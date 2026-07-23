@@ -22,6 +22,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.state_manager = None
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -166,7 +167,12 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        state_slot_ids = None
+        if self.state_manager is not None:
+            state_slot_ids = torch.tensor(
+                [seq.state_slot for seq in seqs], dtype=torch.int64, pin_memory=True
+                ).cuda(non_blocking=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables,state_slot_ids)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -184,7 +190,15 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        cu_seqlens_q = None
+        state_slot_ids = None
+        if self.state_manager is not None:
+            n = len(seqs)
+            cu_seqlens_q = torch.arange(0, n + 1, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            state_slot_ids = torch.tensor(
+                [seq.state_slot for seq in seqs], dtype=torch.int64, pin_memory=True
+                ).cuda(non_blocking=True)
+        set_context(False, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, state_slot_ids=state_slot_ids)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -214,7 +228,16 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        if self.state_manager is not None:
+           context = get_context()
+           states, conv_states = self.state_manager.get_all(context.state_slot_ids)
+           logits, new_states, new_conv_states = self.model(
+               input_ids, positions, context.cu_seqlens_q, states, conv_states
+           )
+           self.state_manager.set_all(context.state_slot_ids, new_states, new_conv_states)
+           logits = self.model.compute_logits(logits)
+        else:
+            logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
