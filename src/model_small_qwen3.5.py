@@ -179,6 +179,11 @@ class LinearAttn(nn.Module):
                 qkv_t = torch.cat([conv_state, qkv_t], dim=2)
             qkv_conv = self.conv1d(qkv_t)
             new_conv  = qkv_t[:, :, -(CK-1):].detach()
+            # Enforce (B, QKV, CK-1) invariant even when available history
+            # (conv_state length + T) is shorter than CK-1.
+            pad_needed = (CK - 1) - new_conv.shape[2]
+            if pad_needed > 0:
+                new_conv = F.pad(new_conv, (pad_needed, 0))
             offset = conv_state.shape[2] if conv_state is not None else 0
             qkv_conv = qkv_conv[:, :, offset:offset+T].transpose(1, 2)
         qkv_conv = F.silu(qkv_conv)

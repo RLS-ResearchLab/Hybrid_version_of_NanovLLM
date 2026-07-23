@@ -89,7 +89,6 @@ def make_small_config():
         dtype=torch.bfloat16,
     )
 
-
 def cosine_sim(a, b):
     a, b = a.float().reshape(-1), b.float().reshape(-1)
     return F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
@@ -100,6 +99,30 @@ def topk_overlap(a, b, k=5):
     b_topk = set(b.float().topk(k).indices.tolist())
     return len(a_topk & b_topk) / k
 
+def test_conv_state_shape_invariant(device):
+    """new_conv must always be exactly (B, QKV, CK-1), even for T < CK-1
+    on the very first call with no prior conv_state."""
+    config = make_small_config()
+    from nanovllm.models.qwen3_5 import Qwen35LinearAttention
+
+    la = Qwen35LinearAttention(
+        hidden_size=config.hidden_size,
+        linear_attn_kq_heads=config.linear_attn_kq_heads,
+        linear_attn_v_heads=config.linear_attn_v_heads,
+        linear_attn_head_dim=config.linear_attn_head_dim,
+        conv_kernel_size=config.conv_kernel_size,
+        rms_norm_eps=config.rms_norm_eps,
+    ).to(device).to(torch.bfloat16)
+
+    x_one_token = torch.randn(1, 1, config.hidden_size, device=device, dtype=torch.bfloat16)
+    _, _, new_conv = la(x_one_token, state=None, conv_state=None)
+
+    expected_len = config.conv_kernel_size - 1
+    assert new_conv.shape[2] == expected_len, (
+        f"conv_state invariant broken: got length {new_conv.shape[2]}, "
+        f"expected {expected_len}"
+    )
+    print(f"  [PASS] conv_state shape invariant holds for T=1, no prior state: {new_conv.shape}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TEST 1: Norm Variants
@@ -344,6 +367,14 @@ def test_linear_attention_incremental(device):
         conv_kernel_size=config.conv_kernel_size,
         rms_norm_eps=config.rms_norm_eps,
     ).to(device).to(torch.bfloat16)
+
+    
+    ref_mod = load_reference_module()
+    ref_la = ref_mod.LinearAttn().to(device).to(torch.bfloat16)
+    ref_sd = dict(ref_la.named_parameters())
+    for name, param in la.named_parameters():
+        if name in ref_sd and param.shape == ref_sd[name].shape:
+            param.data.copy_(ref_sd[name].data)
 
     torch.manual_seed(456)
     B, T, H = 1, 10, config.hidden_size

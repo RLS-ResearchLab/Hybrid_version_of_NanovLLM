@@ -214,108 +214,127 @@ class Qwen35LinearAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        state: torch.Tensor | None = None,
-        conv_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor,
+        states: torch.Tensor | None = None,
+        conv_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
-            hidden_states: (B, T, H) or (N, H) flattened
-            state: (B, LVH, LHD, LHD) recurrent state or None
-            conv_state: (B, QKV, CK-1) conv history or None
+            hidden_states: (N, H) packed across all segments (sequences) in this call
+            cu_seqlens: (num_segments + 1,) int tensor, e.g. [0, 5, 14, 20] for
+                three segments of length 5, 9, 6. During decode, every segment
+                has length 1, i.e. cu_seqlens = [0, 1, 2, ..., num_segments].
+            states: (num_segments, LVH, LHD, LHD) recurrent state per segment, or None
+            conv_states: (num_segments, QKV, CK-1) conv history per segment, or None
 
         Returns:
-            output: (B, T, H)
-            new_state: (B, LVH, LHD, LHD) detached
-            new_conv_state: (B, QKV, CK-1) detached
+            output: (N, H)
+            new_states: (num_segments, LVH, LHD, LHD) detached
+            new_conv_states: (num_segments, QKV, CK-1) detached
         """
-        # Ensure 3D input
-        if hidden_states.ndim == 2:
-            hidden_states = hidden_states.unsqueeze(0)
-        B, T, _ = hidden_states.shape
-
-        # Projections
-        z = self.in_proj_z(hidden_states)       # (B, T, LVH*LHD)
-        a = self.in_proj_a(hidden_states)       # (B, T, LVH)
-        b = self.in_proj_b(hidden_states)       # (B, T, LVH)
-        qkv = self.in_proj_qkv(hidden_states)   # (B, T, QKV)
-
-        QKV = self.qkv_dim
-
-        # Causal conv1d with state management
-        qkv_t = qkv.transpose(1, 2)  # (B, QKV, T)
-        if conv_state is not None and T == 1:
-            # Decode path: single token, use conv state directly
-            combined = torch.cat([conv_state, qkv_t], dim=2)  # (B, QKV, CK)
-            new_conv = combined[:, :, -(self.ck - 1):].detach()
-            qkv_conv = F.conv1d(
-                combined, self.conv1d.weight, self.conv1d.bias,
-                padding=0, groups=QKV
-            ).transpose(1, 2)  # (B, 1, QKV)
-        else:
-            # Prefill path (or first call without state)
-            if conv_state is not None:
-                qkv_t = torch.cat([conv_state, qkv_t], dim=2)
-            qkv_conv = self.conv1d(qkv_t)
-            new_conv = qkv_t[:, :, -(self.ck - 1):].detach()
-            offset = conv_state.shape[2] if conv_state is not None else 0
-            qkv_conv = qkv_conv[:, :, offset:offset + T].transpose(1, 2)  # (B, T, QKV)
-
-        qkv_conv = F.silu(qkv_conv)
-
-        # Split Q, K, V
-        lkh, lvh, lhd = self.lkh, self.lvh, self.lhd
-        q = qkv_conv[:, :, :lkh * lhd].view(B, T, lkh, lhd)
-        k = qkv_conv[:, :, lkh * lhd:2 * lkh * lhd].view(B, T, lkh, lhd)
-        v = qkv_conv[:, :, 2 * lkh * lhd:].view(B, T, lvh, lhd)
-
-        # GDR gating: g = -exp(A_log) * softplus(a + dt_bias)
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
-        beta = b.sigmoid()
-
-        # Head expansion: LKH → LVH
-        q = q.repeat_interleave(self.head_expand, dim=2)
-        k = k.repeat_interleave(self.head_expand, dim=2)
-
-        # L2-normalize Q and K, scale Q
-        scale = lhd ** -0.5
-        q = l2norm(q.float()) * scale
-        k = l2norm(k.float())
-
-        # GDR scan in float32
+        assert hidden_states.ndim == 2, "expects packed (N, H), not (B, T, H)"
+        N, _ = hidden_states.shape
+        num_segments = cu_seqlens.numel() - 1
+        lkh, lvh, lhd, ck = self.lkh, self.lvh, self.lhd, self.ck
         dt = hidden_states.dtype
-        g = g.float()
-        beta = beta.float()
-        v = v.float()
 
-        if state is None:
-            S = torch.zeros(B, lvh, lhd, lhd, device=hidden_states.device, dtype=torch.float32)
-        else:
-            S = state.float()
+        # ── Project once over the whole packed N — pure per-token ops ──
+        z = self.in_proj_z(hidden_states)        # (N, LVH*LHD)
+        a = self.in_proj_a(hidden_states)        # (N, LVH)
+        b = self.in_proj_b(hidden_states)        # (N, LVH)
+        qkv = self.in_proj_qkv(hidden_states)    # (N, QKV)
 
-        ys = []
-        for t in range(T):
-            g_t = g[:, t, :].exp().unsqueeze(-1).unsqueeze(-1)   # (B, LVH, 1, 1)
-            beta_t = beta[:, t, :].unsqueeze(-1)                 # (B, LVH, 1)
-            k_t = k[:, t, :, :]                                   # (B, LVH, LHD)
-            v_t = v[:, t, :, :]                                   # (B, LVH, LHD)
-            q_t = q[:, t, :, :]                                   # (B, LVH, LHD)
-            S = S * g_t                                            # decay state
-            kv_mem = (S * k_t.unsqueeze(-1)).sum(dim=-2)          # (B, LVH, LHD)
-            delta = (v_t - kv_mem) * beta_t                        # (B, LVH, LHD)
-            S = S + k_t.unsqueeze(-1) * delta.unsqueeze(-2)       # rank-1 update
-            ys.append((S * q_t.unsqueeze(-1)).sum(dim=-2))         # (B, LVH, LHD)
+        y_chunks, new_states, new_conv_states = [], [], []
 
-        new_state = S.detach()
-        y = torch.stack(ys, dim=1).to(dt)  # (B, T, LVH, LHD) → cast back to model dtype
+        for i in range(num_segments):
+            start = int(cu_seqlens[i])
+            end = int(cu_seqlens[i + 1])
+            T_i = end - start
 
-        # Gated RMSNorm
-        y = y.reshape(B * T * lvh, lhd)
-        z_flat = z.reshape(B * T * lvh, lhd)
-        y = self.norm(y, z_flat)
-        y = y.reshape(B, T, lvh * lhd)
+            seg_qkv = qkv[start:end].unsqueeze(0)      # (1, T_i, QKV)
+            seg_z = z[start:end]                        # (T_i, LVH*LHD)
+            seg_a = a[start:end].unsqueeze(0)           # (1, T_i, LVH)
+            seg_b = b[start:end].unsqueeze(0)           # (1, T_i, LVH)
 
-        return self.out_proj(y), new_state, new_conv
+            seg_state = states[i:i + 1] if states is not None else None
+            seg_conv_state = conv_states[i:i + 1] if conv_states is not None else None
 
+            # ── Causal conv1d, scoped to this segment only ──
+            qkv_t = seg_qkv.transpose(1, 2)  # (1, QKV, T_i)
+            if seg_conv_state is not None and T_i == 1:
+                combined = torch.cat([seg_conv_state, qkv_t], dim=2)
+                seg_new_conv = combined[:, :, -(ck - 1):].detach()
+                qkv_conv = F.conv1d(
+                    combined, self.conv1d.weight, self.conv1d.bias,
+                    padding=0, groups=self.qkv_dim
+                ).transpose(1, 2)
+            else:
+                if seg_conv_state is not None:
+                    qkv_t = torch.cat([seg_conv_state, qkv_t], dim=2)
+                qkv_conv = self.conv1d(qkv_t)
+                seg_new_conv = qkv_t[:, :, -(ck - 1):].detach()
+                pad_needed = (ck - 1) - seg_new_conv.shape[2]
+                if pad_needed > 0:
+                    seg_new_conv = F.pad(seg_new_conv, (pad_needed, 0))
+                offset = seg_conv_state.shape[2] if seg_conv_state is not None else 0
+                qkv_conv = qkv_conv[:, :, offset:offset + T_i].transpose(1, 2)
+
+            qkv_conv = F.silu(qkv_conv)  # (1, T_i, QKV)
+
+            # ── Split Q/K/V, head-expand, L2-norm — per-token, safe as-is ──
+            q = qkv_conv[:, :, :lkh * lhd].view(1, T_i, lkh, lhd)
+            k = qkv_conv[:, :, lkh * lhd:2 * lkh * lhd].view(1, T_i, lkh, lhd)
+            v = qkv_conv[:, :, 2 * lkh * lhd:].view(1, T_i, lvh, lhd)
+
+            g = -self.A_log.float().exp() * F.softplus(seg_a.float() + self.dt_bias.float())
+            beta = seg_b.sigmoid()
+
+            q = q.repeat_interleave(self.head_expand, dim=2)
+            k = k.repeat_interleave(self.head_expand, dim=2)
+            scale = lhd ** -0.5
+            q = l2norm(q.float()) * scale
+            k = l2norm(k.float())
+
+            g = g.float()
+            beta = beta.float()
+            v = v.float()
+
+            if seg_state is None:
+                S = torch.zeros(1, lvh, lhd, lhd, device=hidden_states.device, dtype=torch.float32)
+            else:
+                S = seg_state.float()
+
+            # ── Sequential scan — identical math to before, scoped to this segment ──
+            ys = []
+            for t in range(T_i):
+                g_t = g[:, t, :].exp().unsqueeze(-1).unsqueeze(-1)
+                beta_t = beta[:, t, :].unsqueeze(-1)
+                k_t = k[:, t, :, :]
+                v_t = v[:, t, :, :]
+                q_t = q[:, t, :, :]
+                S = S * g_t
+                kv_mem = (S * k_t.unsqueeze(-1)).sum(dim=-2)
+                delta = (v_t - kv_mem) * beta_t
+                S = S + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+                ys.append((S * q_t.unsqueeze(-1)).sum(dim=-2))
+
+            seg_new_state = S.detach()  # (1, LVH, LHD, LHD)
+            seg_y = torch.stack(ys, dim=1).to(dt)  # (1, T_i, LVH, LHD)
+
+            seg_y = seg_y.reshape(T_i * lvh, lhd)
+            seg_z_flat = seg_z.reshape(T_i * lvh, lhd)
+            seg_y = self.norm(seg_y, seg_z_flat)
+            seg_y = seg_y.reshape(T_i, lvh * lhd)
+
+            y_chunks.append(seg_y)
+            new_states.append(seg_new_state.squeeze(0))
+            new_conv_states.append(seg_new_conv.squeeze(0))
+
+        y = torch.cat(y_chunks, dim=0)               # (N, LVH*LHD)
+        new_states = torch.stack(new_states, dim=0)          # (num_segments, LVH, LHD, LHD)
+        new_conv_states = torch.stack(new_conv_states, dim=0)  # (num_segments, QKV, CK-1)
+
+        return self.out_proj(y), new_states, new_conv_states
 
 # ─── MoE FFN ────────────────────────────────────────────────────────────────────
 
@@ -544,10 +563,7 @@ class Qwen35DecoderLayer(nn.Module):
             hidden_states, new_state, new_conv = self.linear_attn(
                 hidden_states, state=state, conv_state=conv_state
             )
-            # Flatten back if needed (for consistency with the rest of the pipeline)
-            if hidden_states.ndim == 3 and hidden_states.shape[0] == 1:
-                hidden_states = hidden_states.squeeze(0)
-
+           
         # Post-attention norm with fused residual
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
@@ -579,6 +595,7 @@ class Qwen35Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        cu_seqlens: torch.Tensor,
         states: list | None = None,
         conv_states: list | None = None,
     ) -> tuple[torch.Tensor, list, list]:
@@ -606,7 +623,7 @@ class Qwen35Model(nn.Module):
 
         for i, layer in enumerate(self.layers):
             hidden_states, residual, ns, nc = layer(
-                positions, hidden_states, residual,
+                positions, hidden_states, residual, cu_seqlens,
                 state=states[i], conv_state=conv_states[i],
             )
             new_states.append(ns)
@@ -640,10 +657,11 @@ class Qwen35ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        cu_seqlens: torch.Tensor,
         states: list | None = None,
         conv_states: list | None = None,
     ) -> tuple[torch.Tensor, list, list]:
-        return self.model(input_ids, positions, states, conv_states)
+        return self.model(input_ids, positions, cu_seqlens, states, conv_states)
 
     def compute_logits(
         self,
