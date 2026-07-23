@@ -1,0 +1,54 @@
+# ============================================================================
+# Requirements for the nano-vLLM engine + Qwen3.5-35B-A3B hybrid model project
+# ============================================================================
+#
+# This merges what's actually imported across:
+#   - nanovllm/  (core engine: scheduler, block manager, model runner,
+#                 layers/attention.py, layers/rotary_embedding.py, etc.)
+#   - models/qwen3_5.py, layers/layernorm.py  (hybrid GDR+GQA+MoE model port)
+#   - src/model.py, src/server.py            (reference impl + OpenAI-style server)
+#   - eval/                                   (correctness + throughput harness)
+#   - tests/                                  (standalone numerical comparisons)
+#
+# NOTE (platform): flash-attn and triton require a Linux + NVIDIA CUDA GPU.
+# They will NOT build/run on Windows or CPU-only machines. If you're on
+# Windows/CPU (as in the current antigravity dev environment), you can still
+# run tests/test_qwen35_standalone.py and the CPU-only src/model_small_qwen3.5.py
+# checks by skipping the two lines marked [CUDA-only] below.
+#
+# NOTE (torch version): the Qwen3.5-35B-A3B reference (src/model.py) was
+# verified on torch 2.12.1+cu130 on B300/SM10.3 (cu128's grouped_mm crashes
+# there). The nano-vLLM engine itself only requires torch>=2.4.0. Pin to
+# 2.12.1+cu130 if you're targeting the same hardware as src/model.py.
+
+# ── Core engine (nanovllm/) ─────────────────────────────────────────────────
+torch>=2.4.0
+transformers>=4.51.0
+xxhash                      # engine/block_manager.py — prefix-cache hashing
+numpy                       # engine/block_manager.py — hash byte packing
+tqdm                        # engine/llm_engine.py — generation progress bar
+
+# ── CUDA-only kernels (nanovllm/layers/attention.py, rotary_embedding.py) ───
+#triton>=3.0.0                # [CUDA-only] custom store_kvcache kernel
+flash-attn                   # [CUDA-only] flash_attn_varlen_func / flash_attn_with_kvcache
+
+# ── Weight loading ───────────────────────────────────────────────────────────
+safetensors                  # nanovllm/utils/loader.py, src/model.py load_weights
+
+# ── OpenAI-compatible server (src/server.py) ─────────────────────────────────
+fastapi
+uvicorn[standard]
+pydantic
+
+# ── Weight download / tokenizer utilities ───────────────────────────────────
+huggingface_hub              # download_weights.py
+accelerate                   # multi-GPU dispatch (start.sh uses this for device_map)
+jinja2>=3.1.0                 # chat template rendering
+
+# ── Eval harness (eval/correctness, eval/throughput) ────────────────────────
+lm-eval[api]>=0.4.4           # eval/correctness/run_correctness.py (GSM8K-CoT)
+aiohttp                      # eval/throughput/run_throughput.py — async load testing
+tabulate                     # eval/throughput/run_throughput.py — results table
+
+# ── Future optimization work (Phase 6 follow-ups, not yet wired in) ─────────
+flash-linear-attention        # [CUDA-only] fused chunked-scan GDR kernels
