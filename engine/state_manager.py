@@ -75,18 +75,18 @@ class StateManager:
         self.states[layer_idx].index_copy_(0, slot_ids, state.to(self.states.dtype))
         self.conv_states[layer_idx].index_copy_(0, slot_ids, conv_state.to(self.conv_states.dtype))
 
-    def get_all(self, slot_ids: torch.Tensor):
-        """Convenience: gather every linear layer at once, as lists
-        (index i = the i-th linear-attention layer in model order)."""
-        states = [self.states[i].index_select(0, slot_ids) for i in range(self.num_linear_layers)]
-        conv_states = [self.conv_states[i].index_select(0, slot_ids) for i in range(self.num_linear_layers)]
+    def get_all(self, slot_ids: torch.Tensor, num_total_layers: int, linear_layer_indices: list[int]):
+        states = [None] * num_total_layers
+        conv_states = [None] * num_total_layers
+        for compact_idx, full_idx in enumerate(linear_layer_indices):
+            states[full_idx] = self.states[compact_idx].index_select(0, slot_ids)
+            conv_states[full_idx] = self.conv_states[compact_idx].index_select(0, slot_ids)
         return states, conv_states
 
-    def set_all(self, slot_ids: torch.Tensor, states: list, conv_states: list) -> None:
-        for i in range(self.num_linear_layers):
-            if states[i] is None:
-                continue
-            self.set(i, slot_ids, states[i], conv_states[i])
+    def set_all(self, slot_ids: torch.Tensor, states: list, conv_states: list, linear_layer_indices: list[int]) -> None:
+        for compact_idx, full_idx in enumerate(linear_layer_indices):
+            assert states[full_idx] is not None, f"missing state for linear layer at full index {full_idx}"
+            self.set(compact_idx, slot_ids, states[full_idx], conv_states[full_idx])
 
     def memory_bytes(self) -> int:
         """Total bytes consumed — feeds Phase 3's memory budget calc."""

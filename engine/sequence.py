@@ -2,7 +2,7 @@ from copy import copy
 from enum import Enum, auto
 from itertools import count
 
-from nanovllm.sampling_params import SamplingParams
+from sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
@@ -72,8 +72,15 @@ class Sequence:
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
+            self.num_scheduled_tokens, self.block_table, self.state_slot, last_state)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, self.state_slot, last_state = state
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, self.state_slot, last_state)
+        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
+        self.num_scheduled_tokens, self.block_table, self.state_slot, last_state) = state
+        if isinstance(last_state, list):
+            self.token_ids = last_state
+            self.last_token = self.token_ids[-1]
+        else:
+            self.token_ids = []
+            self.last_token = last_state
