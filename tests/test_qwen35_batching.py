@@ -13,21 +13,23 @@
 import sys, os
 import torch
 
-# Ensure repository root is on sys.path so imports like
-# 'Hybrid_version_of_NanoVLLM.engine.state_manager' resolve from tests/ location.
 sys.path.insert(0, os.path.dirname(__file__))
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-from test_qwen35_standalone import init_dist, make_small_config
+from test_qwen35_standalone import init_dist, make_small_config   # ← MUST run first (registers fake nanovllm package)
 
-from engine.state_manager import StateManager
-from models.qwen3_5 import Qwen35ForCausalLM
-from utils.context import set_context, reset_context
+from nanovllm.engine.state_manager import StateManager             # ← these only work AFTER the line above
+from nanovllm.models.qwen3_5 import Qwen35ForCausalLM
+from nanovllm.utils.context import set_context, reset_context
 
-
-def build_model_and_state(config, device, max_num_seqs):
+def build_model_and_state(config, device, max_num_seqs, dtype=torch.float32):
     torch.manual_seed(2024)
-    model = Qwen35ForCausalLM(config).to(device).to(torch.bfloat16)
+    model = Qwen35ForCausalLM(config).to(device).to(dtype)
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if param.dim() >= 2:
+                torch.nn.init.normal_(param, mean=0.0, std=0.02)
+            else:
+                torch.nn.init.zeros_(param)
+
     num_linear = len(model.model.linear_layer_indices)
     sm = StateManager(
         max_num_seqs=max_num_seqs,
@@ -43,8 +45,6 @@ def build_model_and_state(config, device, max_num_seqs):
 
 
 def run_packed(model, sm, token_id_lists, device):
-    """Run several token sequences packed together in ONE forward call
-    (simulating one scheduler step), return per-sequence final-token logits."""
     num_layers = len(model.model.layers)
     linear_idx = model.model.linear_layer_indices
 
@@ -62,16 +62,22 @@ def run_packed(model, sm, token_id_lists, device):
                                dtype=torch.int32, device=device)
     positions = torch.cat([torch.arange(l, device=device) for l in lengths])
 
+    from nanovllm.utils.context import set_context, reset_context
+    max_seqlen = max(lengths)
+    set_context(True, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, None, None, None)
+
     states, conv_states = sm.get_all(slot_ids, num_layers, linear_idx)
     hidden, new_states, new_conv = model(flat_ids, positions, cu_seqlens, states, conv_states)
-    logits = model.compute_logits(hidden)  # ParallelLMHead extracts last-token-per-segment during prefill
+    logits = model.compute_logits(hidden)
     sm.set_all(slot_ids, new_states, new_conv, linear_idx)
+
+    reset_context()
 
     for s in slot_ids.tolist():
         sm.used_slot_ids.discard(s)
         sm.free_slot_ids.append(s)
 
-    return logits  # (num_segments, VOCAB)
+    return logits
 
 
 def run_single(model, sm, token_ids, device):
@@ -85,7 +91,7 @@ def test_multi_sequence_no_contamination(device):
     print("=" * 70)
 
     config = make_small_config()
-    model, sm = build_model_and_state(config, device, max_num_seqs=8)
+    model, sm = build_model_and_state(config, device, max_num_seqs=8, dtype=torch.float32)
 
     torch.manual_seed(99)
     seqs = [
@@ -156,8 +162,6 @@ def test_chunked_prefill_matches_unconstrained(device):
 
     unconstrained = run_single(model, sm, tokens, device)
 
-    # Simulate chunked prefill: feed the same sequence in two chunks of 12 + 8,
-    # threading state/conv_state manually between calls (as the scheduler would).
     num_layers = len(model.model.layers)
     linear_idx = model.model.linear_layer_indices
     slot_id = sm.free_slot_ids.popleft()
@@ -173,10 +177,14 @@ def test_chunked_prefill_matches_unconstrained(device):
         start_pos = 0 if i == 0 else len(chunk1)
         positions = torch.arange(start_pos, start_pos + len(chunk), device=device)
 
+        set_context(True, cu_seqlens, cu_seqlens, len(chunk), len(chunk), None, None, None)
+
         states, conv_states = sm.get_all(slot_ids, num_layers, linear_idx)
         hidden, new_states, new_conv = model(flat_ids, positions, cu_seqlens, states, conv_states)
         logits_chunked = model.compute_logits(hidden)
         sm.set_all(slot_ids, new_states, new_conv, linear_idx)
+
+        reset_context()
 
     sm.used_slot_ids.discard(slot_id)
     sm.free_slot_ids.append(slot_id)
