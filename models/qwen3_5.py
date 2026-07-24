@@ -15,15 +15,15 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from nanovllm.layers.layernorm import Qwen35RMSNorm, Qwen35RMSNormGated
-from nanovllm.layers.linear import (
+from layers.layernorm import Qwen35RMSNorm, Qwen35RMSNormGated
+from layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
     ReplicatedLinear,
     MergedColumnParallelLinear,
 )
-from nanovllm.layers.rotary_embedding import get_partial_rope
-from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from layers.rotary_embedding import get_partial_rope
+from layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
 def _is_full_attention(layer_idx: int, full_attention_interval: int) -> bool:
@@ -111,7 +111,7 @@ class Qwen35FullAttention(nn.Module):
 
         self.scaling = head_dim ** -0.5
         # Lazy import to avoid requiring flash_attn/triton at module import time
-        from nanovllm.layers.attention import Attention
+        from layers.attention import Attention
         self.attn = Attention(
             self.num_heads, head_dim, self.scaling, self.num_kv_heads
         )
@@ -540,6 +540,7 @@ class Qwen35DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None = None,
         state: torch.Tensor | None = None,
         conv_state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -559,9 +560,9 @@ class Qwen35DecoderLayer(nn.Module):
         if self.is_full:
             hidden_states = self.self_attn(positions, hidden_states)
         else:
-            # LinearAttention needs 3D input (B, T, H)
+            assert cu_seqlens is not None, "linear-attention layers require cu_seqlens"
             hidden_states, new_state, new_conv = self.linear_attn(
-                hidden_states, state=state, conv_state=conv_state
+                hidden_states, cu_seqlens, state=state, conv_state=conv_state
             )
            
         # Post-attention norm with fused residual
@@ -590,6 +591,8 @@ class Qwen35Model(nn.Module):
             for i in range(num_layers)
         ])
         self.norm = Qwen35RMSNorm(config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6))
+        self.layer_types = _get_layer_types(config, num_layers)
+        self.linear_layer_indices = [i for i, t in enumerate(self.layer_types) if t == "linear_attention"]
 
     def forward(
         self,

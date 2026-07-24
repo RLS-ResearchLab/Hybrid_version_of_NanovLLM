@@ -4,13 +4,22 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
-from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
-from nanovllm.utils.loader import load_model
+from config import Config
+from engine.sequence import Sequence
+from models.qwen3 import Qwen3ForCausalLM
+from layers.sampler import Sampler
+from utils.context import set_context, get_context, reset_context
+from utils.loader import load_model
+from models.qwen3_5 import Qwen35ForCausalLM
+from engine.state_manager import StateManager
+from models.qwen3_5 import Qwen35LinearAttention
 
+
+ARCH_DISPATCH = {
+    "Qwen3ForCausalLM": Qwen3ForCausalLM,
+    "Qwen35ForCausalLM": Qwen35ForCausalLM,
+    "Qwen35MoEForCausalLM": Qwen35ForCausalLM,
+}
 
 class ModelRunner:
 
@@ -29,6 +38,23 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
+
+        arch = getattr(hf_config, "architectures", ["Qwen3ForCausalLM"])[0]
+        model_cls = ARCH_DISPATCH.get(arch, Qwen3ForCausalLM)
+        self.model = model_cls(hf_config)
+        load_model(self.model, config.model)
+
+        if model_cls is Qwen35ForCausalLM:
+            num_linear_layers = sum(1 for t in self.model.model.layer_types if t == "linear_attention")
+            la0 = next(m for m in self.model.modules() if isinstance(m, Qwen35LinearAttention))
+            self.state_manager = StateManager(
+                max_num_seqs=config.max_num_seqs,
+                num_linear_layers=num_linear_layers,
+                lvh=la0.lvh, lhd=la0.lhd, qkv_dim=la0.qkv_dim,
+                conv_kernel_size=la0.ck,
+                dtype=hf_config.dtype,
+                )
+            
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
@@ -229,13 +255,15 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         if self.state_manager is not None:
-           context = get_context()
-           states, conv_states = self.state_manager.get_all(context.state_slot_ids)
-           logits, new_states, new_conv_states = self.model(
-               input_ids, positions, context.cu_seqlens_q, states, conv_states
-           )
-           self.state_manager.set_all(context.state_slot_ids, new_states, new_conv_states)
-           logits = self.model.compute_logits(logits)
+            context = get_context()
+            num_layers = len(self.model.model.layers)
+            linear_idx = self.model.model.linear_layer_indices
+            states, conv_states = self.state_manager.get_all(context.state_slot_ids, num_layers, linear_idx)
+            logits, new_states, new_conv_states = self.model(
+            input_ids, positions, context.cu_seqlens_q, states, conv_states
+            )
+            self.state_manager.set_all(context.state_slot_ids, new_states, new_conv_states, linear_idx)
+            logits = self.model.compute_logits(logits)
         else:
             logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
