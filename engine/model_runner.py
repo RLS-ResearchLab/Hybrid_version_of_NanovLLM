@@ -1,10 +1,20 @@
+import os
+import sys
+import types
 import pickle
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
-from config import Config
+if __package__ in (None, "") and "nanovllm" not in sys.modules:
+    package_root = os.path.dirname(os.path.dirname(__file__))
+    nanovllm_pkg = types.ModuleType("nanovllm")
+    nanovllm_pkg.__path__ = [package_root]
+    nanovllm_pkg.__file__ = os.path.join(package_root, "__init__.py")
+    sys.modules["nanovllm"] = nanovllm_pkg
+
+from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -54,9 +64,11 @@ class ModelRunner:
                 conv_kernel_size=la0.ck,
                 dtype=hf_config.dtype,
                 )
-            
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+        if self.state_manager is not None:
+            torch.cuda.synchronize()
+            print(f"[MEM DEBUG] after StateManager construction: "
+                  f"current={torch.cuda.memory_stats()['allocated_bytes.all.current']}, "
+                  f"state_manager.memory_bytes()={self.state_manager.memory_bytes()}")    
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -122,8 +134,10 @@ class ModelRunner:
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
-        for seq in seqs:
+        for i,seq in enumerate(seqs):
             seq.num_scheduled_tokens = seq_len
+            if self.state_manager is not None:
+                seq.state_slot = i
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
@@ -134,18 +148,42 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        print(f"[MEM DEBUG] allocate_kv_cache entry: current={current}, peak={peak}")
+
+        # Calculate StateManager footprint
+        state_bytes = self.state_manager.memory_bytes() if self.state_manager is not None else 0
+
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        arch = getattr(hf_config, "architectures", ["Qwen3ForCausalLM"])[0]
+        model_cls = ARCH_DISPATCH.get(arch, Qwen3ForCausalLM)
+
+        if model_cls is Qwen35ForCausalLM:
+            num_kv_layers = sum(1 for t in self.model.model.layer_types if t == "full_attention")
+        else:
+            num_kv_layers = hf_config.num_hidden_layers
+        old_layers = hf_config.num_hidden_layers
+
+        block_bytes = 2 * num_kv_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current ) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+
+        self.kv_cache = torch.empty(2, num_kv_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+
+        print(f"[KV DEBUG] num_hidden_layers={old_layers}  num_kv_layers(full-attn only)={num_kv_layers}")
+        print(f"[KV DEBUG] block_bytes (per block, per layer count of {num_kv_layers})={block_bytes}")
+        print(f"[KV DEBUG] state_bytes subtracted={state_bytes}")
+        print(f"[KV DEBUG] num_kvcache_blocks={config.num_kvcache_blocks}")
+        print(f"[KV DEBUG] kv_cache tensor shape={tuple(self.kv_cache.shape)}")
+        print(f"[KV DEBUG] total kv_cache bytes = {self.kv_cache.numel() * self.kv_cache.element_size()}")
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+        assert layer_id == num_kv_layers, f"expected {num_kv_layers} attention modules with k/v cache, wired {layer_id}"
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -306,3 +344,4 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+        
