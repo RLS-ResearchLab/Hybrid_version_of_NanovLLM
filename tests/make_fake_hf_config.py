@@ -1,0 +1,38 @@
+# tests/make_fake_hf_config.py
+import json, os
+
+OUT_DIR = os.path.join(os.path.dirname(__file__), "fake_qwen35_small")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+config = {
+    "architectures": ["Qwen35MoEForCausalLM"],
+    "model_type": "qwen3_5_moe",
+    "hidden_size": 512,
+    "num_hidden_layers": 8,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 1,
+    "head_dim": 128,
+    "partial_rotary_factor": 0.25,
+    "rope_theta": 10_000_000.0,
+    "max_position_embeddings": 4096,
+    "vocab_size": 248320,
+    "rms_norm_eps": 1e-6,
+    "full_attention_interval": 4,
+    "linear_attn_kq_heads": 8,
+    "linear_attn_v_heads": 16,
+    "linear_attn_head_dim": 64,
+    "conv_kernel_size": 4,
+    "intermediate_size": 256,
+    "moe_intermediate_size": 256,
+    "shared_expert_intermediate_size": 256,
+    "num_experts": 32,
+    "num_experts_per_tok": 4,
+    "tie_word_embeddings": False,
+    "hidden_act": "silu",
+    "torch_dtype": "bfloat16",
+}
+
+with open(os.path.join(OUT_DIR, "config.json"), "w") as f:
+    json.dump(config, f, indent=2)
+
+print(f"Wrote fake config to {OUT_DIR}/config.json")
