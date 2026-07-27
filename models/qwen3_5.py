@@ -584,6 +584,7 @@ class Qwen35Model(nn.Module):
         self.config = config
         num_layers = config.num_hidden_layers
         self.layer_types = _get_layer_types(config, num_layers)
+        self.linear_layer_indices = [i for i, t in enumerate(self.layer_types) if t == "linear_attention"]
 
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
@@ -591,8 +592,7 @@ class Qwen35Model(nn.Module):
             for i in range(num_layers)
         ])
         self.norm = Qwen35RMSNorm(config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6))
-        self.layer_types = _get_layer_types(config, num_layers)
-        self.linear_layer_indices = [i for i, t in enumerate(self.layer_types) if t == "linear_attention"]
+        
 
     def forward(
         self,

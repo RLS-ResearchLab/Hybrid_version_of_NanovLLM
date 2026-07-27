@@ -1,4 +1,11 @@
-# tests/make_fake_hf_config.py
+"""Generates a fake HF-style checkpoint directory (config.json only, no
+weights) so ModelRunner can be constructed against the small Qwen3.5 hybrid
+config without a real checkpoint.
+
+Usage:
+    python tests/make_fake_hf_config.py
+    python tests/test_qwen35_model_runner.py
+"""
 import json, os
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "fake_qwen35_small")
@@ -36,3 +43,6 @@ with open(os.path.join(OUT_DIR, "config.json"), "w") as f:
     json.dump(config, f, indent=2)
 
 print(f"Wrote fake config to {OUT_DIR}/config.json")
+print("NOTE: no .safetensors file is written on purpose — the ModelRunner")
+print("test harness monkeypatches load_model to a no-op and explicitly")
+print("initializes Experts params itself, since Experts has no default init.")

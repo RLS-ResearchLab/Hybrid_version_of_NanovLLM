@@ -51,10 +51,11 @@ class ModelRunner:
 
         arch = getattr(hf_config, "architectures", ["Qwen3ForCausalLM"])[0]
         model_cls = ARCH_DISPATCH.get(arch, Qwen3ForCausalLM)
+        self._is_hybrid_model = (model_cls is Qwen35ForCausalLM)
+
         self.model = model_cls(hf_config)
         load_model(self.model, config.model)
-
-        if model_cls is Qwen35ForCausalLM:
+        if self._is_hybrid_model:
             num_linear_layers = sum(1 for t in self.model.model.layer_types if t == "linear_attention")
             la0 = next(m for m in self.model.modules() if isinstance(m, Qwen35LinearAttention))
             self.state_manager = StateManager(
@@ -63,12 +64,17 @@ class ModelRunner:
                 lvh=la0.lvh, lhd=la0.lhd, qkv_dim=la0.qkv_dim,
                 conv_kernel_size=la0.ck,
                 dtype=hf_config.dtype,
-                )
-        if self.state_manager is not None:
+            )
             torch.cuda.synchronize()
             print(f"[MEM DEBUG] after StateManager construction: "
                   f"current={torch.cuda.memory_stats()['allocated_bytes.all.current']}, "
-                  f"state_manager.memory_bytes()={self.state_manager.memory_bytes()}")    
+                  f"state_manager.memory_bytes()={self.state_manager.memory_bytes()}")
+
+            assert self.state_manager is not None, (
+                "StateManager must be constructed before warmup_model() runs, "
+                "so the peak-memory probe used by allocate_kv_cache() reflects "
+                "real state-cache usage, not just KV-cache usage."
+            )
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -138,8 +144,15 @@ class ModelRunner:
             seq.num_scheduled_tokens = seq_len
             if self.state_manager is not None:
                 seq.state_slot = i
+        if self.state_manager is not None:
+            assert num_seqs > 0, "warmup_model built zero sequences — state-cache path not exercised"
         self.run(seqs, True)
         torch.cuda.empty_cache()
+        if self.state_manager is not None:
+            assert len(self.state_manager.free_slot_ids) == self.state_manager.max_num_seqs, (
+                f"warmup left {self.state_manager.max_num_seqs - len(self.state_manager.free_slot_ids)} "
+                f"slot(s) marked used after warmup — state_slot bookkeeping bug"
+            )
 
     def allocate_kv_cache(self):
         config = self.config
@@ -155,10 +168,7 @@ class ModelRunner:
 
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        arch = getattr(hf_config, "architectures", ["Qwen3ForCausalLM"])[0]
-        model_cls = ARCH_DISPATCH.get(arch, Qwen3ForCausalLM)
-
-        if model_cls is Qwen35ForCausalLM:
+        if self._is_hybrid_model:
             num_kv_layers = sum(1 for t in self.model.model.layer_types if t == "full_attention")
         else:
             num_kv_layers = hf_config.num_hidden_layers
