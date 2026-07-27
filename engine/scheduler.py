@@ -46,6 +46,8 @@ class Scheduler:
                 self.block_manager.allocate(seq, num_cached_blocks)
                 if self.state_manager is not None:
                     self.state_manager.allocate(seq)
+                    print(f"[REPREFILL DEBUG] seq_id={seq.seq_id} num_tokens={seq.num_tokens} "
+                    f"num_cached_tokens={seq.num_cached_tokens} state_slot={seq.state_slot}")
                 seq.num_cached_tokens = num_cached_blocks * self.block_size
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
@@ -81,8 +83,13 @@ class Scheduler:
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
         if self.state_manager is not None:
-           self.state_manager.free(seq)
+            self.state_manager.free(seq)
         seq.num_cached_tokens = 0
+
+        print(f"[PREEMPT DEBUG] seq_id={seq.seq_id} num_tokens={seq.num_tokens} "
+          f"num_prompt_tokens={seq.num_prompt_tokens} token_ids_len={len(seq.token_ids)} "
+          f"state_slot={seq.state_slot}")
+
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
