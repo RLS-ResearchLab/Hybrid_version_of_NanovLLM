@@ -174,11 +174,18 @@ class Qwen35LinearAttention(nn.Module):
         rms_norm_eps: float,
     ) -> None:
         super().__init__()
-        self.hidden_size = hidden_size
-        self.lkh = linear_attn_kq_heads
-        self.lvh = linear_attn_v_heads
+        tp_size = dist.get_world_size()
+        tp_rank = dist.get_rank()
+       
+        assert linear_attn_kq_heads % tp_size == 0
+        assert linear_attn_v_heads % tp_size == 0
+        self.total_lkh = linear_attn_kq_heads
+        self.total_lvh = linear_attn_v_heads
+        self.lkh = linear_attn_kq_heads // tp_size   # per-rank head counts
+        self.lvh = linear_attn_v_heads // tp_size
         self.lhd = linear_attn_head_dim
         self.ck = conv_kernel_size
+        self.tp_rank = tp_rank
 
         # QKV dim = (LKH + LKH + LVH) * LHD
         self.qkv_dim = (self.lkh + self.lkh + self.lvh) * self.lhd
@@ -238,6 +245,8 @@ class Qwen35LinearAttention(nn.Module):
         lkh, lvh, lhd, ck = self.lkh, self.lvh, self.lhd, self.ck
         dt = hidden_states.dtype
 
+        is_decode_shape = (num_segments == N)
+
         # ── Project once over the whole packed N — pure per-token ops ──
         z = self.in_proj_z(hidden_states)        # (N, LVH*LHD)
         a = self.in_proj_a(hidden_states)        # (N, LVH)
@@ -247,8 +256,11 @@ class Qwen35LinearAttention(nn.Module):
         y_chunks, new_states, new_conv_states = [], [], []
 
         for i in range(num_segments):
-            start = int(cu_seqlens[i])
-            end = int(cu_seqlens[i + 1])
+            if is_decode_shape:
+                start, end = i, i + 1
+            else:
+                start = int(cu_seqlens[i])
+                end = int(cu_seqlens[i + 1])
             T_i = end - start
 
             seg_qkv = qkv[start:end].unsqueeze(0)      # (1, T_i, QKV)
@@ -421,36 +433,77 @@ class Qwen35MoE(nn.Module):
         self.shared_expert = Qwen35SharedExpert(hidden_size, shared_intermediate_size)
         self.shared_expert_gate = ReplicatedLinear(hidden_size, 1, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
+        N = x.shape[0]
+        is_decode = (cu_seqlens is not None) and (cu_seqlens.numel() - 1 == N)
+        if is_decode:
+            return self._forward_gathered(x)
+        return self._forward_dispatch(x)
+ 
+    def _forward_gathered(self, x: torch.Tensor) -> torch.Tensor:
+        """Capture-safe MoE forward for decode. No loops, no .item(), no
+        data-dependent branching -- every op's shape is static given N (batch
+        size) and self.top_k, both fixed for a given call/captured graph."""
+        H, TK = self.hidden_size, self.top_k
+        N = x.shape[0]
+ 
+        w, idx = torch.topk(self.gate(x), TK, dim=-1)          # (N, TK)
+        w = F.softmax(w, dim=-1).to(x.dtype)
+ 
+        # Advanced indexing: dynamic VALUES, static SHAPE (N, TK, ...) --
+        # safe under graph capture, same principle as StateManager's
+        # index_select on state_slot_ids.
+        gate_up = self.experts.gate_up_proj[idx]                # (N, TK, 2*MI, H)
+        down = self.experts.down_proj[idx]                      # (N, TK, H, MI)
+        gw, uw = gate_up.chunk(2, dim=2)                        # each (N, TK, MI, H)
+ 
+        # Per-token, per-selected-expert projection -- equivalent to the
+        # dispatch loop's `xt @ gw.t()` / `xt @ uw.t()`, just batched over
+        # (N, TK) instead of looped over experts with a token subset each.
+        h_gate = torch.einsum('nkmh,nh->nkm', gw, x)            # (N, TK, MI)
+        h_up = torch.einsum('nkmh,nh->nkm', uw, x)              # (N, TK, MI)
+        h = F.silu(h_gate) * h_up                                # (N, TK, MI)
+ 
+        # Equivalent to the dispatch loop's `h @ down_proj[e].t()`.
+        out_e = torch.einsum('nkhm,nkm->nkh', down, h)          # (N, TK, H)
+        out = (out_e * w.unsqueeze(-1)).sum(dim=1)               # (N, H)
+ 
+        sg = torch.sigmoid(self.shared_expert_gate(x))
+        out = out + sg * self.shared_expert(x)
+        return out
+ 
+    def _forward_dispatch(self, x: torch.Tensor) -> torch.Tensor:
+        """Original sort-by-expert dispatch loop -- unchanged. Used for
+        prefill (and any eager, non-graph-captured call), where N can be
+        large and gathering full per-token expert weight matrices would be
+        far too much memory."""
         original_shape = x.shape
         H = self.hidden_size
         NE = self.num_experts
         TK = self.top_k
-
+ 
         xf = x.reshape(-1, H)
         N = xf.shape[0]
-
-        # Top-k routing with softmax
-        w, idx = torch.topk(self.gate(xf), TK, dim=-1)  # (N, TK)
+ 
+        w, idx = torch.topk(self.gate(xf), TK, dim=-1)
         w = F.softmax(w, dim=-1).to(x.dtype)
-
-        # Sort-by-expert dispatch
+ 
         flat_idx = idx.reshape(-1)
         flat_w = w.reshape(-1)
         token_rep = xf.unsqueeze(1).expand(N, TK, H).reshape(N * TK, H)
-
+ 
         sort_order = torch.argsort(flat_idx, stable=True)
         sorted_idx = flat_idx[sort_order]
         sorted_tokens = token_rep[sort_order]
         sorted_weights = flat_w[sort_order]
-
-        expert_counts = torch.bincount(sorted_idx, minlength=NE)
+        expert_counts = torch.zeros(NE, dtype=torch.long, device=x.device)
+        expert_counts.scatter_add_(0, sorted_idx, torch.ones_like(sorted_idx))
+ 
         expert_offsets = torch.cat([
             torch.zeros(1, device=x.device, dtype=torch.long),
             expert_counts.cumsum(0)[:-1]
         ])
-
-        # Per-expert matmul loop
+ 
         sorted_out = torch.zeros(N * TK, H, device=x.device, dtype=x.dtype)
         for e in range(NE):
             cnt = expert_counts[e].item()
@@ -462,15 +515,12 @@ class Qwen35MoE(nn.Module):
             h = F.silu(xt @ gw.t()) * (xt @ uw.t())
             h = h @ self.experts.down_proj[e].t()
             sorted_out[start:start + cnt] = sorted_weights[start:start + cnt].unsqueeze(-1) * h
-
-        # Unsort and combine
+ 
         unsort_order = torch.argsort(sort_order, stable=True)
         out = sorted_out[unsort_order].reshape(N, TK, H).sum(dim=1)
-
-        # Sigmoid-gated shared expert
+ 
         sg = torch.sigmoid(self.shared_expert_gate(xf))
         out = out + sg * self.shared_expert(xf)
-
         return out.view(original_shape)
 
 
@@ -569,7 +619,7 @@ class Qwen35DecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # MoE FFN
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, cu_seqlens)
 
         return hidden_states, residual, new_state, new_conv
 

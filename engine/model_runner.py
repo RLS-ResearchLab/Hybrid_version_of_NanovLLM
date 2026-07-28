@@ -302,18 +302,50 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+ 
         if self.state_manager is not None:
             context = get_context()
-            num_layers = len(self.model.model.layers)
-            linear_idx = self.model.model.linear_layer_indices
-            states, conv_states = self.state_manager.get_all(context.state_slot_ids, num_layers, linear_idx)
-            logits, new_states, new_conv_states = self.model(
-            input_ids, positions, context.cu_seqlens_q, states, conv_states
-            )
-            self.state_manager.set_all(context.state_slot_ids, new_states, new_conv_states, linear_idx)
-            logits = self.model.compute_logits(logits)
+            use_graph = (not is_prefill and not self.enforce_eager
+                         and hasattr(self, "graphs") and input_ids.size(0) <= 512)
+            if use_graph:
+                bs = input_ids.size(0)
+                graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+                gv = self.graph_vars
+                gv["input_ids"][:bs] = input_ids
+                gv["positions"][:bs] = positions
+                gv["slot_mapping"].fill_(-1)
+                gv["slot_mapping"][:bs] = context.slot_mapping
+                gv["context_lens"].zero_()
+                gv["context_lens"][:bs] = context.context_lens
+                gv["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+                gv["state_slot_ids"][:bs] = context.state_slot_ids
+                # cu_seqlens_q for decode is always arange(0, bs+1) — already
+                # correct as a static buffer, no per-call refresh needed.
+ 
+                graph.replay()
+ 
+                hidden = gv["outputs"][:bs]
+                num_layers = len(self.model.model.layers)
+                linear_idx = self.model.model.linear_layer_indices
+                new_states = [None] * num_layers
+                new_conv_states = [None] * num_layers
+                for compact_idx, full_idx in enumerate(linear_idx):
+                    new_states[full_idx] = gv["state_out_bufs"][compact_idx][:bs]
+                    new_conv_states[full_idx] = gv["conv_out_bufs"][compact_idx][:bs]
+                self.state_manager.set_all(context.state_slot_ids, new_states, new_conv_states, linear_idx)
+                logits = self.model.compute_logits(hidden)
+            else:
+                num_layers = len(self.model.model.layers)
+                linear_idx = self.model.model.linear_layer_indices
+                states, conv_states = self.state_manager.get_all(context.state_slot_ids, num_layers, linear_idx)
+                logits, new_states, new_conv_states = self.model(
+                    input_ids, positions, context.cu_seqlens_q, states, conv_states
+                )
+                self.state_manager.set_all(context.state_slot_ids, new_states, new_conv_states, linear_idx)
+                logits = self.model.compute_logits(logits)
         else:
             logits = self.run_model(input_ids, positions, is_prefill)
+ 
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
@@ -324,29 +356,15 @@ class ModelRunner:
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+ 
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
-        self.graph_pool = None
-
-        for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-            reset_context()
-
-        self.graph_vars = dict(
+ 
+        graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
             slot_mapping=slot_mapping,
@@ -354,4 +372,91 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
-        
+ 
+        if self._is_hybrid_model:
+            # Decode: every sequence contributes exactly 1 token, so
+            # cu_seqlens is always arange(0, bs+1) — same construction
+            # prepare_decode() already uses at eager time.
+            cu_seqlens_q = torch.arange(0, max_bs + 1, dtype=torch.int32)
+            state_slot_ids = torch.zeros(max_bs, dtype=torch.int64)
+            graph_vars["cu_seqlens_q"] = cu_seqlens_q
+            graph_vars["state_slot_ids"] = state_slot_ids
+ 
+            num_layers = len(self.model.model.layers)
+            linear_idx = self.model.model.linear_layer_indices
+            sm = self.state_manager
+ 
+            # Static output buffers for the recurrent state — one per
+            # linear-attention layer, sized like StateManager's own
+            # per-layer slices. These live outside StateManager (StateManager
+            # itself gets written to AFTER replay, via set_all, same as
+            # compute_logits happens after replay).
+            state_out_bufs = [
+                torch.zeros(max_bs, sm.states.shape[2], sm.states.shape[3], sm.states.shape[4],
+                            dtype=torch.float32)
+                for _ in range(sm.num_linear_layers)
+            ]
+            conv_out_bufs = [
+                torch.zeros(max_bs, sm.conv_states.shape[2], sm.conv_states.shape[3],
+                            dtype=sm.conv_states.dtype)
+                for _ in range(sm.num_linear_layers)
+            ]
+            graph_vars["state_out_bufs"] = state_out_bufs
+            graph_vars["conv_out_bufs"] = conv_out_bufs
+ 
+            # Sanity check on the "fixed address" assumption this design
+            # depends on — verify it, don't just assert it from reasoning.
+            state_ptr_before = sm.states.data_ptr()
+            conv_ptr_before = sm.conv_states.data_ptr()
+ 
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graphs = {}
+        self.graph_pool = None
+ 
+        for bs in reversed(self.graph_bs):
+            graph = torch.cuda.CUDAGraph()
+ 
+            if self._is_hybrid_model:
+                cu_seqlens_bs = graph_vars["cu_seqlens_q"][:bs + 1]
+                slot_ids_bs = graph_vars["state_slot_ids"][:bs]
+                set_context(False, cu_seqlens_q=cu_seqlens_bs,
+                            slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs],
+                            block_tables=block_tables[:bs], state_slot_ids=slot_ids_bs)
+ 
+                def _step():
+                    states, conv_states = sm.get_all(slot_ids_bs, num_layers, linear_idx)
+                    hidden, new_states, new_conv_states = self.model.model(
+                        input_ids[:bs], positions[:bs], cu_seqlens_bs, states, conv_states
+                    )
+                    outputs[:bs] = hidden
+                    for compact_idx, full_idx in enumerate(linear_idx):
+                        state_out_bufs[compact_idx][:bs] = new_states[full_idx]
+                        conv_out_bufs[compact_idx][:bs] = new_conv_states[full_idx]
+ 
+                _step()    # warmup
+                with torch.cuda.graph(graph, self.graph_pool):
+                    _step()    # capture
+            else:
+                set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs],
+                            block_tables=block_tables[:bs])
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+                with torch.cuda.graph(graph, self.graph_pool):
+                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+ 
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
+            self.graphs[bs] = graph
+            torch.cuda.synchronize()
+            reset_context()
+ 
+        if self._is_hybrid_model:
+            assert sm.states.data_ptr() == state_ptr_before, (
+                "StateManager.states moved address during graph capture — "
+                "the 'no static copy needed' assumption is FALSE, this design "
+                "is unsafe as written and needs a static input buffer instead."
+            )
+            assert sm.conv_states.data_ptr() == conv_ptr_before, (
+                "StateManager.conv_states moved address during graph capture — same issue."
+            )
+ 
+        self.graph_vars = graph_vars
