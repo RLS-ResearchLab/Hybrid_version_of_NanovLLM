@@ -86,7 +86,7 @@ def main():
         max_model_len=128,
         gpu_memory_utilization=0.5,
         tensor_parallel_size=1,
-        enforce_eager=True,
+        enforce_eager=False,
     )
 
     print("Constructing ModelRunner against fake hybrid config...")
