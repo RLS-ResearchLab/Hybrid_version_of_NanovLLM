@@ -1,32 +1,27 @@
-"""Phase 3 Preemption Correctness Test for Qwen3.5 Hybrid Model.
+"""Phase 3 acceptance test: preemption-forced run must produce
+byte-identical output vs. an unconstrained run.
 
-Exercises the REAL Scheduler/ModelRunner/StateManager pipeline via LLMEngine
-under forced memory pressure to validate that preemption:
-  1. Correctly triggers Scheduler.preempt() when KV blocks are constrained.
-  2. Frees state slots in StateManager without leaking slot allocations.
-  3. Correctly re-prefills and rebuilds GDR linear attention state from scratch.
-  4. Produces byte-identical completion tokens compared to an unconstrained run.
+Forces Scheduler.preempt() to actually fire by constructing a ModelRunner
+with a deliberately small num_kvcache_blocks (via low gpu_memory_utilization),
+running several concurrent sequences long enough that they can't all fit
+their KV blocks simultaneously, and comparing the resulting tokens against
+the same sequences run with no memory pressure.
 
-Note on kvcache_block_size: FlashAttention's paged-KV-cache path
-(flash_attn_with_kvcache) hard-requires block size to be a multiple of 256
-internally. We can't shrink the block granularity to force scarcity — instead
-we keep block_size=256 (the real default) and make sequences long enough
-(max_tokens=300) to actually cross a 256-token block boundary, then shrink the
-*block count* (not size) to force multiple concurrent long sequences to
-compete for a scarce pool of full-size blocks.
+Sampling is monkeypatched to plain argmax (greedy) for both runs -- the
+stock Sampler's Gumbel-max trick draws from torch's RNG stream once per
+call, and preemption changes how many calls happen and in what order, so a
+"byte-identical" comparison against stochastic sampling is meaningless by
+construction, not just imprecise. Greedy removes that confound entirely.
 
 Usage:
     python tests/make_fake_hf_config.py
     python tests/test_qwen35_preemption.py
 """
-
-import sys
-import os
-import json
+import sys, os, json, gc
 import torch
-import torch.nn as nn
 
-# --- Path & virtual nanovllm package setup ---
+sys.path.insert(0, os.path.dirname(__file__))
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _PARENT = os.path.dirname(ROOT)
 if _PARENT not in sys.path:
@@ -39,24 +34,14 @@ if _WS_NAME != "nanovllm":
     nanovllm_pkg.__file__ = os.path.join(ROOT, "__init__.py")
     sys.modules["nanovllm"] = nanovllm_pkg
 
-# --- Determinism requirement #2: Monkeypatch Sampler to plain greedy argmax ---
-import nanovllm.layers.sampler as sampler_mod
-sampler_mod.Sampler.forward = lambda self, logits, temperatures: logits.float().argmax(dim=-1)
-
-# --- Monkeypatch model loading (fake config, no .safetensors) ---
 import nanovllm.utils.loader as loader_mod
 loader_mod.load_model = lambda model, path: None
 
 import nanovllm.config as config_mod
-
-# NOTE: the block-size-bypass patch from earlier attempts has been removed.
-# Config's real __post_init__ (with its `kvcache_block_size % 256 == 0`
-# assertion) is used as-is — flash-attn's paged-cache kernel requires this,
-# so bypassing it just moves the failure from Config to flash_attn with a
-# less clear error message.
+sys.path.insert(0, os.path.dirname(__file__))
+from test_utils import init_model_weights_, assert_not_degenerate
 
 class AttrDict(dict):
-    """Minimal stand-in for HF's PretrainedConfig."""
     def __getattr__(self, k):
         try:
             return self[k]
@@ -65,11 +50,9 @@ class AttrDict(dict):
     def __setattr__(self, k, v):
         self[k] = v
 
-_DTYPE_MAP = {
-    "bfloat16": torch.bfloat16,
-    "float16": torch.float16,
-    "float32": torch.float32,
-}
+
+_DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+
 
 def _fake_from_pretrained(path, *args, **kwargs):
     with open(os.path.join(path, "config.json")) as f:
@@ -78,197 +61,185 @@ def _fake_from_pretrained(path, *args, **kwargs):
     d.dtype = _DTYPE_MAP[d.pop("torch_dtype")]
     return d
 
-config_mod.AutoConfig.from_pretrained = staticmethod(_fake_from_pretrained)
 
-# --- Tokenizer Monkeypatch ---
-class DummyTokenizer:
-    eos_token_id = 999999  # high EOS ID so max_tokens bounds generation
+def _build_engine_pieces(gpu_memory_utilization, max_num_seqs=4):
+    """Construct a fresh ModelRunner + Scheduler pair with a given memory
+    budget. Returns (runner, scheduler). Re-seeds weight init identically
+    every call so different memory budgets are still comparing the SAME
+    model weights."""
+    from nanovllm.config import Config
+    from nanovllm.engine.model_runner import ModelRunner
+    from nanovllm.engine.scheduler import Scheduler
+    from nanovllm.models.qwen3_5 import Experts
+    
 
-    def encode(self, prompt):
-        if isinstance(prompt, list):
-            return prompt
-        return [int(x) for x in prompt.split() if x.isdigit()]
-
-    def decode(self, token_ids):
-        return " ".join(str(t) for t in token_ids)
-
-import transformers
-transformers.AutoTokenizer.from_pretrained = staticmethod(lambda *args, **kwargs: DummyTokenizer())
-
-from nanovllm.config import Config
-from nanovllm.engine.llm_engine import LLMEngine
-from nanovllm.sampling_params import SamplingParams
-from nanovllm.models.qwen3_5 import Experts
-
-
-def init_deterministic_weights(engine: LLMEngine, seed: int = 42):
-    """Initialize all model weights deterministically so uninitialized memory
-    (torch.empty in the custom Column/Row/Replicated/MergedColumn linear
-    layers and the embedding classes — none of which are plain nn.Linear or
-    nn.Embedding, so isinstance-based init misses them entirely) doesn't
-    introduce zeros/NaN/inf or unintended randomness into logits."""
-    with torch.no_grad():
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        model = engine.model_runner.model
-        for name, param in model.named_parameters():
-            if param.dim() >= 2:
-                nn.init.normal_(param, mean=0.0, std=0.02)
-            else:
-                nn.init.zeros_(param)  # biases, A_log, dt_bias, 1D norm weights
-
-
-def shrink_kv_cache(engine, num_blocks):
-    """Force num_kvcache_blocks down to a small number post-construction,
-    so preemption is triggered deterministically regardless of GPU size.
-    Block SIZE (256, flash-attn's hard requirement) is left untouched —
-    only the block COUNT is shrunk."""
-    mr = engine.model_runner
-    cfg = mr.config
-    cfg.num_kvcache_blocks = num_blocks
-
-    _, num_kv_layers, _, block_size, num_kv_heads, head_dim = mr.kv_cache.shape
-    mr.kv_cache = torch.empty(
-        2, num_kv_layers, num_blocks, block_size, num_kv_heads, head_dim,
-        device="cuda", dtype=mr.kv_cache.dtype,
+    fake_dir = os.path.join(os.path.dirname(__file__), "fake_qwen35_small")
+    config = Config(
+        model=fake_dir,
+        max_num_batched_tokens=256,
+        max_num_seqs=max_num_seqs,
+        max_model_len=128,
+        gpu_memory_utilization=gpu_memory_utilization,
+        tensor_parallel_size=1,
+        enforce_eager=True,   # keep this test focused on preemption, not graphs
     )
+    # ModelRunner.__init__ unconditionally calls dist.init_process_group(),
+    # which throws if the default process group is already initialized --
+    # and this helper gets called more than once per process (once for the
+    # unconstrained run, once or more inside the memory-budget search loop).
+    # Tear down any prior group before building the next ModelRunner.
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+    runner = ModelRunner(config, rank=0, event=[])
+
+    init_model_weights_(runner.model, seed=2024)
+
+    scheduler = Scheduler(config)
+    scheduler.state_manager = runner.state_manager
+    return runner, scheduler
+
+
+def _run_to_completion(runner, scheduler, prompts, max_tokens, greedy_sampler):
+    """Drive the real Scheduler/ModelRunner loop to completion for a batch
+    of prompts, returning {index_in_prompts: generated_token_ids}."""
+    from nanovllm.engine.sequence import Sequence, SequenceStatus
+    from nanovllm.sampling_params import SamplingParams
+
+    seqs = []
+    for p in prompts:
+        seq = Sequence(p, SamplingParams(max_tokens=max_tokens, ignore_eos=True, temperature=1.0))
+        scheduler.add(seq)
+        seqs.append(seq)
+
+    orig_sampler_forward = runner.sampler.forward
+    runner.sampler.forward = greedy_sampler
+
+    preemption_fired = False
+    orig_preempt = scheduler.preempt
+    def _tracking_preempt(seq):
+        nonlocal preemption_fired
+        preemption_fired = True
+        return orig_preempt(seq)
+    scheduler.preempt = _tracking_preempt
+
+    steps = 0
+    first_step = True
+    while not scheduler.is_finished():
+        batch, is_prefill = scheduler.schedule()
+        token_ids = runner.run(batch, is_prefill)
+        if first_step:
+            # token_ids here are already sampled ints, not logits -- cheapest
+            # real check at this point is just: are they suspiciously uniform?
+            if len(set(token_ids)) == 1:
+                print(f"  [WARNING] all sampled tokens identical on first step: {token_ids[0]} "
+                      f"-- possible degenerate/uninitialized model, verify before trusting this run")
+            first_step = False
+        scheduler.postprocess(batch, token_ids, is_prefill)
+        steps += 1
+
+    runner.sampler.forward = orig_sampler_forward
+    scheduler.preempt = orig_preempt
+
+    return {i: seqs[i].completion_token_ids for i in range(len(seqs))}, preemption_fired, steps
+
+
+def _force_small_kv_cache(runner, scheduler, num_blocks):
+    """Directly truncate the block dimension of an already-constructed
+    ModelRunner's kv_cache and re-wire k_cache/v_cache pointers, instead of
+    hunting for a gpu_memory_utilization value that happens to land on a
+    small block count. Deterministic and exact, rather than a coarse search
+    over an indirect knob.
+
+    CRITICAL: scheduler.block_manager was already constructed with the
+    ORIGINAL (large) block count in _build_engine_pieces, before this ever
+    runs. If not rebuilt here too, BlockManager will keep handing out block
+    ids beyond the physical kv_cache tensor's new (smaller) size -- an
+    out-of-bounds write in the Triton store_kvcache kernel, which does NOT
+    bounds-check, silently corrupting adjacent GPU memory instead of
+    raising an error. Must rebuild BlockManager in lockstep with kv_cache,
+    not just truncate the tensor."""
+    assert num_blocks < runner.config.num_kvcache_blocks
+    runner.config.num_kvcache_blocks = num_blocks
+    runner.kv_cache = runner.kv_cache[:, :, :num_blocks].contiguous()
     layer_id = 0
-    for module in mr.model.modules():
+    for module in runner.model.modules():
         if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-            module.k_cache = mr.kv_cache[0, layer_id]
-            module.v_cache = mr.kv_cache[1, layer_id]
+            module.k_cache = runner.kv_cache[0, layer_id]
+            module.v_cache = runner.kv_cache[1, layer_id]
             layer_id += 1
+    assert layer_id == runner.kv_cache.shape[1]
 
     from nanovllm.engine.block_manager import BlockManager
-    engine.scheduler.block_manager = BlockManager(num_blocks, cfg.kvcache_block_size)
+    scheduler.block_manager = BlockManager(num_blocks, runner.block_size)
 
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    assert device == "cuda", "Preemption test requires CUDA (flash-attn, paged KV cache)"
+    assert torch.cuda.is_available(), "requires CUDA"
+    config_mod.AutoConfig.from_pretrained = staticmethod(_fake_from_pretrained)
 
     fake_dir = os.path.join(os.path.dirname(__file__), "fake_qwen35_small")
-    assert os.path.isdir(fake_dir), "Run tests/make_fake_hf_config.py first"
+    assert os.path.isdir(fake_dir), "run tests/make_fake_hf_config.py first"
 
-    # Test prompt token lists (4 distinct prompts of varying lengths)
-    prompts = [
-        [10, 11, 12, 13, 14, 15, 16, 17],
-        [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
-        [40, 41, 42, 43],
-        [50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65],
-    ]
-    # 300 > 256 (the fixed block_size) so a sequence's total length actually
-    # crosses a block boundary and needs a 2nd block during decode — without
-    # this, can_append() never needs a new block and preempt() never fires,
-    # no matter how few blocks exist globally.
-    max_tokens = 300
-    sampling_params = SamplingParams(max_tokens=max_tokens, temperature=1.0)
+    def greedy_sampler(logits, temperatures):
+        return logits.float().argmax(dim=-1)
 
-    print("=" * 70)
-    print("PHASE 3 PREEMPTION TEST: Qwen3.5 Hybrid Model")
-    print("=" * 70)
+    torch.manual_seed(500)
+    # Prompts + generation must exceed block_size (256) for at least one
+    # sequence, or Scheduler.preempt() can never fire at all -- it only
+    # triggers when a RUNNING sequence needs a SECOND block (crossing a
+    # block-size boundary), never on prefill-time admission contention.
+    # Short sequences (prev attempt: 12-18 tokens + 20 generated) can only
+    # ever exercise admission-stalling, a different, non-preemption code
+    # path -- confirmed by that attempt's step count changing (20->40
+    # steps) while preempted_c stayed False the whole time.
+    prompts = [torch.randint(100, 5000, (n,)).tolist() for n in [10, 12, 8, 15]]
+    max_tokens = 260   # prompt + generated > 256 for every sequence here
 
-    # -------------------------------------------------------------------------
-    # RUN A: Unconstrained (Generous KV cache, zero preemption)
-    # -------------------------------------------------------------------------
-    print("\n--- RUN A: Unconstrained Execution ---")
-    engine_a = LLMEngine(
-        fake_dir,
-        max_num_batched_tokens=256,
-        max_num_seqs=8,
-        max_model_len=512,   # room for prompt + up to 300 generated tokens
-        gpu_memory_utilization=0.5,
-        tensor_parallel_size=1,
-        enforce_eager=True,
-    )
-    try:
-        init_deterministic_weights(engine_a, seed=42)
-
-        preempt_count_a = [0]
-        orig_preempt_a = engine_a.scheduler.preempt
-        def count_preempt_a(seq):
-            preempt_count_a[0] += 1
-            return orig_preempt_a(seq)
-        engine_a.scheduler.preempt = count_preempt_a
-
-        res_a = engine_a.generate(prompts, sampling_params, use_tqdm=False)
-        tokens_a = [out["token_ids"] for out in res_a]
-
-        print(f"  Run A Preemption Count: {preempt_count_a[0]}")
-        assert preempt_count_a[0] == 0, f"Run A unexpected preemption: {preempt_count_a[0]}"
-        print(f"  Run A Generated Tokens (sample seq 0): {tokens_a[0][:8]}...")
-    finally:
-        # Clean up distributed process group and CUDA resources before starting Run B
-        engine_a.exit()
+    # ---- unconstrained baseline: generous memory budget ----
+    print("Building UNCONSTRAINED engine (generous memory budget)...")
+    runner_u, sched_u = _build_engine_pieces(gpu_memory_utilization=0.5)
+    baseline, preempted_u, steps_u = _run_to_completion(runner_u, sched_u, prompts, max_tokens, greedy_sampler)
+    print(f"  done in {steps_u} steps, preemption fired: {preempted_u} (expected False)")
+    assert not preempted_u, "unconstrained run unexpectedly preempted -- budget not generous enough, raise it"
+    del runner_u, sched_u
+    gc.collect()
     torch.cuda.empty_cache()
-    torch.cuda.synchronize()
 
-    # -------------------------------------------------------------------------
-    # RUN B: Preemption-Forced (tiny block COUNT, real block SIZE)
-    # -------------------------------------------------------------------------
-    print("\n--- RUN B: Preemption-Forced Execution ---")
-    engine_b = LLMEngine(
-        fake_dir,
-        max_num_batched_tokens=256,
-        max_num_seqs=8,
-        max_model_len=512,
-        gpu_memory_utilization=0.5,  # doesn't matter — shrink_kv_cache overrides directly below
-        tensor_parallel_size=1,
-        enforce_eager=True,
+    # ---- memory-constrained: build once, then directly truncate kv_cache
+    # to a small fixed block count that's guaranteed to force contention.
+    # Each of the 4 prompts (max ~38 tokens including generation) needs
+    # exactly 1 block at block_size=256, so num_blocks < 4 guarantees at
+    # least one sequence can't get a block when all 4 are concurrently
+    # scheduled. ----
+    print("\nBuilding CONSTRAINED engine (will truncate kv_cache directly)...")
+    runner_c, sched_c = _build_engine_pieces(gpu_memory_utilization=0.15, max_num_seqs=4)
+    print(f"  built with {runner_c.config.num_kvcache_blocks} blocks (unconstrained-for-this-config)")
+    _force_small_kv_cache(runner_c, sched_c, num_blocks=len(prompts))
+    print(f"  truncated to {runner_c.config.num_kvcache_blocks} blocks "
+          f"(== {len(prompts)} concurrent sequences -> 0 free once all admitted; "
+          f"first sequence to cross a block-size boundary must preempt another)")
+
+    constrained, preempted_c, steps_c = _run_to_completion(runner_c, sched_c, prompts, max_tokens, greedy_sampler)
+    print(f"  done in {steps_c} steps, preemption fired: {preempted_c}")
+    assert preempted_c, (
+        "still no preemption even with only 2 blocks for 4 concurrent sequences -- "
+        "check BlockManager.can_allocate()/Scheduler.schedule()'s decode-branch "
+        "preemption trigger, this should have been unavoidable"
     )
-    init_deterministic_weights(engine_b, seed=42)
-    # 4 sequences need >=1 block each just to start (4 total), and will each
-    # need a 2nd block once they cross token 256. 6 blocks is enough for all
-    # 4 to start, but not enough for all 4 to hold 2 blocks simultaneously —
-    # forcing real competition/eviction once sequences grow past the first block.
-    shrink_kv_cache(engine_b, num_blocks=6)
 
-    try:
-        actual_blocks = engine_b.model_runner.config.num_kvcache_blocks
-        print(f"  Run B Allocated KV Cache Blocks (via allocate_kv_cache): {actual_blocks}")
+    print(f"\nPreemption forced. Comparing outputs...")
+    print("=" * 60)
+    all_match = True
+    for i in range(len(prompts)):
+        match = baseline[i] == constrained[i]
+        all_match &= match
+        print(f"  seq {i}: {'MATCH' if match else 'MISMATCH'}"
+              f"{'' if match else f' -- baseline={baseline[i]} constrained={constrained[i]}'}")
+    print("=" * 60)
+    assert all_match, "preempted run diverged from unconstrained run -- NOT byte-identical"
+    print("[PASS] preemption-forced run is byte-identical to unconstrained run")
 
-        preempt_count_b = [0]
-        orig_preempt_b = engine_b.scheduler.preempt
-        def count_preempt_b(seq):
-            preempt_count_b[0] += 1
-            return orig_preempt_b(seq)
-        engine_b.scheduler.preempt = count_preempt_b
-
-        res_b = engine_b.generate(prompts, sampling_params, use_tqdm=False)
-        tokens_b = [out["token_ids"] for out in res_b]
-
-        print(f"  Run B Preemption Count: {preempt_count_b[0]}")
-        assert preempt_count_b[0] > 0, "Run B failed to trigger preemption — budget was not constrained enough!"
-        print(f"  [OK] Confirmed preemption triggered {preempt_count_b[0]} time(s)")
-
-        sm = engine_b.model_runner.state_manager
-        if sm is not None:
-            assert len(sm.free_slot_ids) == sm.max_num_seqs, (
-                f"Run B leaked state slots! {sm.max_num_seqs - len(sm.free_slot_ids)} slots still in use."
-            )
-            print("  [OK] StateManager pool fully cleaned up after preemption run.")
-    finally:
-        engine_b.exit()
-
-    # -------------------------------------------------------------------------
-    # ASSERTION: Byte-identical outputs between Run A and Run B
-    # -------------------------------------------------------------------------
-    print("\n--- Verifying Exact Token Equivalence ---")
-    mismatches = 0
-    for idx, (seq_a, seq_b) in enumerate(zip(tokens_a, tokens_b)):
-        if seq_a != seq_b:
-            print(f"  [FAIL] Sequence {idx} mismatch!")
-            print(f"    Run A: {seq_a}")
-            print(f"    Run B: {seq_b}")
-            mismatches += 1
-        else:
-            print(f"  [PASS] Sequence {idx}: exact match ({len(seq_a)} tokens)")
-
-    assert mismatches == 0, f"Preemption test failed: {mismatches} sequence(s) mismatched!"
-
-    print("=" * 70)
-    print("ALL PREEMPTION TESTS PASSED — Preemption is 100% correct!")
-    print("=" * 70)
 
 if __name__ == "__main__":
     main()

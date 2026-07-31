@@ -3,6 +3,7 @@ import sys
 import types
 import pickle
 import torch
+import torch._dynamo
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -42,6 +43,17 @@ class ModelRunner:
         self.rank = rank
         self.event = event
         self.state_manager = None
+
+        # enforce_eager elsewhere in this file only gates CUDA graph
+        # capture/replay -- it does nothing about the @torch.compile
+        # decorators in layers/{layernorm,sampler,activation,rotary_embedding}.py,
+        # which are applied at import time independent of any engine config.
+        # Disabling dynamo globally is the only way enforce_eager=True actually
+        # guarantees zero compilation anywhere in the forward path. Set
+        # unconditionally (not just when True) so a later ModelRunner built
+        # with enforce_eager=False in the same process re-enables compilation
+        # instead of staying silently stuck off.
+        torch._dynamo.config.disable = self.enforce_eager
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)

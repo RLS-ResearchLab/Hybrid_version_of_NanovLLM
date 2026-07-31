@@ -50,6 +50,18 @@ class StateManager:
         # whatever the previous tenant of this slot left behind.
         self.states[:, slot_id].zero_()
         self.conv_states[:, slot_id].zero_()
+        # Fail loudly rather than silently serving a contaminated slot --
+        # a leftover nonzero value here means a new sequence would read
+        # a previous tenant's recurrent/conv state with no crash or NaN,
+        # just silently wrong output.
+        assert not self.states[:, slot_id].any(), (
+            f"StateManager slot {slot_id} not fully zeroed after allocate() -- "
+            f"recurrent state contamination risk for the incoming sequence"
+        )
+        assert not self.conv_states[:, slot_id].any(), (
+            f"StateManager slot {slot_id} not fully zeroed after allocate() -- "
+            f"conv-state contamination risk for the incoming sequence"
+        )
         seq.state_slot = slot_id
         return slot_id
 
