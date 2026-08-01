@@ -30,13 +30,29 @@ ARCH_DISPATCH = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen35ForCausalLM": Qwen35ForCausalLM,
     "Qwen35MoEForCausalLM": Qwen35ForCausalLM,
+    "Qwen3_5MoeForConditionalGeneration": Qwen35ForCausalLM,
 }
+
+
+def _resolve_dtype(dtype) -> torch.dtype:
+    """hf_config.dtype comes straight off config.json and may be a plain
+    string (e.g. "bfloat16") rather than an actual torch.dtype -- real VLM
+    checkpoints serialize it that way. Resolve generically via getattr(torch,
+    name) so any dtype string transformers emits works, not just bfloat16."""
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    resolved = getattr(torch, dtype, None)
+    if not isinstance(resolved, torch.dtype):
+        raise ValueError(f"Unrecognized torch dtype string: {dtype!r}")
+    return resolved
+
 
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
+        hf_config.dtype = _resolve_dtype(hf_config.dtype)
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
