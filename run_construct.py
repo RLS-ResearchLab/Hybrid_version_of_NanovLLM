@@ -25,12 +25,23 @@ if _WS_NAME != "nanovllm" and "nanovllm" not in sys.modules:
 # submodule directly surfaces the real error.
 from nanovllm.llm import LLM
 
-llm = LLM(
-    "qwen35_checkpoint",
-    enforce_eager=True,
-    tensor_parallel_size=2,
-    gpu_memory_utilization=0.9,
-    max_num_seqs=1,
-    max_model_len=2048,
-)
-print("LLM construction succeeded:", type(llm))
+
+def main():
+    llm = LLM(
+        "qwen35_checkpoint",
+        enforce_eager=True,
+        tensor_parallel_size=2,
+        gpu_memory_utilization=0.9,
+        max_num_seqs=1,
+        max_model_len=2048,
+    )
+    print("LLM construction succeeded:", type(llm))
+
+
+if __name__ == "__main__":
+    # Required: engine/llm_engine.py spawns rank>0 ModelRunner processes via
+    # multiprocessing's "spawn" context whenever tensor_parallel_size > 1.
+    # Under spawn, child processes re-import this file as __main__ -- without
+    # this guard they'd re-run LLM(...) too, recursing before the parent even
+    # finishes starting the first child.
+    main()
