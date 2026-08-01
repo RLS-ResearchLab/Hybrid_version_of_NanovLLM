@@ -29,13 +29,22 @@ class Config:
         # Flatten both onto the top-level object so any field downstream code
         # reads directly (hidden_size, vocab_size, rope_theta, ...) resolves
         # correctly regardless of nesting depth.
+        #
+        # Only fill gaps (top-level attribute missing or None) -- never
+        # overwrite a real top-level value. text_config is itself a full
+        # PretrainedConfig with its own base-class defaults (e.g.
+        # `architectures=None`, `model_type="qwen3_5_moe_text"`), and a
+        # blind overwrite clobbers meaningful top-level fields like
+        # `architectures` with those meaningless nested defaults.
         text_config = getattr(hf_config, "text_config", None)
         if text_config is not None:
             for key, value in vars(text_config).items():
-                setattr(hf_config, key, value)
+                if getattr(hf_config, key, None) is None:
+                    setattr(hf_config, key, value)
         rope_parameters = getattr(hf_config, "rope_parameters", None)
         if isinstance(rope_parameters, dict):
             for key, value in rope_parameters.items():
-                setattr(hf_config, key, value)
+                if getattr(hf_config, key, None) is None:
+                    setattr(hf_config, key, value)
         self.hf_config = hf_config
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
