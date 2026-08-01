@@ -16,7 +16,14 @@ if _WS_NAME != "nanovllm" and "nanovllm" not in sys.modules:
     nanovllm_pkg.__file__ = os.path.join(ROOT, "__init__.py")
     sys.modules["nanovllm"] = nanovllm_pkg
 
-from nanovllm import LLM
+# Import the submodule directly rather than `from nanovllm import LLM` --
+# the latter goes through nanovllm/__init__.py's __getattr__ lazy-import
+# shim, and CPython's IMPORT_FROM opcode swallows whatever the real
+# underlying exception is if that shim's own import chain raises
+# AttributeError anywhere, replacing it with a generic
+# "cannot import name 'LLM'" message with no traceback. Importing the
+# submodule directly surfaces the real error.
+from nanovllm.llm import LLM
 
 llm = LLM(
     "qwen35_checkpoint",
