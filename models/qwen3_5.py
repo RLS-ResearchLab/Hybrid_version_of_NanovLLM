@@ -579,8 +579,8 @@ class Qwen35DecoderLayer(nn.Module):
         # MoE FFN
         self.mlp = Qwen35MoE(
             hidden_size=hidden_size,
-            intermediate_size=getattr(config, "moe_intermediate_size", config.intermediate_size),
-            shared_intermediate_size=getattr(config, "shared_expert_intermediate_size", config.intermediate_size),
+            intermediate_size=getattr(config, "moe_intermediate_size", getattr(config, "intermediate_size", None)),
+            shared_intermediate_size=getattr(config, "shared_expert_intermediate_size", getattr(config, "intermediate_size", None)),
             num_experts=getattr(config, "num_experts", 256),
             top_k=getattr(config, "num_experts_per_tok", 8),
         )
