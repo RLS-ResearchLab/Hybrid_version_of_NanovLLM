@@ -28,8 +28,8 @@ from nanovllm.llm import LLM
 llm = LLM(
     "qwen35_checkpoint",
     enforce_eager=True,
-    tensor_parallel_size=1,
-    gpu_memory_utilization=0.2,
+    tensor_parallel_size=2,
+    gpu_memory_utilization=0.9,
     max_num_seqs=1,
     max_model_len=2048,
 )
