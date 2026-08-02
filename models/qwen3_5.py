@@ -216,11 +216,21 @@ class Qwen35LinearAttention(nn.Module):
         self.in_proj_a = ColumnParallelLinear(hidden_size, self.total_lvh, bias=False)
         self.in_proj_b = ColumnParallelLinear(hidden_size, self.total_lvh, bias=False)
 
-        # Depthwise causal conv1d
+        # Depthwise causal conv1d. groups=qkv_dim -> 1-to-1 per channel, so
+        # this operates on exactly whatever channels in_proj_qkv produced
+        # locally for this rank. nn.Conv1d creates its own .weight
+        # internally (not our nn.Parameter(...) call) -- easy to miss in an
+        # audit that only searches for explicit nn.Parameter(...) sites, but
+        # it's the same gap: real checkpoints store the FULL
+        # (total_qkv_dim, 1, kernel_size) tensor, and this needs the SAME
+        # contiguous out_channels range in_proj_qkv's ColumnParallelLinear
+        # sharding already uses, or a channel here pairs with the wrong
+        # channel's conv kernel.
         self.conv1d = nn.Conv1d(
             self.qkv_dim, self.qkv_dim, conv_kernel_size,
             groups=self.qkv_dim, padding=conv_kernel_size - 1, bias=False
         )
+        self.conv1d.weight.weight_loader = self._tp_dim0_weight_loader
 
         # Per-head parameters for GDR gating. Raw nn.Parameter, no TP-linear
         # wrapper, so -- unlike in_proj_qkv/in_proj_z/in_proj_a/in_proj_b --
@@ -233,8 +243,8 @@ class Qwen35LinearAttention(nn.Module):
         # LinearBase uses (self.weight.weight_loader = self.weight_loader).
         self.A_log = nn.Parameter(torch.zeros(self.lvh))
         self.dt_bias = nn.Parameter(torch.zeros(self.lvh))
-        self.A_log.weight_loader = self._tp_head_weight_loader
-        self.dt_bias.weight_loader = self._tp_head_weight_loader
+        self.A_log.weight_loader = self._tp_dim0_weight_loader
+        self.dt_bias.weight_loader = self._tp_dim0_weight_loader
 
         # Gated RMSNorm on output
         self.norm = Qwen35RMSNormGated(self.lhd, eps=rms_norm_eps)
@@ -246,10 +256,11 @@ class Qwen35LinearAttention(nn.Module):
         assert self.lvh % self.lkh == 0
         self.head_expand = self.lvh // self.lkh
 
-    def _tp_head_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        """Row-shard a 1D per-head parameter (A_log, dt_bias) by tp_rank --
-        same contiguous chunking as ColumnParallelLinear, applied to the same
-        head dimension in_proj_a/in_proj_b are sharded along."""
+    def _tp_dim0_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """Shard along dim 0 by tp_rank -- same contiguous chunking as
+        ColumnParallelLinear, applied to raw parameters (A_log, dt_bias,
+        conv1d.weight) that have no LinearBase wrapper of their own but need
+        to land on the same rank as the qkv/a/b channels they pair with."""
         shard_size = param.shape[0]
         start = self.tp_rank * shard_size
         param.data.copy_(loaded_weight.narrow(0, start, shard_size))

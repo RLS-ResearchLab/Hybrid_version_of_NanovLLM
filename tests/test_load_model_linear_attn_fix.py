@@ -1,15 +1,17 @@
 """Re-measures load_model()'s DISPATCH+DATA correctness (same standard as
 tests/test_load_model_tp.py's "Part 1") specifically against
-Qwen35LinearAttention's seven now-fixed parameters: in_proj_qkv, in_proj_z,
-in_proj_a, in_proj_b, out_proj, A_log, dt_bias.
+Qwen35LinearAttention's eight now-fixed parameters: in_proj_qkv, in_proj_z,
+in_proj_a, in_proj_b, out_proj, A_log, dt_bias, conv1d.weight.
 
-A_log/dt_bias were added after the first version of this test caught a
-real bug on the actual GPU server run: they're raw nn.Parameters (no
-LinearBase wrapper, so no free weight_loader), sized locally (self.lvh) but
-previously had no weight_loader at all -- default_weight_loader's unsliced
-copy_() crashed on a genuine full (32) vs local (16) shape mismatch the
-first time this ran against the real checkpoint. Fixed via an explicit
-_tp_head_weight_loader bound the same way LinearBase binds its own.
+A_log/dt_bias/conv1d.weight were added after real GPU server runs caught
+two rounds of the same bug class: raw parameters (A_log/dt_bias are our own
+nn.Parameter; conv1d.weight belongs to an nn.Conv1d, PyTorch's own internal
+parameter) with no LinearBase wrapper, so no free weight_loader, sized
+locally but with no weight_loader to slice the checkpoint's full-sized
+tensor down -- default_weight_loader's unsliced copy_() crashed on genuine
+shape mismatches (32 vs 16, then 8192 vs 4096) the first two times this ran
+against the real checkpoint. Both fixed via the same explicit
+_tp_dim0_weight_loader, bound the same way LinearBase binds its own.
 
 The earlier pass in test_load_model_tp.py validated load_model()'s dispatch
 logic against parameters that were, at the time, WRONGLY shaped (the
@@ -98,6 +100,13 @@ def _vec_tagged(n: int, base: float) -> torch.Tensor:
     return torch.tensor([float(base + i) for i in range(n)])
 
 
+def _conv_tagged(channels: int, kernel_size: int, base: float) -> torch.Tensor:
+    t = torch.empty(channels, 1, kernel_size)
+    for c in range(channels):
+        t[c, :, :] = float(base + c)
+    return t
+
+
 def _col_tagged(rows: int, cols: int, base: float) -> torch.Tensor:
     t = torch.empty(rows, cols)
     for j in range(cols):
@@ -118,6 +127,7 @@ def _build_checkpoint(tmp_path: str):
         f"{L0}.linear_attn.out_proj.weight": _col_tagged(HIDDEN, total_out_in, 5000.0),
         f"{L0}.linear_attn.A_log": _vec_tagged(LVH, 6000.0),
         f"{L0}.linear_attn.dt_bias": _vec_tagged(LVH, 7000.0),
+        f"{L0}.linear_attn.conv1d.weight": _conv_tagged(total_qkv_dim, CK, 8000.0),
     }
     save_file(ref, tmp_path)
     return ref
@@ -158,6 +168,7 @@ def worker(rank: int, ckpt_dir: str, ref: dict):
         "out_proj": la.out_proj.weight,
         "A_log": la.A_log,
         "dt_bias": la.dt_bias,
+        "conv1d.weight": la.conv1d.weight,
     }
     hit_default = [name for name, p in targets.items() if id(p) in called_via_default]
     assert not hit_default, (
@@ -209,6 +220,19 @@ def worker(rank: int, ckpt_dir: str, ref: dict):
         )
         print(f"[rank{rank}] DATA check OK -- {name}: shape={tuple(real_param.shape)} "
               f"bitwise match vs hand-computed slice [{start}:{start+shard_size}]")
+
+    # conv1d.weight: same dim-0 contiguous slicing, but of the qkv_dim
+    # channel space (different size than A_log/dt_bias's lvh space).
+    qkv_local = (LKH // TP_SIZE + LKH // TP_SIZE + LVH // TP_SIZE) * LHD
+    qkv_start = rank * qkv_local
+    expected_conv = ref[f"{L0}.linear_attn.conv1d.weight"][qkv_start:qkv_start + qkv_local]
+    real_conv = targets["conv1d.weight"]
+    assert torch.equal(real_conv.data, expected_conv), (
+        f"[rank{rank}] DATA MISMATCH on conv1d.weight: real shape={tuple(real_conv.shape)} "
+        f"expected shape={tuple(expected_conv.shape)}"
+    )
+    print(f"[rank{rank}] DATA check OK -- conv1d.weight: shape={tuple(real_conv.shape)} "
+          f"bitwise match vs hand-computed slice [{qkv_start}:{qkv_start+qkv_local}]")
 
     dist.destroy_process_group()
 
