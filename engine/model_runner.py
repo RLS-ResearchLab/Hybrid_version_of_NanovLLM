@@ -405,7 +405,7 @@ class ModelRunner:
         return logits.cpu() if logits is not None else None
 
     @torch.inference_mode()
-    def get_prefill_layer_states(self, seqs: list[Sequence]) -> list[torch.Tensor] | None:
+    def get_prefill_layer_states(self, seqs: list[Sequence]) -> tuple[list[torch.Tensor], torch.Tensor] | None:
         """Diagnostic-only, additive -- does not change run()'s or
         get_prefill_logits()'s behavior at all. Mirrors get_prefill_logits's
         prefill path exactly, but captures the residual-stream hidden state
@@ -416,7 +416,9 @@ class ModelRunner:
         Qwen35RMSNorm computes internally for the next layer's input, i.e.
         the actual residual-stream value at that point, not the
         pre-add/pre-norm intermediate qwen3_5.py's layer forward returns
-        split. Returns None on non-rank-0.
+        split. Also computes final-norm + lm_head logits the same way
+        get_prefill_logits does, as one more checkpoint past the last
+        decoder layer. Returns (layer_states, logits), or None on non-rank-0.
         """
         input_ids, positions = self.prepare_prefill(seqs)
         context = get_context()
@@ -437,8 +439,12 @@ class ModelRunner:
                 state=states[i], conv_state=conv_states[i],
             )
             captured.append((hidden_states + residual).float().cpu())
+        final_hidden, _ = model.norm(hidden_states, residual)
+        logits = self.model.compute_logits(final_hidden)
         reset_context()
-        return captured if self.rank == 0 else None
+        if self.rank != 0:
+            return None
+        return captured, logits.float().cpu()
 
     @torch.inference_mode()
     def capture_cudagraph(self):
