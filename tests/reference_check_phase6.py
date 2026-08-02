@@ -219,12 +219,23 @@ def phase_compare():
     print(f"THRESHOLD (stated before running): cosine >= {COSINE_SIM_THRESHOLD} AND argmax match")
     print(f"VERDICT: {'PASS' if passed else 'FAIL'}")
     if not passed:
-        print("NOTE: this is NOT the expected M-RoPE gap. For a text-only prompt (no image/video "
-              "tokens), Qwen-VL-style get_rope_index() assigns identical t/h/w position ids, so "
-              "missing M-RoPE support should reduce to plain 1D RoPE here -- ~zero effect. A cosine "
-              "similarity this negative, and a garbage (non-token-like) top-1, indicates a real "
-              "correctness bug elsewhere in the forward pass, not a known/deferred gap. See "
-              "reference_check_phase6_layerwise.py to localize which layer the divergence starts at.")
+        if cos_sim < 0 or not argmax_match:
+            print("NOTE: this is NOT the expected M-RoPE gap. For a text-only prompt (no image/video "
+                  "tokens), Qwen-VL-style get_rope_index() assigns identical t/h/w position ids, so "
+                  "missing M-RoPE support should reduce to plain 1D RoPE here -- ~zero effect. A cosine "
+                  "similarity this negative, and/or a wrong top-1, indicates a real correctness bug "
+                  "elsewhere in the forward pass, not a known/deferred gap. See "
+                  "reference_check_phase6_layerwise.py to localize which layer the divergence starts at.")
+        else:
+            print("NOTE: top-1 argmax matches HF -- the generated token is correct. cosine is positive "
+                  "but below the strict 0.99 bar, which (per reference_check_phase6_layerwise.py's "
+                  "attn-only-vs-full-layer trace) shows up as a GRADUAL, compounding drift across all "
+                  "40 layers rather than a discrete per-layer bug. Consistent with bf16 rounding error "
+                  "accumulating through linear_attn's sequential recurrent scan (each of this prompt's "
+                  "tokens depends on the previous token's state, within each of 40 layers) -- the same "
+                  "class of issue test_shared_expert_allreduce_precision.py was already investigating "
+                  "(bf16 vs fp32 all-reduce precision), not a new structural bug like the two TP-sharding "
+                  "bugs fixed earlier tonight (in_proj_qkv and conv1d.weight in Qwen35LinearAttention).")
 
 
 def main():
