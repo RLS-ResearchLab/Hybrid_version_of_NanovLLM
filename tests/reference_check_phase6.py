@@ -85,6 +85,12 @@ def phase_engine():
 
     seq = Sequence(prompt_ids)
     seq.num_scheduled_tokens = len(prompt_ids)
+    # prepare_prefill() (engine/model_runner.py) treats an empty block_table
+    # as the warmup case and skips building slot_mapping entirely, which
+    # then fails store_kvcache's `slot_mapping.numel() == N` assertion for
+    # any real (non-warmup) sequence. Allocate real KV-cache blocks the same
+    # way Scheduler.schedule() does for a fresh, uncached sequence.
+    llm.scheduler.block_manager.allocate(seq, 0)
     if llm.model_runner.state_manager is not None:
         # Matches ModelRunner.warmup_model()'s exact pattern -- slot 0 is
         # safe to reuse here: run()'s state_manager.get_all/set_all are
