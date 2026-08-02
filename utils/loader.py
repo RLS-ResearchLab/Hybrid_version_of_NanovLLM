@@ -62,7 +62,14 @@ def shard_experts_tensor(full_tensor: torch.Tensor, rank: int, tp_size: int) -> 
     num_experts = full_tensor.shape[0]
     assert num_experts % tp_size == 0
     local_ids = [e for e in range(num_experts) if e % tp_size == rank]
-    idx = torch.tensor(local_ids, dtype=torch.long)
+    # Explicit device, matching full_tensor -- not torch's ambient default
+    # device. ModelRunner.__init__ calls torch.set_default_device("cuda")
+    # before load_model() runs, so an unpinned torch.tensor(...) here would
+    # silently land on CUDA while full_tensor (read via safe_open(..., "cpu"))
+    # is on CPU -- index_select then fails on the device mismatch. None of
+    # tonight's CPU-only tests exercised this, since none of them ran with
+    # that default-device override active.
+    idx = torch.tensor(local_ids, dtype=torch.long, device=full_tensor.device)
     return full_tensor.index_select(0, idx)
 
 
