@@ -189,6 +189,7 @@ class Qwen35LinearAttention(nn.Module):
         self.lhd = linear_attn_head_dim
         self.ck = conv_kernel_size
         self.tp_rank = tp_rank
+        self.tp_size = tp_size
 
         # QKV dim = (LKH + LKH + LVH) * LHD -- LOCAL (per-rank) width. Consumed
         # by conv1d below and by forward()'s slicing (lkh/lvh unpacked
@@ -205,6 +206,22 @@ class Qwen35LinearAttention(nn.Module):
         # head_expand, forward()'s slicing).
         total_qkv_dim = (self.total_lkh + self.total_lkh + self.total_lvh) * self.lhd
         self.in_proj_qkv = ColumnParallelLinear(hidden_size, total_qkv_dim, bias=False)
+        # ColumnParallelLinear's default weight_loader takes ONE naive
+        # contiguous dim-0 chunk of the full output range. That's correct
+        # for in_proj_z/in_proj_a/in_proj_b (each a single homogeneous
+        # head-group) but WRONG here: the checkpoint stores in_proj_qkv as
+        # one merged [Q_full(total_lkh*lhd) | K_full(total_lkh*lhd) |
+        # V_full(total_lvh*lhd)] tensor, and forward() slices each rank's
+        # LOCAL weight assuming [Q_local | K_local | V_local] layout (see
+        # forward()'s q/k/v split below). A naive contiguous chunk crosses
+        # the Q/K/V boundaries at tp_size>1 (e.g. tp_size=2 with this
+        # checkpoint's 16/16/32-head split: rank 0's chunk is all of
+        # Q_full+K_full and none of V_full; rank 1's is all of V_full and
+        # none of Q/K) -- silently cross-wiring which weight rows forward()
+        # treats as Q vs K vs V. Split Q/K/V first, then shard each by
+        # tp_rank, matching QKVParallelLinear's approach for the
+        # non-merged-single-tensor case.
+        self.in_proj_qkv.weight.weight_loader = self._qkv_weight_loader
         self.in_proj_z = ColumnParallelLinear(hidden_size, self.total_lvh * self.lhd, bias=False)
         # A and B project to per-head scalars -- LOCAL output (broadcast
         # against the per-rank A_log/dt_bias inside the local delta-rule
@@ -255,6 +272,20 @@ class Qwen35LinearAttention(nn.Module):
         # Head expansion ratio (LKH → LVH)
         assert self.lvh % self.lkh == 0
         self.head_expand = self.lvh // self.lkh
+
+    def _qkv_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """Split the checkpoint's merged [Q_full | K_full | V_full] tensor
+        into its three sections first, shard each section by tp_rank
+        independently, then re-concatenate -- so the local weight ends up
+        [Q_local | K_local | V_local], matching forward()'s slicing."""
+        lhd = self.lhd
+        q_full, k_full, v_full = loaded_weight.split(
+            [self.total_lkh * lhd, self.total_lkh * lhd, self.total_lvh * lhd], dim=0
+        )
+        q_local = q_full.chunk(self.tp_size, dim=0)[self.tp_rank]
+        k_local = k_full.chunk(self.tp_size, dim=0)[self.tp_rank]
+        v_local = v_full.chunk(self.tp_size, dim=0)[self.tp_rank]
+        param.data.copy_(torch.cat([q_local, k_local, v_local], dim=0))
 
     def _tp_dim0_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         """Shard along dim 0 by tp_rank -- same contiguous chunking as

@@ -189,10 +189,30 @@ def worker(rank: int, ckpt_dir: str, ref: dict):
         )
         print(f"[rank{rank}] DATA check OK -- {name}: shape={tuple(real_param.shape)} bitwise match vs oracle")
 
-    total_qkv_dim = (LKH + LKH + LVH) * LHD
-    check("in_proj_qkv", targets["in_proj_qkv"],
-          ColumnParallelLinear(HIDDEN, total_qkv_dim, bias=False),
-          f"{L0}.linear_attn.in_proj_qkv.weight")
+    # in_proj_qkv: hand-computed Q/K/V-split-then-shard, independent of the
+    # method under test (same pattern as A_log/dt_bias/conv1d.weight below)
+    # -- NOT a same-class "oracle" built from plain ColumnParallelLinear's
+    # own default weight_loader. That oracle would itself reproduce the
+    # Q/K/V-boundary-crossing bug _qkv_weight_loader exists to avoid: a
+    # naive contiguous dim-0 chunk of the merged [Q_full|K_full|V_full]
+    # checkpoint tensor crosses section boundaries at tp_size>1, silently
+    # feeding e.g. rank 0 all of Q_full+K_full and none of V_full instead of
+    # each rank's own Q/K/V head slice.
+    full_qkv = ref[f"{L0}.linear_attn.in_proj_qkv.weight"]
+    q_full, k_full, v_full = full_qkv.split([LKH * LHD, LKH * LHD, LVH * LHD], dim=0)
+    q_local = q_full.chunk(TP_SIZE, dim=0)[rank]
+    k_local = k_full.chunk(TP_SIZE, dim=0)[rank]
+    v_local = v_full.chunk(TP_SIZE, dim=0)[rank]
+    expected_qkv = torch.cat([q_local, k_local, v_local], dim=0)
+    real_qkv = targets["in_proj_qkv"]
+    assert torch.equal(real_qkv.data, expected_qkv), (
+        f"[rank{rank}] DATA MISMATCH on in_proj_qkv: real shape={tuple(real_qkv.shape)} "
+        f"expected shape={tuple(expected_qkv.shape)}\n"
+        f"real ={real_qkv.data.tolist()}\nexpected={expected_qkv.tolist()}"
+    )
+    print(f"[rank{rank}] DATA check OK -- in_proj_qkv: shape={tuple(real_qkv.shape)} "
+          f"bitwise match vs hand-computed Q/K/V-split-then-shard slice")
+
     check("in_proj_z", targets["in_proj_z"],
           ColumnParallelLinear(HIDDEN, LVH * LHD, bias=False),
           f"{L0}.linear_attn.in_proj_z.weight")
