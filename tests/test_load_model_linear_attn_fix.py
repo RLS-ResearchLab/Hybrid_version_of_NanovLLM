@@ -1,7 +1,15 @@
 """Re-measures load_model()'s DISPATCH+DATA correctness (same standard as
 tests/test_load_model_tp.py's "Part 1") specifically against
-Qwen35LinearAttention's five now-fixed parameters: in_proj_qkv, in_proj_z,
-in_proj_a, in_proj_b, out_proj.
+Qwen35LinearAttention's seven now-fixed parameters: in_proj_qkv, in_proj_z,
+in_proj_a, in_proj_b, out_proj, A_log, dt_bias.
+
+A_log/dt_bias were added after the first version of this test caught a
+real bug on the actual GPU server run: they're raw nn.Parameters (no
+LinearBase wrapper, so no free weight_loader), sized locally (self.lvh) but
+previously had no weight_loader at all -- default_weight_loader's unsliced
+copy_() crashed on a genuine full (32) vs local (16) shape mismatch the
+first time this ran against the real checkpoint. Fixed via an explicit
+_tp_head_weight_loader bound the same way LinearBase binds its own.
 
 The earlier pass in test_load_model_tp.py validated load_model()'s dispatch
 logic against parameters that were, at the time, WRONGLY shaped (the
@@ -86,6 +94,10 @@ def _row_tagged(rows: int, cols: int, base: float) -> torch.Tensor:
     return t
 
 
+def _vec_tagged(n: int, base: float) -> torch.Tensor:
+    return torch.tensor([float(base + i) for i in range(n)])
+
+
 def _col_tagged(rows: int, cols: int, base: float) -> torch.Tensor:
     t = torch.empty(rows, cols)
     for j in range(cols):
@@ -104,6 +116,8 @@ def _build_checkpoint(tmp_path: str):
         f"{L0}.linear_attn.in_proj_a.weight": _row_tagged(LVH, HIDDEN, 3000.0),
         f"{L0}.linear_attn.in_proj_b.weight": _row_tagged(LVH, HIDDEN, 4000.0),
         f"{L0}.linear_attn.out_proj.weight": _col_tagged(HIDDEN, total_out_in, 5000.0),
+        f"{L0}.linear_attn.A_log": _vec_tagged(LVH, 6000.0),
+        f"{L0}.linear_attn.dt_bias": _vec_tagged(LVH, 7000.0),
     }
     save_file(ref, tmp_path)
     return ref
@@ -142,6 +156,8 @@ def worker(rank: int, ckpt_dir: str, ref: dict):
         "in_proj_a": la.in_proj_a.weight,
         "in_proj_b": la.in_proj_b.weight,
         "out_proj": la.out_proj.weight,
+        "A_log": la.A_log,
+        "dt_bias": la.dt_bias,
     }
     hit_default = [name for name, p in targets.items() if id(p) in called_via_default]
     assert not hit_default, (
@@ -178,6 +194,21 @@ def worker(rank: int, ckpt_dir: str, ref: dict):
     check("out_proj", targets["out_proj"],
           RowParallelLinear(LVH * LHD, HIDDEN, bias=False),
           f"{L0}.linear_attn.out_proj.weight")
+
+    # A_log/dt_bias: independent hand-computed expected slice (not reusing
+    # _tp_head_weight_loader itself, for a check that doesn't depend on the
+    # method under test being correct in order to validate it).
+    shard_size = LVH // TP_SIZE
+    start = rank * shard_size
+    for name, ref_key in (("A_log", f"{L0}.linear_attn.A_log"), ("dt_bias", f"{L0}.linear_attn.dt_bias")):
+        expected = ref[ref_key][start:start + shard_size]
+        real_param = targets[name]
+        assert torch.equal(real_param.data, expected), (
+            f"[rank{rank}] DATA MISMATCH on {name}: real={real_param.data.tolist()} "
+            f"expected={expected.tolist()}"
+        )
+        print(f"[rank{rank}] DATA check OK -- {name}: shape={tuple(real_param.shape)} "
+              f"bitwise match vs hand-computed slice [{start}:{start+shard_size}]")
 
     dist.destroy_process_group()
 

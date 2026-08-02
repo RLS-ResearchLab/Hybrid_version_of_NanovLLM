@@ -222,9 +222,19 @@ class Qwen35LinearAttention(nn.Module):
             groups=self.qkv_dim, padding=conv_kernel_size - 1, bias=False
         )
 
-        # Per-head parameters for GDR gating
+        # Per-head parameters for GDR gating. Raw nn.Parameter, no TP-linear
+        # wrapper, so -- unlike in_proj_qkv/in_proj_z/in_proj_a/in_proj_b --
+        # they don't get a weight_loader for free from LinearBase. Real
+        # checkpoints store the FULL (total_lvh,)-sized tensor; each rank
+        # needs the SAME contiguous row-range as in_proj_a/in_proj_b's
+        # ColumnParallelLinear sharding, so head h's A_log/dt_bias lands on
+        # the same rank as head h's a/b gating value (forward() broadcasts
+        # them together). Bind an explicit weight_loader, same mechanism
+        # LinearBase uses (self.weight.weight_loader = self.weight_loader).
         self.A_log = nn.Parameter(torch.zeros(self.lvh))
         self.dt_bias = nn.Parameter(torch.zeros(self.lvh))
+        self.A_log.weight_loader = self._tp_head_weight_loader
+        self.dt_bias.weight_loader = self._tp_head_weight_loader
 
         # Gated RMSNorm on output
         self.norm = Qwen35RMSNormGated(self.lhd, eps=rms_norm_eps)
@@ -235,6 +245,14 @@ class Qwen35LinearAttention(nn.Module):
         # Head expansion ratio (LKH → LVH)
         assert self.lvh % self.lkh == 0
         self.head_expand = self.lvh // self.lkh
+
+    def _tp_head_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """Row-shard a 1D per-head parameter (A_log, dt_bias) by tp_rank --
+        same contiguous chunking as ColumnParallelLinear, applied to the same
+        head dimension in_proj_a/in_proj_b are sharded along."""
+        shard_size = param.shape[0]
+        start = self.tp_rank * shard_size
+        param.data.copy_(loaded_weight.narrow(0, start, shard_size))
 
     def forward(
         self,
