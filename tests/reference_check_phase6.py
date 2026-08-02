@@ -92,14 +92,28 @@ def phase_engine():
     # way Scheduler.schedule() does for a fresh, uncached sequence.
     llm.scheduler.block_manager.allocate(seq, 0)
     if llm.model_runner.state_manager is not None:
-        # Matches ModelRunner.warmup_model()'s exact pattern -- slot 0 is
-        # safe to reuse here: run()'s state_manager.get_all/set_all are
-        # agnostic to the scheduler's separate allocate/free bookkeeping
-        # (confirmed by reading model_runner.py -- warmup_model() itself
-        # never calls an allocate/free method around its own state_slot
-        # usage either, and its own post-warmup assertion about free
-        # slot count already proves this doesn't collide).
-        seq.state_slot = 0
+        # NOT `seq.state_slot = 0` (what this used to do, matching
+        # ModelRunner.warmup_model()'s own shortcut) -- warmup_model() runs
+        # a REAL forward pass using slot 0 (Sequence([0]*seq_len),
+        # seq.state_slot=i, then self.run(seqs, True)), and run()'s prefill
+        # path calls state_manager.set_all(...) at the end, persisting
+        # genuinely non-zero recurrent/conv state into slot 0. Its
+        # post-warmup assertion only checks free/used slot-ID bookkeeping
+        # (len(free_slot_ids) == max_num_seqs) -- it never re-zeros the
+        # underlying state/conv_state tensors. In real production this is
+        # harmless because Scheduler traffic always goes through
+        # StateManager.allocate(), which explicitly .zero_()s a slot before
+        # handing it to a new sequence -- but directly reusing slot 0 here,
+        # bypassing allocate(), was silently feeding this diagnostic's
+        # "fresh" sequence leftover warmup state instead of a truly fresh
+        # (zero) one. Confirmed via reference_check_phase6_layerwise.py's
+        # attn-only trace: linear_attention layers (the only ones that
+        # consume state/conv_state) were consistently worse than
+        # neighboring full_attention layers, and
+        # diag_linear_attn_tp_isolation.py's real-weights/real-HF-input
+        # isolation test (states=None, genuinely fresh) matched HF closely
+        # even where the full pipeline (contaminated slot 0) didn't.
+        llm.model_runner.state_manager.allocate(seq)
 
     logits = llm.model_runner.call("get_prefill_logits", [seq])
     assert logits is not None, "expected rank0 to return gathered logits"
