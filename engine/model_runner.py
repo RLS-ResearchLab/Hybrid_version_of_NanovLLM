@@ -379,6 +379,23 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    def allocate_state_slot(self, seq: Sequence) -> None:
+        """Diagnostic-only, additive. StateManager.allocate() must run on
+        EVERY rank's own StateManager instance, not just rank0's -- each
+        rank at tensor_parallel_size>1 is a separate process with its own
+        independent state/conv_state buffers (each ran its own
+        warmup_model(), which leaves genuine non-zero residue in whatever
+        slot it used, never re-zeroed afterward -- see
+        reference_check_phase6.py's phase_engine() for the full writeup).
+        Calling state_manager.allocate(seq) directly on the caller's own
+        ModelRunner object only zeros ITS rank's copy; dispatching this
+        through .call(...) (which pickles+sends seq to every other rank via
+        the same shared-memory mechanism run()/get_prefill_logits() use)
+        runs allocate() on all of them, so every rank's slot for this seq
+        starts genuinely zeroed, not just rank0's."""
+        if self.state_manager is not None:
+            self.state_manager.allocate(seq)
+
     @torch.inference_mode()
     def get_prefill_logits(self, seqs: list[Sequence]) -> torch.Tensor | None:
         """Diagnostic-only, additive -- does not change run()'s behavior at
