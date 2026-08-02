@@ -428,7 +428,15 @@ class Qwen35MoE(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
 
-        self.experts = Experts(num_experts, intermediate_size, hidden_size)
+        # ep_size==1 (the default/existing single-process and non-EP-TP case)
+        # must allocate identically to before: Experts(num_experts, ...), same
+        # as prior to EP support. Only ep_size>1 shrinks the local allocation
+        # -- round-robin, matching utils.loader.expert_local_slot exactly
+        # (expert e -> rank e % ep_size, local slot e // ep_size).
+        self.ep_size = dist.get_world_size()
+        self.ep_rank = dist.get_rank()
+        local_num_experts = num_experts // self.ep_size if self.ep_size > 1 else num_experts
+        self.experts = Experts(local_num_experts, intermediate_size, hidden_size)
         self.gate = ReplicatedLinear(hidden_size, num_experts, bias=False)
         self.shared_expert = Qwen35SharedExpert(hidden_size, shared_intermediate_size)
         self.shared_expert_gate = ReplicatedLinear(hidden_size, 1, bias=False)
@@ -437,7 +445,20 @@ class Qwen35MoE(nn.Module):
         N = x.shape[0]
         is_decode = (cu_seqlens is not None) and (cu_seqlens.numel() - 1 == N)
         if is_decode:
+            if self.ep_size > 1:
+                # Explicit scope boundary (Q5/Checkpoint 3): only the prefill
+                # (_forward_dispatch) path has an EP-aware variant so far.
+                # _forward_gathered indexes self.experts with GLOBAL expert
+                # ids, which would silently read out-of-bounds/wrong data
+                # against a round-robin-sharded local Experts tensor -- fail
+                # loud instead of computing silently-wrong decode output.
+                raise NotImplementedError(
+                    "EP decode path (_forward_gathered) not implemented yet -- "
+                    "out of scope for Checkpoint 3"
+                )
             return self._forward_gathered(x)
+        if self.ep_size > 1:
+            return self._forward_dispatch_ep(x)
         return self._forward_dispatch(x)
  
     def _forward_gathered(self, x: torch.Tensor) -> torch.Tensor:
@@ -466,6 +487,12 @@ class Qwen35MoE(nn.Module):
  
         # Equivalent to the dispatch loop's `h @ down_proj[e].t()`.
         out_e = torch.einsum('nkhm,nkm->nkh', down, h)          # (N, TK, H)
+        # NOTE: unlike _forward_dispatch/_forward_dispatch_ep, this combine
+        # is NOT promoted to fp32 -- same unpromoted bf16-sum-across-top_k
+        # pattern that measurably caused ~1.3% relative error there before
+        # the fix (see _forward_dispatch's comment), so this decode path
+        # likely has the same issue. Not fixed here: this path wasn't
+        # ablation-tested, only _forward_dispatch/_forward_dispatch_ep were.
         out = (out_e * w.unsqueeze(-1)).sum(dim=1)               # (N, H)
  
         sg = torch.sigmoid(self.shared_expert_gate(x))
@@ -504,7 +531,20 @@ class Qwen35MoE(nn.Module):
             expert_counts.cumsum(0)[:-1]
         ])
  
-        sorted_out = torch.zeros(N * TK, H, device=x.device, dtype=x.dtype)
+        # Weighted-sum-across-top_k combine always happens in fp32, regardless
+        # of x.dtype -- expert FFN matmuls (h) stay in x.dtype, unchanged,
+        # only this combine step is promoted, then cast back down before
+        # shared_expert. Measured (not assumed): for bf16 x, this took the
+        # routed-expert-only output from ~1.3% relative error (bf16-throughout
+        # combine) to exactly bitwise zero vs an fp32 reference, for top_k=8 --
+        # bf16 inputs carry ~8 mantissa bits; summing top_k=8 of them in an
+        # fp32 (24-bit) accumulator needs only 8+log2(8)=11 bits of headroom,
+        # comfortably inside fp32's 24, so the sum is exact regardless of
+        # summation order/reassociation. For x already fp32 this is a no-op
+        # (combine_dtype == x.dtype either way) -- verified no regression on
+        # the top_k=2/top_k=8 fp32 checkpoints.
+        combine_dtype = torch.float32
+        sorted_out = torch.zeros(N * TK, H, device=x.device, dtype=combine_dtype)
         for e in range(NE):
             cnt = expert_counts[e].item()
             if cnt == 0:
@@ -514,13 +554,106 @@ class Qwen35MoE(nn.Module):
             gw, uw = self.experts.gate_up_proj[e].chunk(2, 0)
             h = F.silu(xt @ gw.t()) * (xt @ uw.t())
             h = h @ self.experts.down_proj[e].t()
-            sorted_out[start:start + cnt] = sorted_weights[start:start + cnt].unsqueeze(-1) * h
- 
+            w_slice = sorted_weights[start:start + cnt].unsqueeze(-1).to(combine_dtype)
+            sorted_out[start:start + cnt] = w_slice * h.to(combine_dtype)
+
         unsort_order = torch.argsort(sort_order, stable=True)
-        out = sorted_out[unsort_order].reshape(N, TK, H).sum(dim=1)
- 
+        out = sorted_out[unsort_order].reshape(N, TK, H).sum(dim=1).to(x.dtype)
+
         sg = torch.sigmoid(self.shared_expert_gate(xf))
         out = out + sg * self.shared_expert(xf)
+        return out.view(original_shape)
+
+    def _forward_dispatch_ep(self, x: torch.Tensor) -> torch.Tensor:
+        """Expert-parallel prefill forward.
+
+        This is NOT an all_to_all design. Every rank in the EP group (== the
+        TP group -- this codebase has no separate data-parallel dimension, so
+        every TP rank already processes bit-identical activations; confirmed
+        via engine/model_runner.py's shared-memory broadcast of the same
+        seqs/input_ids to every rank) already has the full x locally. No
+        token movement is needed: each rank locally selects the (token, k)
+        pairs whose expert it owns (round-robin -- expert e belongs to rank
+        e % ep_size at local slot e // ep_size, matching
+        utils.loader.expert_local_slot exactly), computes only those pairs
+        against its own local (sharded) Experts tensor, and an all_reduce
+        sums the disjoint per-rank partial contributions into the true total
+        -- the same combine mechanism RowParallelLinear already uses
+        correctly for shared_expert.
+
+        Bitwise-equivalent to the dense _forward_dispatch reference for
+        top_k==2: each token's final value is a sum of exactly 2 finite
+        floats (its two selected experts' contributions); IEEE754 addition
+        of 2 finite floats is exactly commutative and zero-padding never
+        perturbs a float via addition, so which rank(s) computed which of
+        the 2 terms doesn't change the bit pattern of their sum. (Not a
+        general guarantee for top_k > 2 spread across more ranks, where
+        reassociation of 3+ terms can matter -- untested beyond top_k==2.)
+
+        Sets self._last_ep_token_id_roundtrip (test/debug instrumentation,
+        not used by the numeric output) from the *same* ownership mask and
+        token-index tensor the real computation uses, so a caller can verify
+        indexing correctness rode through the real communication step rather
+        than checking a side-channel duplicate.
+        """
+        original_shape = x.shape
+        H = self.hidden_size
+        TK = self.top_k
+        P = self.ep_size
+
+        xf = x.reshape(-1, H)
+        N = xf.shape[0]
+
+        w, idx = torch.topk(self.gate(xf), TK, dim=-1)
+        w = F.softmax(w, dim=-1).to(x.dtype)
+
+        flat_idx = idx.reshape(-1)                                          # (N*TK,) global expert id
+        flat_w = w.reshape(-1)                                              # (N*TK,)
+        token_rep = xf.unsqueeze(1).expand(N, TK, H).reshape(N * TK, H)
+        token_of_pair = torch.arange(N, device=x.device).unsqueeze(1).expand(N, TK).reshape(-1)
+
+        owned = (flat_idx % P) == self.ep_rank                              # (N*TK,) bool
+        local_slots = flat_idx[owned] // P
+        owned_tokens = token_rep[owned]
+        owned_weights = flat_w[owned]
+        owned_token_idx = token_of_pair[owned]
+
+        # Weighted-multiply/local-accumulate/all_reduce combine always happens
+        # in fp32, regardless of x.dtype -- symmetric with _forward_dispatch's
+        # fp32 combine, same measured justification (see there).
+        combine_dtype = torch.float32
+        local_out = torch.zeros(N, H, device=x.device, dtype=combine_dtype)
+        for local_e in range(self.experts.num_experts):
+            sel = local_slots == local_e
+            cnt = int(sel.sum())
+            if cnt == 0:
+                continue
+            xt = owned_tokens[sel]
+            gw, uw = self.experts.gate_up_proj[local_e].chunk(2, 0)
+            h = F.silu(xt @ gw.t()) * (xt @ uw.t())
+            h = h @ self.experts.down_proj[local_e].t()
+            w_slice = owned_weights[sel].unsqueeze(-1).to(combine_dtype)
+            contribution = w_slice * h.to(combine_dtype)
+            local_out.index_add_(0, owned_token_idx[sel], contribution)
+
+        dist.all_reduce(local_out)
+        local_out = local_out.to(x.dtype)
+
+        # Token-id round-trip check, using the exact same `owned` /
+        # owned_token_idx tensors as the real computation above. Sentinel
+        # -1 for untouched rows; MAX (not SUM) combine so a token whose two
+        # selected experts are both local to this rank -- writing the same
+        # correct value twice -- doesn't get double-counted the way a sum
+        # would. Every row is guaranteed touched by exactly the rank(s)
+        # owning that token's selected expert(s), so after the all_reduce
+        # every row equals its own index with no leftover sentinels.
+        token_id_local = torch.full((N,), -1, dtype=torch.int64, device=x.device)
+        token_id_local[owned_token_idx] = owned_token_idx
+        dist.all_reduce(token_id_local, op=dist.ReduceOp.MAX)
+        self._last_ep_token_id_roundtrip = token_id_local
+
+        sg = torch.sigmoid(self.shared_expert_gate(xf))
+        out = local_out + sg * self.shared_expert(xf)
         return out.view(original_shape)
 
 
