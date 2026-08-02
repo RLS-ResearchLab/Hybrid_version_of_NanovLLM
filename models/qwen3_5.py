@@ -237,17 +237,24 @@ class Qwen35LinearAttention(nn.Module):
         # this operates on exactly whatever channels in_proj_qkv produced
         # locally for this rank. nn.Conv1d creates its own .weight
         # internally (not our nn.Parameter(...) call) -- easy to miss in an
-        # audit that only searches for explicit nn.Parameter(...) sites, but
-        # it's the same gap: real checkpoints store the FULL
-        # (total_qkv_dim, 1, kernel_size) tensor, and this needs the SAME
-        # contiguous out_channels range in_proj_qkv's ColumnParallelLinear
-        # sharding already uses, or a channel here pairs with the wrong
-        # channel's conv kernel.
+        # audit that only searches for explicit nn.Parameter(...) sites.
+        # Real checkpoints store the FULL (total_qkv_dim, 1, kernel_size)
+        # tensor in the SAME [Q_full|K_full|V_full] channel order
+        # in_proj_qkv.weight's rows are in (conv1d is depthwise, so channel
+        # c's kernel must match whatever in_proj_qkv's output channel c
+        # actually is for THIS rank) -- must use the same _qkv_weight_loader
+        # split-then-shard-then-concat as in_proj_qkv, not a naive
+        # single-chunk loader: a plain contiguous dim-0 chunk here would
+        # pair each rank's (now correctly Q/K/V-reassembled) in_proj_qkv
+        # output channels with a completely different set of channels'
+        # conv kernels. (_qkv_weight_loader's split/chunk/cat calls are all
+        # dim=0, so they apply unchanged to this tensor's extra trailing
+        # (1, kernel_size) dims.)
         self.conv1d = nn.Conv1d(
             self.qkv_dim, self.qkv_dim, conv_kernel_size,
             groups=self.qkv_dim, padding=conv_kernel_size - 1, bias=False
         )
-        self.conv1d.weight.weight_loader = self._tp_dim0_weight_loader
+        self.conv1d.weight.weight_loader = self._qkv_weight_loader
 
         # Per-head parameters for GDR gating. Raw nn.Parameter, no TP-linear
         # wrapper, so -- unlike in_proj_qkv/in_proj_z/in_proj_a/in_proj_b --

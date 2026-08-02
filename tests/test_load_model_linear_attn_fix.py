@@ -241,18 +241,25 @@ def worker(rank: int, ckpt_dir: str, ref: dict):
         print(f"[rank{rank}] DATA check OK -- {name}: shape={tuple(real_param.shape)} "
               f"bitwise match vs hand-computed slice [{start}:{start+shard_size}]")
 
-    # conv1d.weight: same dim-0 contiguous slicing, but of the qkv_dim
-    # channel space (different size than A_log/dt_bias's lvh space).
-    qkv_local = (LKH // TP_SIZE + LKH // TP_SIZE + LVH // TP_SIZE) * LHD
-    qkv_start = rank * qkv_local
-    expected_conv = ref[f"{L0}.linear_attn.conv1d.weight"][qkv_start:qkv_start + qkv_local]
+    # conv1d.weight: depthwise (groups=qkv_dim), so channel c's kernel must
+    # match whatever in_proj_qkv's output channel c actually is for this
+    # rank -- the SAME Q/K/V-split-then-shard as in_proj_qkv above, NOT a
+    # naive single contiguous dim-0 chunk of the qkv_dim channel space (that
+    # would pair each rank's Q/K/V-reassembled in_proj_qkv output channels
+    # with a completely different set of channels' conv kernels).
+    full_conv = ref[f"{L0}.linear_attn.conv1d.weight"]
+    qc_full, kc_full, vc_full = full_conv.split([LKH * LHD, LKH * LHD, LVH * LHD], dim=0)
+    qc_local = qc_full.chunk(TP_SIZE, dim=0)[rank]
+    kc_local = kc_full.chunk(TP_SIZE, dim=0)[rank]
+    vc_local = vc_full.chunk(TP_SIZE, dim=0)[rank]
+    expected_conv = torch.cat([qc_local, kc_local, vc_local], dim=0)
     real_conv = targets["conv1d.weight"]
     assert torch.equal(real_conv.data, expected_conv), (
         f"[rank{rank}] DATA MISMATCH on conv1d.weight: real shape={tuple(real_conv.shape)} "
         f"expected shape={tuple(expected_conv.shape)}"
     )
     print(f"[rank{rank}] DATA check OK -- conv1d.weight: shape={tuple(real_conv.shape)} "
-          f"bitwise match vs hand-computed slice [{qkv_start}:{qkv_start+qkv_local}]")
+          f"bitwise match vs hand-computed Q/K/V-split-then-shard slice")
 
     dist.destroy_process_group()
 

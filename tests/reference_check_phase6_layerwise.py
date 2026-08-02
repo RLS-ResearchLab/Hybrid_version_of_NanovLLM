@@ -126,12 +126,22 @@ def phase_hf():
 
     decoder_layers = model.model.layers
     attn_captures = [None] * len(decoder_layers)
+    # Full (not just final-position) input/output sequence per layer's
+    # attention-ish submodule -- needed to feed the exact same real input
+    # into a standalone re-run of that layer (diag_linear_attn_tp_isolation.py),
+    # not just for a single-vector cosine-similarity summary.
+    mixer_io = [None] * len(decoder_layers)
     handles = []
 
     def _make_hook(idx):
         def _hook(module, inputs, output):
             out = output[0] if isinstance(output, (tuple, list)) else output
             attn_captures[idx] = out[0, -1, :].detach().float().cpu()
+            in_ = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
+            mixer_io[idx] = {
+                "input": in_[0].detach().float().cpu(),      # (seq_len, hidden)
+                "output": out[0].detach().float().cpu(),     # (seq_len, hidden)
+            }
         return _hook
 
     mixer_names = []
@@ -171,6 +181,7 @@ def phase_hf():
         "prompt_ids": prompt_ids,
         "layer_states": layer_states,
         "attn_only_states": attn_captures,
+        "mixer_io": mixer_io,
         "mixer_names": mixer_names,
         "logits": logits,
     }, HF_STATES_PATH)
