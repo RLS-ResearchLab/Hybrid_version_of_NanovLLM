@@ -93,10 +93,11 @@ def phase_engine():
     if llm.model_runner.state_manager is not None:
         seq.state_slot = 0
 
-    layer_states, attn_only_states, logits = llm.model_runner.call("get_prefill_layer_states", [seq])
+    layer_states, attn_only_states, post_ln_states, logits = llm.model_runner.call("get_prefill_layer_states", [seq])
     assert layer_states is not None, "expected rank0 to return gathered layer states"
     print(f"[engine] captured {len(layer_states)} layer states + {len(attn_only_states)} "
-          f"attn-only states, each layer_states shape {tuple(layer_states[0].shape)}; "
+          f"attn-only states + {len(post_ln_states)} post-input_layernorm states, "
+          f"each layer_states shape {tuple(layer_states[0].shape)}; "
           f"final logits shape {tuple(logits.shape)}")
 
     torch.save({
@@ -104,6 +105,7 @@ def phase_engine():
         "layer_types": layer_types,
         "layer_states": layer_states,
         "attn_only_states": attn_only_states,
+        "post_ln_states": post_ln_states,
         "logits": logits,
     }, ENGINE_STATES_PATH)
     print(f"[engine] saved to {ENGINE_STATES_PATH}")
@@ -222,31 +224,48 @@ def phase_compare():
     hf_states = hf_payload["layer_states"]
     engine_attn = engine_payload["attn_only_states"]
     hf_attn = hf_payload["attn_only_states"]
+    engine_post_ln = engine_payload.get("post_ln_states")
+    hf_mixer_io = hf_payload.get("mixer_io")
+    have_post_ln = engine_post_ln is not None and hf_mixer_io is not None
 
     if len(engine_states) != len(hf_states):
         print(f"\nFAIL: layer count mismatch -- engine captured {len(engine_states)} states, "
               f"hf captured {len(hf_states)}. Can't compare 1:1.")
         return
 
-    print(f"\n{'idx':>4}  {'label':<30}  {'attn-only cos':>13}  {'full-layer cos':>15}  {'max_abs_diff':>13}")
-    print("-" * 84)
+    header = f"\n{'idx':>4}  {'label':<30}  "
+    if have_post_ln:
+        header += f"{'post-LN cos':>11}  "
+    header += f"{'attn-only cos':>13}  {'full-layer cos':>15}  {'max_abs_diff':>13}"
+    print(header)
+    print("-" * (len(header) - 1))
     trace = []    # (idx, label, full_layer_cos)
     for i, (e, h) in enumerate(zip(engine_states, hf_states)):
         e_vec = _last_row(e)
         h_vec = h.float()
         cos = _cos(e_vec, h_vec)
         max_abs = (e_vec - h_vec).abs().max().item()
+        post_ln_cos_str = ""
         if i == 0:
             label = "embedding"
             attn_cos_str = "n/a"
+            if have_post_ln:
+                post_ln_cos_str = "n/a"
         else:
             layer_idx = i - 1
             type_tag = f" ({layer_types[layer_idx]})" if layer_types else ""
             label = f"layer {layer_idx}{type_tag}"
             a_cos = _cos(_last_row(engine_attn[layer_idx]), hf_attn[layer_idx].float())
             attn_cos_str = f"{a_cos:.6f}"
+            if have_post_ln:
+                pln_cos = _cos(_last_row(engine_post_ln[layer_idx]), hf_mixer_io[layer_idx]["input"].float())
+                post_ln_cos_str = f"{pln_cos:.6f}"
         trace.append((i, label, cos))
-        print(f"{i:>4}  {label:<30}  {attn_cos_str:>13}  {cos:>15.6f}  {max_abs:>13.4e}")
+        row = f"{i:>4}  {label:<30}  "
+        if have_post_ln:
+            row += f"{post_ln_cos_str:>11}  "
+        row += f"{attn_cos_str:>13}  {cos:>15.6f}  {max_abs:>13.4e}"
+        print(row)
 
     # Final logits checkpoint, one past the last decoder layer.
     engine_logits = engine_payload["logits"].float()
@@ -255,8 +274,11 @@ def phase_compare():
         engine_logits = engine_logits.squeeze(0)
     logits_cos = _cos(engine_logits, hf_logits)
     trace.append((len(engine_states), "final logits (norm+lm_head)", logits_cos))
-    print(f"{len(engine_states):>4}  {'final logits (norm+lm_head)':<30}  {'n/a':>13}  {logits_cos:>15.6f}  "
-          f"{(engine_logits - hf_logits).abs().max().item():>13.4e}")
+    final_row = f"{len(engine_states):>4}  {'final logits (norm+lm_head)':<30}  "
+    if have_post_ln:
+        final_row += f"{'n/a':>11}  "
+    final_row += f"{'n/a':>13}  {logits_cos:>15.6f}  {(engine_logits - hf_logits).abs().max().item():>13.4e}"
+    print(final_row)
 
     # Bisect: does the attention sublayer alone already diverge at the
     # first bad layer, or is it fine and the MoE FFN is what breaks it?
@@ -275,6 +297,15 @@ def phase_compare():
     bad_layer_idx = bad_idx - 1
     attn_cos_at_bad = _cos(_last_row(engine_attn[bad_layer_idx]), hf_attn[bad_layer_idx].float())
     print(f"First divergence at {bad_label} (index {bad_idx}).")
+    if have_post_ln:
+        pln_cos_at_bad = _cos(_last_row(engine_post_ln[bad_layer_idx]), hf_mixer_io[bad_layer_idx]["input"].float())
+        print(f"  post-input_layernorm cosine at this layer (BEFORE attention runs): {pln_cos_at_bad:.6f}")
+        if pln_cos_at_bad < 0.999:
+            print(f"  -> Already degraded before attention even runs. The bug is in input_layernorm "
+                  f"(Qwen35RMSNorm) itself or its TP handling, not in {layer_types[bad_layer_idx] if layer_types else '(mixer)'}. "
+                  f"Check Qwen35RMSNorm.weight loading (should be REPLICATED across ranks, never sharded "
+                  f"-- hidden_size is never partitioned in this repo's TP scheme) and its forward formula "
+                  f"against HF's Qwen3_5MoeRMSNorm.")
     print(f"  attention-sublayer-only cosine at this layer: {attn_cos_at_bad:.6f}")
     if attn_cos_at_bad < 0.99:
         print(f"  -> The attention/linear_attn sublayer ITSELF is already wrong at this layer, "

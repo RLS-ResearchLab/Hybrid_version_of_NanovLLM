@@ -405,7 +405,7 @@ class ModelRunner:
         return logits.cpu() if logits is not None else None
 
     @torch.inference_mode()
-    def get_prefill_layer_states(self, seqs: list[Sequence]) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor] | None:
+    def get_prefill_layer_states(self, seqs: list[Sequence]) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor] | None:
         """Diagnostic-only, additive -- does not change run()'s or
         get_prefill_logits()'s behavior at all. Mirrors get_prefill_logits's
         prefill path exactly, but captures the residual-stream hidden state
@@ -427,10 +427,17 @@ class ModelRunner:
         same submodule can isolate "attention sublayer wrong" from "MoE FFN
         wrong" instead of only seeing their combined effect.
 
+        Also captures each layer's post-input_layernorm, pre-attention
+        tensor (post_ln) -- the exact input fed into self_attn/linear_attn,
+        so it can be compared 1:1 against a HF-side hook at the same point.
+        Isolates "input_layernorm/RMSNorm already wrong" from "attention
+        itself wrong", since the embedding checkpoint above is captured
+        BEFORE input_layernorm and can't distinguish those on its own.
+
         Also computes final-norm + lm_head logits the same way
         get_prefill_logits does, as one more checkpoint past the last
-        decoder layer. Returns (layer_states, attn_only_states, logits), or
-        None on non-rank-0.
+        decoder layer. Returns (layer_states, attn_only_states, post_ln,
+        logits), or None on non-rank-0.
         """
         input_ids, positions = self.prepare_prefill(seqs)
         context = get_context()
@@ -446,11 +453,20 @@ class ModelRunner:
         residual = None
         captured = [hidden_states.float().cpu()]
         attn_only = []
+        # post-input_layernorm, pre-attention -- the exact tensor fed INTO
+        # self_attn/linear_attn, so it lines up 1:1 with HF's mixer_io[i]["input"]
+        # (captured via a forward hook on the SAME point in HF's own
+        # DecoderLayer.forward). Isolates "input_layernorm/RMSNorm is
+        # already wrong before attention runs" from "attention itself is
+        # wrong" -- the "embedding" checkpoint above is BEFORE
+        # input_layernorm, so it can't answer that on its own.
+        post_ln = []
         for i, layer in enumerate(model.layers):
             if residual is None:
                 hs_in, res_in = layer.input_layernorm(hidden_states), hidden_states
             else:
                 hs_in, res_in = layer.input_layernorm(hidden_states, residual)
+            post_ln.append(hs_in.float().cpu())
             if layer.is_full:
                 attn_out = layer.self_attn(positions, hs_in)
             else:
@@ -466,7 +482,7 @@ class ModelRunner:
         reset_context()
         if self.rank != 0:
             return None
-        return captured, attn_only, logits.float().cpu()
+        return captured, attn_only, post_ln, logits.float().cpu()
 
     @torch.inference_mode()
     def capture_cudagraph(self):
