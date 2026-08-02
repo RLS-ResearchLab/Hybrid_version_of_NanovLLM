@@ -205,6 +205,13 @@ def _last_row(t: torch.Tensor) -> torch.Tensor:
     return t[-1, :].float() if t.dim() == 2 else t.float()
 
 
+def _norm_ratio(a: torch.Tensor, b: torch.Tensor) -> float:
+    """||a|| / ||b|| -- cosine similarity is scale-invariant (direction
+    only), so two vectors can be cosine~1.0 while differing substantially
+    in magnitude. 1.0 = same magnitude."""
+    return (a.float().norm() / b.float().norm()).item()
+
+
 def phase_compare():
     assert os.path.exists(ENGINE_STATES_PATH), f"missing {ENGINE_STATES_PATH} -- run --phase engine first"
     assert os.path.exists(HF_STATES_PATH), f"missing {HF_STATES_PATH} -- run --phase hf first"
@@ -298,8 +305,13 @@ def phase_compare():
     attn_cos_at_bad = _cos(_last_row(engine_attn[bad_layer_idx]), hf_attn[bad_layer_idx].float())
     print(f"First divergence at {bad_label} (index {bad_idx}).")
     if have_post_ln:
-        pln_cos_at_bad = _cos(_last_row(engine_post_ln[bad_layer_idx]), _last_row(hf_mixer_io[bad_layer_idx]["input"]))
+        e_pln = _last_row(engine_post_ln[bad_layer_idx])
+        h_pln = _last_row(hf_mixer_io[bad_layer_idx]["input"])
+        pln_cos_at_bad = _cos(e_pln, h_pln)
+        pln_norm_ratio = _norm_ratio(e_pln, h_pln)
         print(f"  post-input_layernorm cosine at this layer (BEFORE attention runs): {pln_cos_at_bad:.6f}")
+        print(f"  post-input_layernorm ||engine|| / ||HF|| norm ratio: {pln_norm_ratio:.6f} "
+              f"(1.0 = same magnitude; cosine is scale-invariant and can't see this)")
         if pln_cos_at_bad < 0.999:
             print(f"  -> Already degraded before attention even runs. The bug is in input_layernorm "
                   f"(Qwen35RMSNorm) itself or its TP handling, not in {layer_types[bad_layer_idx] if layer_types else '(mixer)'}. "
