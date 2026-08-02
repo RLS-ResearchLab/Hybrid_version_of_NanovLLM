@@ -112,6 +112,7 @@ def run_layers_capture(model, ids, positions, cu_seqlens, num_segments, device, 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Layer-by-layer cascade diagnostic -- device={device}")
+    os.environ["MASTER_PORT"] = "29513"  # avoid EADDRINUSE from a leftover process on the 29500 default
     init_dist()
 
     config = make_small_config()
