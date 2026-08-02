@@ -114,7 +114,7 @@ def _load_into(la, real_tensors: dict[str, torch.Tensor]):
         loader(param, real_tensors[suffix])
 
 
-def _build_layer(dims):
+def _build_layer(dims, device):
     from nanovllm.models.qwen3_5 import Qwen35LinearAttention
     return Qwen35LinearAttention(
         hidden_size=dims["hidden_size"],
@@ -123,34 +123,66 @@ def _build_layer(dims):
         linear_attn_head_dim=dims["lhd"],
         conv_kernel_size=dims["ck"],
         rms_norm_eps=dims["rms_norm_eps"],
-    ).to(torch.bfloat16)
+    ).to(device=device, dtype=torch.bfloat16)
+
+
+def _use_cuda(world_size: int) -> bool:
+    """Mirror engine/model_runner.py's real backend/device choice (nccl +
+    torch.cuda.set_device(rank), one real GPU per rank) whenever enough
+    GPUs are actually present -- CPU/gloo execution has different bf16
+    rounding behavior than real GPU tensor-core execution (most CPU bf16
+    ops upcast to fp32 internally; GPU tensor cores don't), which matters
+    a lot for a sequential recurrent scan with exp()/softplus() in the
+    loop. Falls back to CPU/gloo (with a loud warning) only when there
+    genuinely aren't enough GPUs, so this stays runnable as a smoke test
+    in CPU-only environments -- but a CPU-only run is NOT a faithful
+    reproduction of the real engine's execution path and any agreement or
+    disagreement it finds should not be treated as the final answer.
+    """
+    return torch.cuda.is_available() and torch.cuda.device_count() >= world_size
 
 
 def run_tp1(real_tensors: dict, hf_input: torch.Tensor) -> torch.Tensor:
-    dist.init_process_group("gloo", init_method="tcp://localhost:29911", rank=0, world_size=1)
+    use_cuda = _use_cuda(1)
+    backend = "nccl" if use_cuda else "gloo"
+    if not use_cuda:
+        print("WARNING: running tp1 on CPU/gloo -- not a faithful reproduction of the real "
+              "engine's GPU bf16 execution. See _use_cuda's docstring.")
+    device = torch.device("cuda:0") if use_cuda else torch.device("cpu")
+    if use_cuda:
+        torch.cuda.set_device(0)
+    dist.init_process_group(backend, init_method="tcp://localhost:29911", rank=0, world_size=1)
     dims = _real_dims()
-    la = _build_layer(dims)
-    _load_into(la, real_tensors)
-    cu_seqlens = torch.tensor([0, hf_input.shape[0]], dtype=torch.int32)
+    la = _build_layer(dims, device)
+    _load_into(la, {k: v.to(device) for k, v in real_tensors.items()})
+    cu_seqlens = torch.tensor([0, hf_input.shape[0]], dtype=torch.int32, device=device)
     with torch.no_grad():
-        out, _, _ = la(hf_input.to(torch.bfloat16), cu_seqlens)
+        out, _, _ = la(hf_input.to(device=device, dtype=torch.bfloat16), cu_seqlens)
     dist.destroy_process_group()
-    return out.float()
+    return out.float().cpu()
 
 
 def _tp2_worker(rank: int, tmp_path: str, results: list):
-    dist.init_process_group("gloo", init_method="tcp://localhost:29912", rank=rank, world_size=2)
-    payload = torch.load(tmp_path, weights_only=True)
+    use_cuda = _use_cuda(2)
+    backend = "nccl" if use_cuda else "gloo"
+    if not use_cuda and rank == 0:
+        print("WARNING: running tp2 on CPU/gloo -- not a faithful reproduction of the real "
+              "engine's GPU bf16 execution. See _use_cuda's docstring.")
+    device = torch.device(f"cuda:{rank}") if use_cuda else torch.device("cpu")
+    if use_cuda:
+        torch.cuda.set_device(rank)
+    dist.init_process_group(backend, init_method="tcp://localhost:29912", rank=rank, world_size=2)
+    payload = torch.load(tmp_path, weights_only=True, map_location="cpu")
     real_tensors = payload["real_tensors"]
     hf_input = payload["hf_input"]
 
     dims = _real_dims()
-    la = _build_layer(dims)
-    _load_into(la, real_tensors)
-    cu_seqlens = torch.tensor([0, hf_input.shape[0]], dtype=torch.int32)
+    la = _build_layer(dims, device)
+    _load_into(la, {k: v.to(device) for k, v in real_tensors.items()})
+    cu_seqlens = torch.tensor([0, hf_input.shape[0]], dtype=torch.int32, device=device)
     with torch.no_grad():
-        out, _, _ = la(hf_input.to(torch.bfloat16), cu_seqlens)
-    results.append((rank, out.float()))
+        out, _, _ = la(hf_input.to(device=device, dtype=torch.bfloat16), cu_seqlens)
+    results.append((rank, out.float().cpu()))
     dist.destroy_process_group()
 
 
