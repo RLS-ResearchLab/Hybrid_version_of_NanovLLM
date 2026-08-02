@@ -1,5 +1,14 @@
-"""One-off: attempt LLM(...) construction against the real qwen35_checkpoint.
-Construction only -- no generate(). Run from the repo root: python3 run_construct.py
+"""One-off: attempt LLM(...) construction AND a single-token generate()
+against the real qwen35_checkpoint. Run from the repo root:
+python3 run_construct.py
+
+max_tokens=1 is deliberate: engine/scheduler.py's postprocess() marks a
+sequence finished as soon as num_completion_tokens == max_tokens, in the
+same call that processes the token -- so with max_tokens=1 the first
+(prefill) step's token immediately satisfies completion and the decode
+path (Qwen35MoE._forward_gathered, still NotImplementedError at ep_size>1)
+is never reached. This exercises construction, EP/TP-aware load_model(),
+and one real prefill forward pass -- not decode.
 """
 import os
 import sys
@@ -24,6 +33,7 @@ if _WS_NAME != "nanovllm" and "nanovllm" not in sys.modules:
 # "cannot import name 'LLM'" message with no traceback. Importing the
 # submodule directly surfaces the real error.
 from nanovllm.llm import LLM
+from nanovllm.sampling_params import SamplingParams
 
 
 def main():
@@ -36,6 +46,13 @@ def main():
         max_model_len=2048,
     )
     print("LLM construction succeeded:", type(llm))
+
+    out = llm.generate(
+        ["The capital of France is"],
+        SamplingParams(temperature=0.0, max_tokens=1),
+    )
+    print("GENERATION SUCCEEDED")
+    print(out)
 
 
 if __name__ == "__main__":
