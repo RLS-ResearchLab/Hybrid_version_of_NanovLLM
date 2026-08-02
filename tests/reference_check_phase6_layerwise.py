@@ -10,7 +10,17 @@ the final logits, for both the engine and HF, and reports per-checkpoint
 cosine similarity so we can see exactly where it goes wrong instead of
 guessing.
 
-Two hypotheses this distinguishes:
+A per-decoder-layer checkpoint alone conflates two very different
+sublayers: self_attn/linear_attn, then a full MoE FFN pass. This script
+ALSO captures each layer's raw attention/linear-attn sublayer output on
+its own (engine: inlined in ModelRunner.get_prefill_layer_states; HF: a
+forward hook on each layer's attention-ish submodule, auto-identified as
+whichever child isn't input_layernorm/post_attention_layernorm/mlp), so
+the compare phase can tell "the attention sublayer itself is wrong" apart
+from "the attention sublayer is fine but MoE FFN is wrong" instead of only
+seeing their combined effect.
+
+Two hypotheses the per-decoder-layer trace distinguishes:
   - M-RoPE / positional precision: errors compound gradually, layer over
     layer -- cosine similarity starts near 1.0 and decays smoothly.
   - A discrete bug (wrong dim order, sign error, bad mask, transposed
@@ -53,6 +63,8 @@ HF_STATES_PATH = os.path.join(CACHE_DIR, "hf_layer_states.pt")
 
 PROMPT = "The capital of France is"
 
+_SKIP_CHILD_NAMES = {"input_layernorm", "post_attention_layernorm", "mlp"}
+
 
 def phase_engine():
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -72,10 +84,6 @@ def phase_engine():
     prompt_ids = llm.tokenizer.encode(PROMPT)
     print(f"[engine] prompt token ids: {prompt_ids}")
 
-    # rank0's model object lives in this process (only rank>0 workers are
-    # separate spawned processes) -- plain attribute access, no dispatch
-    # needed, since this is just introspecting the layer schedule, not
-    # running the model.
     layer_types = list(llm.model_runner.model.model.layer_types)
     print(f"[engine] layer_types (layer 0 is {layer_types[0]}): {layer_types}")
 
@@ -85,16 +93,17 @@ def phase_engine():
     if llm.model_runner.state_manager is not None:
         seq.state_slot = 0
 
-    layer_states, logits = llm.model_runner.call("get_prefill_layer_states", [seq])
+    layer_states, attn_only_states, logits = llm.model_runner.call("get_prefill_layer_states", [seq])
     assert layer_states is not None, "expected rank0 to return gathered layer states"
-    print(f"[engine] captured {len(layer_states)} states "
-          f"(1 embedding + {len(layer_states) - 1} decoder layers), "
-          f"each shape {tuple(layer_states[0].shape)}; final logits shape {tuple(logits.shape)}")
+    print(f"[engine] captured {len(layer_states)} layer states + {len(attn_only_states)} "
+          f"attn-only states, each layer_states shape {tuple(layer_states[0].shape)}; "
+          f"final logits shape {tuple(logits.shape)}")
 
     torch.save({
         "prompt_ids": prompt_ids,
         "layer_types": layer_types,
         "layer_states": layer_states,
+        "attn_only_states": attn_only_states,
         "logits": logits,
     }, ENGINE_STATES_PATH)
     print(f"[engine] saved to {ENGINE_STATES_PATH}")
@@ -115,15 +124,39 @@ def phase_hf():
     )
     model.eval()
 
+    decoder_layers = model.model.layers
+    attn_captures = [None] * len(decoder_layers)
+    handles = []
+
+    def _make_hook(idx):
+        def _hook(module, inputs, output):
+            out = output[0] if isinstance(output, (tuple, list)) else output
+            attn_captures[idx] = out[0, -1, :].detach().float().cpu()
+        return _hook
+
+    mixer_names = []
+    for i, layer in enumerate(decoder_layers):
+        mixer_name = next(
+            name for name, _ in layer.named_children() if name not in _SKIP_CHILD_NAMES
+        )
+        mixer_names.append(mixer_name)
+        handles.append(getattr(layer, mixer_name).register_forward_hook(_make_hook(i)))
+    print(f"[hf] attention-sublayer submodule name per layer (first 5): {mixer_names[:5]}")
+
     input_ids = torch.tensor([prompt_ids], dtype=torch.long).to(model.device)
     with torch.no_grad():
         out = model(input_ids=input_ids, output_hidden_states=True)
+
+    for h in handles:
+        h.remove()
 
     if not hasattr(out, "hidden_states") or out.hidden_states is None:
         raise RuntimeError(
             f"[hf] output_hidden_states=True did not produce .hidden_states -- "
             f"type={type(out)}, available attrs={[a for a in dir(out) if not a.startswith('_')]}"
         )
+    assert all(c is not None for c in attn_captures), "some layers' attention-sublayer hook never fired"
+
     # out.hidden_states: tuple of (num_layers + 1) tensors, each (1, seq_len, hidden).
     # Index 0 = embedding output, index i+1 = output of layer i. Take the
     # final-position slice to align with the engine's flat (N,...) capture
@@ -137,6 +170,8 @@ def phase_hf():
     torch.save({
         "prompt_ids": prompt_ids,
         "layer_states": layer_states,
+        "attn_only_states": attn_captures,
+        "mixer_names": mixer_names,
         "logits": logits,
     }, HF_STATES_PATH)
     print(f"[hf] saved to {HF_STATES_PATH}")
@@ -145,6 +180,10 @@ def phase_hf():
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
     return torch.nn.functional.cosine_similarity(a.float().unsqueeze(0), b.float().unsqueeze(0)).item()
+
+
+def _last_row(t: torch.Tensor) -> torch.Tensor:
+    return t[-1, :].float() if t.dim() == 2 else t.float()
 
 
 def phase_compare():
@@ -164,28 +203,33 @@ def phase_compare():
     layer_types = engine_payload.get("layer_types")
     engine_states = engine_payload["layer_states"]
     hf_states = hf_payload["layer_states"]
+    engine_attn = engine_payload["attn_only_states"]
+    hf_attn = hf_payload["attn_only_states"]
 
     if len(engine_states) != len(hf_states):
         print(f"\nFAIL: layer count mismatch -- engine captured {len(engine_states)} states, "
               f"hf captured {len(hf_states)}. Can't compare 1:1.")
         return
 
-    print(f"\n{'idx':>4}  {'label':<30}  {'cos_sim':>10}  {'max_abs_diff':>13}")
-    print("-" * 64)
-    trace = []    # (idx, label, cos)
+    print(f"\n{'idx':>4}  {'label':<30}  {'attn-only cos':>13}  {'full-layer cos':>15}  {'max_abs_diff':>13}")
+    print("-" * 84)
+    trace = []    # (idx, label, full_layer_cos)
     for i, (e, h) in enumerate(zip(engine_states, hf_states)):
-        e_vec = e[-1, :].float() if e.dim() == 2 else e.float()
+        e_vec = _last_row(e)
         h_vec = h.float()
         cos = _cos(e_vec, h_vec)
         max_abs = (e_vec - h_vec).abs().max().item()
         if i == 0:
             label = "embedding"
+            attn_cos_str = "n/a"
         else:
             layer_idx = i - 1
             type_tag = f" ({layer_types[layer_idx]})" if layer_types else ""
             label = f"layer {layer_idx}{type_tag}"
+            a_cos = _cos(_last_row(engine_attn[layer_idx]), hf_attn[layer_idx].float())
+            attn_cos_str = f"{a_cos:.6f}"
         trace.append((i, label, cos))
-        print(f"{i:>4}  {label:<30}  {cos:>10.6f}  {max_abs:>13.4e}")
+        print(f"{i:>4}  {label:<30}  {attn_cos_str:>13}  {cos:>15.6f}  {max_abs:>13.4e}")
 
     # Final logits checkpoint, one past the last decoder layer.
     engine_logits = engine_payload["logits"].float()
@@ -194,52 +238,52 @@ def phase_compare():
         engine_logits = engine_logits.squeeze(0)
     logits_cos = _cos(engine_logits, hf_logits)
     trace.append((len(engine_states), "final logits (norm+lm_head)", logits_cos))
-    print(f"{len(engine_states):>4}  {'final logits (norm+lm_head)':<30}  {logits_cos:>10.6f}  "
+    print(f"{len(engine_states):>4}  {'final logits (norm+lm_head)':<30}  {'n/a':>13}  {logits_cos:>15.6f}  "
           f"{(engine_logits - hf_logits).abs().max().item():>13.4e}")
 
-    # Distinguish gradual precision decay (M-RoPE-shaped) from a sharp,
-    # discrete-bug-shaped drop. Report the full trace regardless -- this is
-    # the evidence, not just the summary label.
+    # Bisect: does the attention sublayer alone already diverge at the
+    # first bad layer, or is it fine and the MoE FFN is what breaks it?
     print()
     first_bad = next(((i, label, cos) for i, label, cos in trace if cos < 0.99), None)
     if first_bad is None:
         print("All checkpoints have cosine similarity >= 0.99 -- no meaningful divergence found "
               "anywhere in this trace.")
+        return
+
+    bad_idx, bad_label, _ = first_bad
+    if bad_idx == 0:
+        print(f"Divergence starts at the EMBEDDING layer itself -- check tokenizer/vocab alignment "
+              f"or embed_tokens weight loading first.")
+        return
+    bad_layer_idx = bad_idx - 1
+    attn_cos_at_bad = _cos(_last_row(engine_attn[bad_layer_idx]), hf_attn[bad_layer_idx].float())
+    print(f"First divergence at {bad_label} (index {bad_idx}).")
+    print(f"  attention-sublayer-only cosine at this layer: {attn_cos_at_bad:.6f}")
+    if attn_cos_at_bad < 0.99:
+        print(f"  -> The attention/linear_attn sublayer ITSELF is already wrong at this layer, "
+              f"before the MoE FFN even runs. Look at {layer_types[bad_layer_idx] if layer_types else '(mixer)'} "
+              f"and its weight loading/forward logic.")
     else:
-        bad_idx, bad_label, _ = first_bad
-        prior = trace[:bad_idx]
-        # "Gradual" = every step before the drop is itself trending downward
-        # by a comparable, small amount. "Sharp" = flat near 1.0 right up
-        # until one point, then a cliff.
-        near_one_before = all(cos >= 0.999 for _, _, cos in prior) if prior else True
-        cliff = prior and (prior[-1][2] - first_bad[2]) > 0.5
-        if near_one_before and cliff:
-            shape = "SHARP DROP"
-            explanation = (
-                f"Everything before {bad_label} is essentially bit-identical (cosine >= 0.999); "
-                f"the cosine similarity falls off a cliff exactly at {bad_label}. This is the "
-                f"signature of a discrete bug localized to that one step (or its direct inputs -- "
-                f"state/conv_state, cu_seqlens, RoPE table, a transposed weight, wrong dtype cast) "
-                f"-- NOT gradual M-RoPE/positional precision drift."
-            )
-        elif near_one_before:
-            shape = "MODERATE DROP"
-            explanation = (
-                f"Everything before {bad_label} matches closely (cosine >= 0.999) but the drop at "
-                f"{bad_label} isn't a full cliff to near-zero/negative. Still points at {bad_label} "
-                f"as the first place computation diverges -- inspect that layer's own logic and its "
-                f"inputs first."
-            )
-        else:
-            shape = "GRADUAL DECAY"
-            explanation = (
-                f"Cosine similarity was already trending down before {bad_label} rather than "
-                f"holding near 1.0 -- consistent with compounding precision error (e.g. the known, "
-                f"deferred M-RoPE gap) rather than one discrete bug. Still worth checking {bad_label} "
-                f"specifically, but this shape doesn't point at a single localized defect."
-            )
-        print(f"SHAPE: {shape}")
-        print(explanation)
+        print(f"  -> The attention/linear_attn sublayer output MATCHES HF closely here (cosine >= 0.99). "
+              f"The divergence is introduced by the MoE FFN (routing, expert compute, or shared-expert "
+              f"combine/all-reduce) at this same layer, not by attention.")
+
+    # Full per-checkpoint shape classification, same as before.
+    prior = trace[:bad_idx]
+    near_one_before = all(cos >= 0.999 for _, _, cos in prior) if prior else True
+    cliff = prior and (prior[-1][2] - first_bad[2]) > 0.5
+    print()
+    if near_one_before and cliff:
+        print(f"SHAPE: SHARP DROP -- everything before {bad_label} is essentially bit-identical "
+              f"(cosine >= 0.999), then falls off a cliff exactly at {bad_label}. Signature of a "
+              f"discrete, localized bug -- NOT gradual M-RoPE/positional precision drift.")
+    elif near_one_before:
+        print(f"SHAPE: MODERATE DROP at {bad_label} (not a full cliff to near-zero/negative). "
+              f"Still points at {bad_label} as the first place computation diverges.")
+    else:
+        print(f"SHAPE: GRADUAL DECAY -- cosine similarity was already trending down before "
+              f"{bad_label} rather than holding near 1.0, consistent with compounding precision "
+              f"error rather than one discrete bug.")
 
 
 def main():
