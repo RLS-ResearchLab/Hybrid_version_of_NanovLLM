@@ -38,6 +38,7 @@ from test_qwen35_standalone import init_dist, make_small_config   # noqa: E402
 from test_qwen35_batching import build_model_and_state   # noqa: E402
 
 from nanovllm.models.qwen3_5 import Qwen35LinearAttention   # noqa: E402
+from nanovllm.utils.context import set_context, reset_context   # noqa: E402
 
 _ORIG_LA_FORWARD = Qwen35LinearAttention.forward  # captured once, never reassigned globally
 
@@ -64,41 +65,46 @@ def run_layers_capture(model, ids, positions, cu_seqlens, num_segments, device, 
     captures = []
     local_casts = []
 
-    for layer in model.model.layers:
-        if residual is None:
-            normed, residual = layer.input_layernorm(hidden_states), hidden_states
-        else:
-            normed, residual = layer.input_layernorm(hidden_states, residual)
+    max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+    set_context(True, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, None, None, None)
+    try:
+        for layer in model.model.layers:
+            if residual is None:
+                normed, residual = layer.input_layernorm(hidden_states), hidden_states
+            else:
+                normed, residual = layer.input_layernorm(hidden_states, residual)
 
-        if layer.is_full:
-            with torch.no_grad():
-                hidden_states = layer.self_attn(positions, normed)
-            local_casts.append(None)
-        else:
-            la = layer.linear_attn
-            conv0 = torch.zeros(num_segments, la.qkv_dim, la.ck - 1, device=device, dtype=torch.bfloat16)
-            state0 = torch.zeros(num_segments, la.lvh, la.lhd, la.lhd, device=device, dtype=torch.float32)
-
-            if regime == "bf16":
+            if layer.is_full:
                 with torch.no_grad():
-                    hidden_states, _, _ = _ORIG_LA_FORWARD(la, normed, cu_seqlens, state0, conv0)
+                    hidden_states = layer.self_attn(positions, normed)
                 local_casts.append(None)
-            else:  # fp32gdr
-                la.float()
-                try:
+            else:
+                la = layer.linear_attn
+                conv0 = torch.zeros(num_segments, la.qkv_dim, la.ck - 1, device=device, dtype=torch.bfloat16)
+                state0 = torch.zeros(num_segments, la.lvh, la.lhd, la.lhd, device=device, dtype=torch.float32)
+
+                if regime == "bf16":
                     with torch.no_grad():
-                        out32, _, _ = _ORIG_LA_FORWARD(la, normed.float(), cu_seqlens, state0, conv0.float())
-                    cast_out = out32.to(normed.dtype)
-                    hidden_states = cast_out
-                    local_casts.append((cast_out.float(), out32.float()))
-                finally:
-                    la.to(torch.bfloat16)
+                        hidden_states, _, _ = _ORIG_LA_FORWARD(la, normed, cu_seqlens, state0, conv0)
+                    local_casts.append(None)
+                else:  # fp32gdr
+                    la.float()
+                    try:
+                        with torch.no_grad():
+                            out32, _, _ = _ORIG_LA_FORWARD(la, normed.float(), cu_seqlens, state0, conv0.float())
+                        cast_out = out32.to(normed.dtype)
+                        hidden_states = cast_out
+                        local_casts.append((cast_out.float(), out32.float()))
+                    finally:
+                        la.to(torch.bfloat16)
 
-        normed2, residual = layer.post_attention_layernorm(hidden_states, residual)
-        with torch.no_grad():
-            hidden_states = layer.mlp(normed2, cu_seqlens)
+            normed2, residual = layer.post_attention_layernorm(hidden_states, residual)
+            with torch.no_grad():
+                hidden_states = layer.mlp(normed2, cu_seqlens)
 
-        captures.append((hidden_states.float() + residual.float()))
+            captures.append((hidden_states.float() + residual.float()))
+    finally:
+        reset_context()
 
     return captures, local_casts
 
