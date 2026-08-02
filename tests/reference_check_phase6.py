@@ -174,6 +174,11 @@ def phase_compare():
 
     engine_logits = engine_payload["logits"].float()
     hf_logits = hf_payload["logits"].float()
+    if engine_logits.dim() == 2 and engine_logits.shape[0] == 1:
+        # get_prefill_logits() returns one row per sequence in the batch
+        # ((num_seqs, vocab)); phase_hf() already slices down to the single
+        # final position ((vocab,)). Same quantity, different leading dim.
+        engine_logits = engine_logits.squeeze(0)
     print(f"engine logits shape: {tuple(engine_logits.shape)}  "
           f"dtype in file: {engine_payload['logits'].dtype}")
     print(f"hf     logits shape: {tuple(hf_logits.shape)}  "
