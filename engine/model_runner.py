@@ -380,6 +380,31 @@ class ModelRunner:
         return token_ids
 
     @torch.inference_mode()
+    def get_prefill_logits(self, seqs: list[Sequence]) -> torch.Tensor | None:
+        """Diagnostic-only, additive -- does not change run()'s behavior at
+        all. Mirrors run()'s prefill (non-graph) branch exactly, but returns
+        raw logits at each seq's final position (already sliced by
+        ParallelLMHead.forward()'s context.is_prefill branch, same as the
+        logits run() would have sampled from) instead of sampled token ids.
+        Never calls self.sampler. Returns None on non-rank-0, matching
+        ParallelLMHead's gather-onto-rank-0-only behavior."""
+        input_ids, positions = self.prepare_prefill(seqs)
+        if self.state_manager is not None:
+            context = get_context()
+            num_layers = len(self.model.model.layers)
+            linear_idx = self.model.model.linear_layer_indices
+            states, conv_states = self.state_manager.get_all(context.state_slot_ids, num_layers, linear_idx)
+            logits, new_states, new_conv_states = self.model(
+                input_ids, positions, context.cu_seqlens_q, states, conv_states
+            )
+            self.state_manager.set_all(context.state_slot_ids, new_states, new_conv_states, linear_idx)
+            logits = self.model.compute_logits(logits)
+        else:
+            logits = self.run_model(input_ids, positions, True)
+        reset_context()
+        return logits.cpu() if logits is not None else None
+
+    @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
