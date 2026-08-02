@@ -49,12 +49,7 @@ def main():
 
     out = llm.generate(
         ["The capital of France is"],
-        # sampling_params.py disallows temperature==0.0 (greedy) outright --
-        # deliberate constraint in this codebase, not overridden here. A
-        # small positive temperature is close enough to deterministic for
-        # this smoke test's purpose (confirm generation completes and
-        # produces plausible output), not an exact-reproducibility check.
-        SamplingParams(temperature=0.01, max_tokens=1),
+        SamplingParams(temperature=0, max_tokens=1),
     )
     print("GENERATION SUCCEEDED")
     print(out)
