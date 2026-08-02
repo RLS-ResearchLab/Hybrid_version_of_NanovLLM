@@ -33,8 +33,11 @@ def _is_full_attention(layer_idx: int, full_attention_interval: int) -> bool:
 
 def _get_layer_types(config, num_layers: int) -> list[str]:
     """Determine layer types from config. Data-driven if available, else modulo rule."""
-    # Prefer explicit per-layer type list (Jamba/Zamba-style)
-    layers_block_type = getattr(config, "layers_block_type", None)
+    # Prefer explicit per-layer type list (Jamba/Zamba-style). Real
+    # checkpoints call this field "layer_types", not "layers_block_type" --
+    # confirmed no test fixture anywhere in the repo uses the old name, so
+    # this is a straight rename, not a fallback chain.
+    layers_block_type = getattr(config, "layer_types", None)
     if layers_block_type is not None:
         assert len(layers_block_type) == num_layers
         return list(layers_block_type)
@@ -187,16 +190,31 @@ class Qwen35LinearAttention(nn.Module):
         self.ck = conv_kernel_size
         self.tp_rank = tp_rank
 
-        # QKV dim = (LKH + LKH + LVH) * LHD
+        # QKV dim = (LKH + LKH + LVH) * LHD -- LOCAL (per-rank) width. Consumed
+        # by conv1d below and by forward()'s slicing (lkh/lvh unpacked
+        # directly there) -- must stay local-valued, do not change this line.
         self.qkv_dim = (self.lkh + self.lkh + self.lvh) * self.lhd
 
-        # Projections
-        self.in_proj_qkv = ColumnParallelLinear(hidden_size, self.qkv_dim, bias=False)
-        self.in_proj_z = ColumnParallelLinear(hidden_size, self.lvh * self.lhd, bias=False)
-        # A and B project to per-head scalars — LVH-sized output.
-        # Structured for future TP sharding along head dimension.
-        self.in_proj_a = ReplicatedLinear(hidden_size, self.lvh, bias=False)
-        self.in_proj_b = ReplicatedLinear(hidden_size, self.lvh, bias=False)
+        # Projections. ColumnParallelLinear/RowParallelLinear divide their
+        # size argument by tp_size internally (see Qwen35FullAttention.q_proj
+        # for the correct reference pattern: full, undivided size in). These
+        # five constructor sites previously passed the already-local
+        # self.lkh/self.lvh-derived value, causing a double division -- use
+        # total_lkh/total_lvh (undivided) here instead; self.lkh/self.lvh
+        # remain local and unchanged everywhere else (conv1d, A_log, dt_bias,
+        # head_expand, forward()'s slicing).
+        total_qkv_dim = (self.total_lkh + self.total_lkh + self.total_lvh) * self.lhd
+        self.in_proj_qkv = ColumnParallelLinear(hidden_size, total_qkv_dim, bias=False)
+        self.in_proj_z = ColumnParallelLinear(hidden_size, self.total_lvh * self.lhd, bias=False)
+        # A and B project to per-head scalars -- LOCAL output (broadcast
+        # against the per-rank A_log/dt_bias inside the local delta-rule
+        # scan; no cross-rank communication anywhere in forward() before
+        # out_proj). ColumnParallelLinear (sharded by head, matching
+        # in_proj_qkv/in_proj_z), not ReplicatedLinear (full/identical copy
+        # -- wrong contract for a per-head-sharded quantity, and unable to
+        # load a real checkpoint's full-size tensor without erroring).
+        self.in_proj_a = ColumnParallelLinear(hidden_size, self.total_lvh, bias=False)
+        self.in_proj_b = ColumnParallelLinear(hidden_size, self.total_lvh, bias=False)
 
         # Depthwise causal conv1d
         self.conv1d = nn.Conv1d(
@@ -212,7 +230,7 @@ class Qwen35LinearAttention(nn.Module):
         self.norm = Qwen35RMSNormGated(self.lhd, eps=rms_norm_eps)
 
         # Output projection
-        self.out_proj = RowParallelLinear(self.lvh * self.lhd, hidden_size, bias=False)
+        self.out_proj = RowParallelLinear(self.total_lvh * self.lhd, hidden_size, bias=False)
 
         # Head expansion ratio (LKH → LVH)
         assert self.lvh % self.lkh == 0
@@ -700,12 +718,30 @@ class Qwen35DecoderLayer(nn.Module):
                 rms_norm_eps=rms_norm_eps,
             )
         else:
+            # Real checkpoints name these linear_num_key_heads /
+            # linear_num_value_heads / linear_key_head_dim /
+            # linear_conv_kernel_dim -- not the linear_attn_* / conv_kernel_size
+            # names this code originally looked for (those defaults happened
+            # to numerically match this checkpoint's real values, which is
+            # exactly the silent-coincidence failure mode to not rely on).
+            # Real name tried first; old name kept as a second fallback only
+            # for the small fake configs several existing tests build
+            # (tests/make_fake_hf_config.py and friends), which still use the
+            # old field names -- not because the old name is correct.
             self.linear_attn = Qwen35LinearAttention(
                 hidden_size=hidden_size,
-                linear_attn_kq_heads=getattr(config, "linear_attn_kq_heads", 16),
-                linear_attn_v_heads=getattr(config, "linear_attn_v_heads", 32),
-                linear_attn_head_dim=getattr(config, "linear_attn_head_dim", 128),
-                conv_kernel_size=getattr(config, "conv_kernel_size", 4),
+                linear_attn_kq_heads=getattr(
+                    config, "linear_num_key_heads", getattr(config, "linear_attn_kq_heads", 16)
+                ),
+                linear_attn_v_heads=getattr(
+                    config, "linear_num_value_heads", getattr(config, "linear_attn_v_heads", 32)
+                ),
+                linear_attn_head_dim=getattr(
+                    config, "linear_key_head_dim", getattr(config, "linear_attn_head_dim", 128)
+                ),
+                conv_kernel_size=getattr(
+                    config, "linear_conv_kernel_dim", getattr(config, "conv_kernel_size", 4)
+                ),
                 rms_norm_eps=rms_norm_eps,
             )
 
