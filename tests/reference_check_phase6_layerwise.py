@@ -134,10 +134,16 @@ def phase_hf():
     handles = []
 
     def _make_hook(idx):
-        def _hook(module, inputs, output):
+        # with_kwargs=True: the real model calls
+        # self.linear_attn(hidden_states=hidden_states, ...) with
+        # hidden_states passed as a KEYWORD arg, so the default hook
+        # signature's positional-only `args` is empty -- hidden_states is
+        # only reachable via `kwargs` here.
+        def _hook(module, args, kwargs, output):
             out = output[0] if isinstance(output, (tuple, list)) else output
             attn_captures[idx] = out[0, -1, :].detach().float().cpu()
-            in_ = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
+            in_ = kwargs.get("hidden_states", args[0] if args else None)
+            assert in_ is not None, f"layer {idx}: couldn't find hidden_states in hook args/kwargs"
             mixer_io[idx] = {
                 "input": in_[0].detach().float().cpu(),      # (seq_len, hidden)
                 "output": out[0].detach().float().cpu(),     # (seq_len, hidden)
@@ -150,7 +156,7 @@ def phase_hf():
             name for name, _ in layer.named_children() if name not in _SKIP_CHILD_NAMES
         )
         mixer_names.append(mixer_name)
-        handles.append(getattr(layer, mixer_name).register_forward_hook(_make_hook(i)))
+        handles.append(getattr(layer, mixer_name).register_forward_hook(_make_hook(i), with_kwargs=True))
     print(f"[hf] attention-sublayer submodule name per layer (first 5): {mixer_names[:5]}")
 
     input_ids = torch.tensor([prompt_ids], dtype=torch.long).to(model.device)
