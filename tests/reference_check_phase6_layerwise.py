@@ -258,7 +258,7 @@ def phase_compare():
             a_cos = _cos(_last_row(engine_attn[layer_idx]), hf_attn[layer_idx].float())
             attn_cos_str = f"{a_cos:.6f}"
             if have_post_ln:
-                pln_cos = _cos(_last_row(engine_post_ln[layer_idx]), hf_mixer_io[layer_idx]["input"].float())
+                pln_cos = _cos(_last_row(engine_post_ln[layer_idx]), _last_row(hf_mixer_io[layer_idx]["input"]))
                 post_ln_cos_str = f"{pln_cos:.6f}"
         trace.append((i, label, cos))
         row = f"{i:>4}  {label:<30}  "
@@ -298,7 +298,7 @@ def phase_compare():
     attn_cos_at_bad = _cos(_last_row(engine_attn[bad_layer_idx]), hf_attn[bad_layer_idx].float())
     print(f"First divergence at {bad_label} (index {bad_idx}).")
     if have_post_ln:
-        pln_cos_at_bad = _cos(_last_row(engine_post_ln[bad_layer_idx]), hf_mixer_io[bad_layer_idx]["input"].float())
+        pln_cos_at_bad = _cos(_last_row(engine_post_ln[bad_layer_idx]), _last_row(hf_mixer_io[bad_layer_idx]["input"]))
         print(f"  post-input_layernorm cosine at this layer (BEFORE attention runs): {pln_cos_at_bad:.6f}")
         if pln_cos_at_bad < 0.999:
             print(f"  -> Already degraded before attention even runs. The bug is in input_layernorm "
