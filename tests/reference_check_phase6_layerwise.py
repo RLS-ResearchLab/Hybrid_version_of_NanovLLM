@@ -91,7 +91,17 @@ def phase_engine():
     seq.num_scheduled_tokens = len(prompt_ids)
     llm.scheduler.block_manager.allocate(seq, 0)
     if llm.model_runner.state_manager is not None:
-        seq.state_slot = 0
+        # NOT `seq.state_slot = 0` -- ModelRunner.warmup_model() runs a
+        # real forward pass using slot 0 and persists non-zero state via
+        # set_all(), and never re-zeros it afterward (only bookkeeping is
+        # checked post-warmup). Reusing slot 0 directly silently fed this
+        # "fresh" sequence leftover warmup state. state_manager.allocate()
+        # explicitly .zero_()s the slot first, matching what real Scheduler
+        # traffic gets. See reference_check_phase6.py's phase_engine() for
+        # the full writeup of how this was found (attn-only trace showing
+        # linear_attention layers consistently worse than neighboring
+        # full_attention layers, confirmed via diag_linear_attn_tp_isolation.py).
+        llm.model_runner.state_manager.allocate(seq)
 
     layer_states, attn_only_states, post_ln_states, logits = llm.model_runner.call("get_prefill_layer_states", [seq])
     assert layer_states is not None, "expected rank0 to return gathered layer states"
