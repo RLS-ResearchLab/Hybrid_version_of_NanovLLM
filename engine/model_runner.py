@@ -405,7 +405,7 @@ class ModelRunner:
         return logits.cpu() if logits is not None else None
 
     @torch.inference_mode()
-    def get_prefill_layer_states(self, seqs: list[Sequence]) -> tuple[list[torch.Tensor], torch.Tensor] | None:
+    def get_prefill_layer_states(self, seqs: list[Sequence]) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor] | None:
         """Diagnostic-only, additive -- does not change run()'s or
         get_prefill_logits()'s behavior at all. Mirrors get_prefill_logits's
         prefill path exactly, but captures the residual-stream hidden state
@@ -416,9 +416,21 @@ class ModelRunner:
         Qwen35RMSNorm computes internally for the next layer's input, i.e.
         the actual residual-stream value at that point, not the
         pre-add/pre-norm intermediate qwen3_5.py's layer forward returns
-        split. Also computes final-norm + lm_head logits the same way
+        split.
+
+        A per-decoder-layer checkpoint conflates two very different
+        sublayers (self_attn/linear_attn, then a full MoE FFN pass) --
+        inlines Qwen35DecoderLayer.forward()'s steps here (instead of
+        calling layer(...) as one opaque call) to ALSO capture each layer's
+        raw attention/linear-attn sublayer output on its own, before
+        post_attention_layernorm/mlp run, so a HF-side forward hook on the
+        same submodule can isolate "attention sublayer wrong" from "MoE FFN
+        wrong" instead of only seeing their combined effect.
+
+        Also computes final-norm + lm_head logits the same way
         get_prefill_logits does, as one more checkpoint past the last
-        decoder layer. Returns (layer_states, logits), or None on non-rank-0.
+        decoder layer. Returns (layer_states, attn_only_states, logits), or
+        None on non-rank-0.
         """
         input_ids, positions = self.prepare_prefill(seqs)
         context = get_context()
@@ -433,18 +445,28 @@ class ModelRunner:
         hidden_states = model.embed_tokens(input_ids)
         residual = None
         captured = [hidden_states.float().cpu()]
+        attn_only = []
         for i, layer in enumerate(model.layers):
-            hidden_states, residual, ns, nc = layer(
-                positions, hidden_states, residual, context.cu_seqlens_q,
-                state=states[i], conv_state=conv_states[i],
-            )
+            if residual is None:
+                hs_in, res_in = layer.input_layernorm(hidden_states), hidden_states
+            else:
+                hs_in, res_in = layer.input_layernorm(hidden_states, residual)
+            if layer.is_full:
+                attn_out = layer.self_attn(positions, hs_in)
+            else:
+                attn_out, ns, nc = layer.linear_attn(
+                    hs_in, context.cu_seqlens_q, states=states[i], conv_states=conv_states[i]
+                )
+            attn_only.append(attn_out.float().cpu())
+            hs_mid, residual = layer.post_attention_layernorm(attn_out, res_in)
+            hidden_states = layer.mlp(hs_mid, context.cu_seqlens_q)
             captured.append((hidden_states + residual).float().cpu())
         final_hidden, _ = model.norm(hidden_states, residual)
         logits = self.model.compute_logits(final_hidden)
         reset_context()
         if self.rank != 0:
             return None
-        return captured, logits.float().cpu()
+        return captured, attn_only, logits.float().cpu()
 
     @torch.inference_mode()
     def capture_cudagraph(self):
