@@ -405,6 +405,42 @@ class ModelRunner:
         return logits.cpu() if logits is not None else None
 
     @torch.inference_mode()
+    def get_prefill_layer_states(self, seqs: list[Sequence]) -> list[torch.Tensor] | None:
+        """Diagnostic-only, additive -- does not change run()'s or
+        get_prefill_logits()'s behavior at all. Mirrors get_prefill_logits's
+        prefill path exactly, but captures the residual-stream hidden state
+        after the embedding layer and after each decoder layer, for
+        layer-by-layer comparison against HF's `output_hidden_states=True`
+        tuple (index 0 = embedding output, index i+1 = output of layer i).
+        "hidden_states + residual" is the same fused-add value
+        Qwen35RMSNorm computes internally for the next layer's input, i.e.
+        the actual residual-stream value at that point, not the
+        pre-add/pre-norm intermediate qwen3_5.py's layer forward returns
+        split. Returns None on non-rank-0.
+        """
+        input_ids, positions = self.prepare_prefill(seqs)
+        context = get_context()
+        model = self.model.model    # Qwen35Model
+        num_layers = len(model.layers)
+        states = [None] * num_layers
+        conv_states = [None] * num_layers
+        if self.state_manager is not None:
+            states, conv_states = self.state_manager.get_all(
+                context.state_slot_ids, num_layers, model.linear_layer_indices
+            )
+        hidden_states = model.embed_tokens(input_ids)
+        residual = None
+        captured = [hidden_states.float().cpu()]
+        for i, layer in enumerate(model.layers):
+            hidden_states, residual, ns, nc = layer(
+                positions, hidden_states, residual, context.cu_seqlens_q,
+                state=states[i], conv_state=conv_states[i],
+            )
+            captured.append((hidden_states + residual).float().cpu())
+        reset_context()
+        return captured if self.rank == 0 else None
+
+    @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config

@@ -219,10 +219,12 @@ def phase_compare():
     print(f"THRESHOLD (stated before running): cosine >= {COSINE_SIM_THRESHOLD} AND argmax match")
     print(f"VERDICT: {'PASS' if passed else 'FAIL'}")
     if not passed:
-        print("Expected, not a surprise: M-RoPE (mrope_interleaved/mrope_section, declared in this "
-              "checkpoint's config) is not implemented in this engine -- deliberately deferred from "
-              "message 1 of tonight's session. This measurement quantifies that gap's actual numeric "
-              "impact; it does not indicate a new bug introduced tonight.")
+        print("NOTE: this is NOT the expected M-RoPE gap. For a text-only prompt (no image/video "
+              "tokens), Qwen-VL-style get_rope_index() assigns identical t/h/w position ids, so "
+              "missing M-RoPE support should reduce to plain 1D RoPE here -- ~zero effect. A cosine "
+              "similarity this negative, and a garbage (non-token-like) top-1, indicates a real "
+              "correctness bug elsewhere in the forward pass, not a known/deferred gap. See "
+              "reference_check_phase6_layerwise.py to localize which layer the divergence starts at.")
 
 
 def main():
