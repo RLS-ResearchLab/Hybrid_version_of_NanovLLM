@@ -15,6 +15,7 @@ No GPU needed -- pure Python, reads a JSONL file.
 Usage:
     python tests/gsm8k_score.py
     python tests/gsm8k_score.py --results tests/_gsm8k_cache/smoke_results.jsonl
+    python tests/gsm8k_score.py --results tests/_gsm8k_cache/full_results_n660.jsonl --expected-total 660
 """
 import argparse
 import json
@@ -53,7 +54,14 @@ def load_records(path: str) -> list[dict]:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--results", default=DEFAULT_RESULTS_PATH)
+    parser.add_argument(
+        "--expected-total", type=int, default=EXPECTED_TOTAL,
+        help=f"Denominator for the 'is this run complete' check -- default {EXPECTED_TOTAL} "
+             f"(full test set). Pass the --num-examples value used with gsm8k_full_run.py "
+             f"when scoring a subsample, or a PARTIAL-RUN verdict never clears.",
+    )
     args = parser.parse_args()
+    expected_total = args.expected_total
 
     if not os.path.exists(args.results):
         print(f"STOP: {args.results} does not exist yet -- nothing to score.")
@@ -71,17 +79,18 @@ def main():
     n_extract_failed = sum(1 for r in records if r["extraction_method"] == "failed")
     exact_match_pct = 100 * n_correct / n
 
-    is_partial = n < EXPECTED_TOTAL
+    is_partial = n < expected_total
     print("=" * 70)
     print(f"GSM8K SCORE -- {args.results}")
     print("=" * 70)
     if is_partial:
-        print(f"PARTIAL RUN: {n}/{EXPECTED_TOTAL} examples completed so far.")
+        print(f"PARTIAL RUN: {n}/{expected_total} examples completed so far.")
         print("(Numbers below are over the completed subset only -- the 87.5% threshold")
-        print(" verdict below only applies once all 1319 examples are done.)")
-    elif n > EXPECTED_TOTAL:
-        print(f"WARNING: {n} records found, expected exactly {EXPECTED_TOTAL} -- "
-              f"check for a stale/mixed results file.")
+        print(f" verdict below only applies once all {expected_total} examples are done.)")
+    elif n > expected_total:
+        print(f"WARNING: {n} records found, expected exactly {expected_total} -- "
+              f"check for a stale/mixed results file, or pass --expected-total to match "
+              f"the --num-examples value gsm8k_full_run.py actually used.")
     print()
     print(f"Examples scored:            {n}")
     print(f"Correct (exact match):      {n_correct}")
