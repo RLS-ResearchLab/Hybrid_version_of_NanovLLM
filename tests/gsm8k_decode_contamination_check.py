@@ -30,13 +30,21 @@ already validated at prefill, isolating this check to the DECODE loop
 specifically -- which is the thing that's actually new this session.
 
 Usage (run engine loads are ~1-2 min each; run baseline and packed in
-either order, both before compare):
+either order, both before compare; pass the SAME --enforce-eager/--batch-size
+to all three -- results are cached per-setting so different configurations
+don't collide):
     python tests/gsm8k_decode_contamination_check.py --phase baseline
     python tests/gsm8k_decode_contamination_check.py --phase packed
     python tests/gsm8k_decode_contamination_check.py --phase compare   # no GPU needed
 
+    # to validate a non-default setting before trusting it in gsm8k_full_run.py:
+    python tests/gsm8k_decode_contamination_check.py --phase baseline --no-enforce-eager
+    python tests/gsm8k_decode_contamination_check.py --phase packed --no-enforce-eager
+    python tests/gsm8k_decode_contamination_check.py --phase compare --no-enforce-eager
+
 Intermediate artifacts land in tests/_gsm8k_cache/decode_contamination/
-(repo-relative, safe to delete after --phase compare).
+(repo-relative, safe to delete after --phase compare), named per-setting so
+an eager-mode run and a graph-mode run don't overwrite each other.
 
 CAVEAT -- stated here, before running, not after seeing the result: exact
 token-for-token equality across up to 512 autoregressive decode steps is a
@@ -85,14 +93,24 @@ from gsm8k_prompt import build_prompt  # noqa: E402
 
 CKPT_DIR = os.path.join(ROOT, "qwen35_checkpoint")
 CACHE_DIR = os.path.join(ROOT, "tests", "_gsm8k_cache", "decode_contamination")
-BASELINE_PATH = os.path.join(CACHE_DIR, "baseline.json")
-PACKED_PATH = os.path.join(CACHE_DIR, "packed.json")
 
 MAX_MODEL_LEN = 2048
 MAX_TOKENS = 512  # same as the real eval -- validating the actual config, not a scaled-down proxy
-TARGET_INDICES = [0, 1, 2]        # same GSM8K test-set indices used in gsm8k_smoke_test.py
-FILLER_INDICES = [3, 4, 5, 6, 7]  # 3 target + 5 filler = 8, the real eval's batch size
-BATCH_SIZE = len(TARGET_INDICES) + len(FILLER_INDICES)
+TARGET_INDICES = [0, 1, 2]  # same GSM8K test-set indices used in gsm8k_smoke_test.py
+
+
+def _cache_paths(enforce_eager: bool, batch_size: int):
+    tag = f"eager{enforce_eager}_bs{batch_size}"
+    return (
+        os.path.join(CACHE_DIR, f"baseline_{tag}.json"),
+        os.path.join(CACHE_DIR, f"packed_{tag}.json"),
+    )
+
+
+def _filler_indices(batch_size: int) -> list[int]:
+    n_filler = batch_size - len(TARGET_INDICES)
+    assert n_filler >= 0, f"--batch-size must be >= {len(TARGET_INDICES)} (number of target prompts)"
+    return list(range(len(TARGET_INDICES), len(TARGET_INDICES) + n_filler))
 
 
 def _load_gsm8k():
@@ -104,21 +122,22 @@ def _load_gsm8k():
     return ds
 
 
-def phase_baseline():
+def phase_baseline(enforce_eager: bool, batch_size: int):
     os.makedirs(CACHE_DIR, exist_ok=True)
+    baseline_path, _ = _cache_paths(enforce_eager, batch_size)
     ds = _load_gsm8k()
     target_prompts = [build_prompt(ds[i]["question"]) for i in TARGET_INDICES]
 
     from nanovllm.llm import LLM
     from nanovllm.sampling_params import SamplingParams
 
-    print(f"Loading engine from {CKPT_DIR} (tensor_parallel_size=2) ...")
+    print(f"Loading engine from {CKPT_DIR} (tensor_parallel_size=2, enforce_eager={enforce_eager}) ...")
     llm = LLM(
         CKPT_DIR,
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         tensor_parallel_size=2,
         gpu_memory_utilization=0.9,
-        max_num_seqs=BATCH_SIZE,
+        max_num_seqs=batch_size,
         max_model_len=MAX_MODEL_LEN,
     )
     sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
@@ -136,35 +155,37 @@ def phase_baseline():
         results[str(idx)] = token_ids
         print(f"  gsm8k idx={idx}: {len(token_ids)} tokens generated in {dt:.1f}s")
 
-    with open(BASELINE_PATH, "w") as f:
+    with open(baseline_path, "w") as f:
         json.dump(results, f)
-    print(f"\nSaved baseline results to {BASELINE_PATH}")
+    print(f"\nSaved baseline results to {baseline_path}")
     print("PHASE COMPLETE -- exit this process fully before running --phase packed")
 
 
-def phase_packed():
+def phase_packed(enforce_eager: bool, batch_size: int):
     os.makedirs(CACHE_DIR, exist_ok=True)
+    _, packed_path = _cache_paths(enforce_eager, batch_size)
+    filler_indices = _filler_indices(batch_size)
     ds = _load_gsm8k()
     target_prompts = [build_prompt(ds[i]["question"]) for i in TARGET_INDICES]
-    filler_prompts = [build_prompt(ds[i]["question"]) for i in FILLER_INDICES]
+    filler_prompts = [build_prompt(ds[i]["question"]) for i in filler_indices]
 
     from nanovllm.llm import LLM
     from nanovllm.sampling_params import SamplingParams
 
-    print(f"Loading engine from {CKPT_DIR} (tensor_parallel_size=2) ...")
+    print(f"Loading engine from {CKPT_DIR} (tensor_parallel_size=2, enforce_eager={enforce_eager}) ...")
     llm = LLM(
         CKPT_DIR,
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         tensor_parallel_size=2,
         gpu_memory_utilization=0.9,
-        max_num_seqs=BATCH_SIZE,
+        max_num_seqs=batch_size,
         max_model_len=MAX_MODEL_LEN,
     )
     sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
 
     print("\n" + "=" * 78)
-    print(f"PACKED -- {len(TARGET_INDICES)} target + {len(FILLER_INDICES)} filler prompts, "
-          f"ONE batch (concurrency={BATCH_SIZE}), fresh process/engine/cache -- this is each "
+    print(f"PACKED -- {len(TARGET_INDICES)} target + {len(filler_indices)} filler prompts, "
+          f"ONE batch (concurrency={batch_size}), fresh process/engine/cache -- this is each "
           f"target prompt's FIRST EVER submission in this process, so num_cached_tokens must be "
           f"0 for all of them (verified below); no self-cache-reuse confound possible.")
     print("=" * 78)
@@ -178,9 +199,9 @@ def phase_packed():
     for idx, token_ids in results.items():
         print(f"  gsm8k idx={idx}: {len(token_ids)} tokens generated")
 
-    with open(PACKED_PATH, "w") as f:
+    with open(packed_path, "w") as f:
         json.dump(results, f)
-    print(f"\nSaved packed results to {PACKED_PATH}")
+    print(f"\nSaved packed results to {packed_path}")
     print("PHASE COMPLETE")
 
 
@@ -191,13 +212,14 @@ def _first_divergence(a: list[int], b: list[int]):
     return len(a) if len(a) != len(b) else None  # None means fully identical
 
 
-def phase_compare():
-    assert os.path.exists(BASELINE_PATH), f"missing {BASELINE_PATH} -- run --phase baseline first"
-    assert os.path.exists(PACKED_PATH), f"missing {PACKED_PATH} -- run --phase packed first"
+def phase_compare(enforce_eager: bool, batch_size: int):
+    baseline_path, packed_path = _cache_paths(enforce_eager, batch_size)
+    assert os.path.exists(baseline_path), f"missing {baseline_path} -- run --phase baseline first"
+    assert os.path.exists(packed_path), f"missing {packed_path} -- run --phase packed first"
 
-    with open(BASELINE_PATH) as f:
+    with open(baseline_path) as f:
         baseline = json.load(f)
-    with open(PACKED_PATH) as f:
+    with open(packed_path) as f:
         packed = json.load(f)
 
     print("\n" + "=" * 78)
@@ -238,7 +260,7 @@ def phase_compare():
     print("=" * 78)
     if all_exact:
         print(f"ALL {len(TARGET_INDICES)} target prompts: EXACT token-for-token match between "
-              f"concurrency=1 and concurrency={BATCH_SIZE}, with no shared-cache confound. No "
+              f"concurrency=1 and concurrency={batch_size}, with no shared-cache confound. No "
               f"decode-time contamination detected.")
     else:
         print("At least one target prompt diverged -- see the DIVERGENCE/ASSESSMENT lines above "
@@ -248,13 +270,20 @@ def phase_compare():
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--phase", required=True, choices=["baseline", "packed", "compare"])
+    parser.add_argument(
+        "--enforce-eager", action=argparse.BooleanOptionalAction, default=True,
+        help="Must match whatever setting gsm8k_full_run.py will actually use -- results are "
+             "cached per-setting (see _cache_paths), so mismatched --phase calls fail loudly "
+             "(missing file) rather than silently comparing incompatible runs.",
+    )
+    parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
     if args.phase == "baseline":
-        phase_baseline()
+        phase_baseline(args.enforce_eager, args.batch_size)
     elif args.phase == "packed":
-        phase_packed()
+        phase_packed(args.enforce_eager, args.batch_size)
     else:
-        phase_compare()
+        phase_compare(args.enforce_eager, args.batch_size)
 
 
 if __name__ == "__main__":
