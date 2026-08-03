@@ -412,21 +412,36 @@ class ModelRunner:
         return token_ids
 
     def allocate_state_slot(self, seq: Sequence) -> None:
-        """Diagnostic-only, additive. StateManager.allocate() must run on
-        EVERY rank's own StateManager instance, not just rank0's -- each
-        rank at tensor_parallel_size>1 is a separate process with its own
-        independent state/conv_state buffers (each ran its own
-        warmup_model(), which leaves genuine non-zero residue in whatever
-        slot it used, never re-zeroed afterward -- see
-        reference_check_phase6.py's phase_engine() for the full writeup).
-        Calling state_manager.allocate(seq) directly on the caller's own
-        ModelRunner object only zeros ITS rank's copy; dispatching this
-        through .call(...) (which pickles+sends seq to every other rank via
-        the same shared-memory mechanism run()/get_prefill_logits() use)
+        """Called via .call(...) from Scheduler.schedule() (engine/scheduler.py)
+        for every real request, not just diagnostics -- StateManager.allocate()
+        must run on EVERY rank's own StateManager instance, not just rank0's --
+        each rank at tensor_parallel_size>1 is a separate process with its own
+        independent state/conv_state buffers (each ran its own warmup_model(),
+        which leaves genuine non-zero residue in whatever slot it used, never
+        re-zeroed afterward -- see reference_check_phase6.py's phase_engine()
+        for the full writeup). Calling state_manager.allocate(seq) directly on
+        only one rank's ModelRunner object -- which is what Scheduler used to
+        do, calling straight into its own local state_manager reference with
+        no cross-rank dispatch at all -- only zeros THAT rank's copy, leaving
+        every other rank reading whatever the slot's previous tenant (often
+        still-warm warmup residue) left behind, with no crash or NaN, just
+        silently wrong recurrent state from the very first forward pass.
+        Dispatching through .call(...) (pickles+sends seq to every other rank
+        via the same shared-memory mechanism run()/get_prefill_logits() use)
         runs allocate() on all of them, so every rank's slot for this seq
-        starts genuinely zeroed, not just rank0's."""
+        starts genuinely zeroed."""
         if self.state_manager is not None:
             self.state_manager.allocate(seq)
+
+    def free_state_slot(self, seq: Sequence) -> None:
+        """Called via .call(...) from Scheduler.postprocess()/preempt() --
+        the free-side counterpart of allocate_state_slot(), same reason:
+        StateManager.free() must zero every rank's own copy of this seq's
+        slot, not just rank0's, so the NEXT sequence to receive this slot
+        (via allocate_state_slot(), possibly on a different rank first)
+        doesn't inherit this one's leftover recurrent/conv state anywhere."""
+        if self.state_manager is not None:
+            self.state_manager.free(seq)
 
     @torch.inference_mode()
     def get_prefill_logits(self, seqs: list[Sequence]) -> torch.Tensor | None:
