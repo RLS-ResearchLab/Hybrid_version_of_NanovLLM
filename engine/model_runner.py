@@ -448,6 +448,24 @@ class ModelRunner:
         return logits.cpu() if logits is not None else None
 
     @torch.inference_mode()
+    def sample_from_logits(self, logits: torch.Tensor, temperatures: torch.Tensor) -> list[int] | None:
+        """Diagnostic-only, additive -- does not change run()'s behavior at
+        all. Calls self.sampler directly on an ALREADY-COMPUTED logits
+        tensor (e.g. captured via get_prefill_logits), the exact same call
+        run() makes (`self.sampler(logits, temperatures)`), to isolate
+        whether the (@torch.compile-decorated) sampler itself introduces
+        any batch-shape-dependent behavior for a FIXED row's greedy
+        argmax, independent of whether the upstream logits computation
+        itself is shape-dependent (already checked separately via
+        get_prefill_logits). Only meaningful on rank0 -- other ranks never
+        run the sampler (ParallelLMHead gathers logits onto rank0 only) --
+        returns None elsewhere, matching every other rank0-only diagnostic
+        in this file."""
+        if self.rank != 0:
+            return None
+        return self.sampler(logits.cuda(), temperatures.cuda()).tolist()
+
+    @torch.inference_mode()
     def get_prefill_layer_states(self, seqs: list[Sequence]) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor] | None:
         """Diagnostic-only, additive -- does not change run()'s or
         get_prefill_logits()'s behavior at all. Mirrors get_prefill_logits's
