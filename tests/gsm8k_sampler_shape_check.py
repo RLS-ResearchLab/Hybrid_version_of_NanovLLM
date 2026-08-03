@@ -103,6 +103,14 @@ def main():
           f"{'sampler_alone':>13}  {'sampler_stacked':>15}  {'ALL_MATCH':>9}")
     print("  " + "-" * 90)
 
+    # sample_from_logits is rank0-only-local (no cross-GPU model computation,
+    # just self.sampler on an already-computed logits tensor) -- call it
+    # DIRECTLY on llm.model_runner (rank0's own object, in this process),
+    # NOT via .call(), which broadcasts args to rank1 through a 1MB
+    # shared-memory buffer that a (8, 248320) float32 tensor (~7.6MB)
+    # blows straight past. Computed once outside the loop, not once per row.
+    sampled_stacked_all = llm.model_runner.sample_from_logits(packed_logits.cpu(), torch.zeros(len(prompts)))
+
     all_match = True
     for i, idx in enumerate(SELECTED_INDICES):
         base_row = baseline_logits[i]
@@ -110,12 +118,8 @@ def main():
         raw_argmax_base = int(base_row.argmax().item())
         raw_argmax_packed = int(packed_row.argmax().item())
 
-        sampled_alone = llm.model_runner.call(
-            "sample_from_logits", base_row.unsqueeze(0).cpu(), torch.zeros(1)
-        )[0]
-        sampled_stacked = llm.model_runner.call(
-            "sample_from_logits", packed_logits.cpu(), torch.zeros(len(prompts))
-        )[i]
+        sampled_alone = llm.model_runner.sample_from_logits(base_row.unsqueeze(0).cpu(), torch.zeros(1))[0]
+        sampled_stacked = sampled_stacked_all[i]
 
         match = len({raw_argmax_base, raw_argmax_packed, sampled_alone, sampled_stacked}) == 1
         if not match:
