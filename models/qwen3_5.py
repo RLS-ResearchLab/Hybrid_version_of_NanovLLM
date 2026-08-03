@@ -531,16 +531,7 @@ class Qwen35MoE(nn.Module):
         is_decode = (cu_seqlens is not None) and (cu_seqlens.numel() - 1 == N)
         if is_decode:
             if self.ep_size > 1:
-                # Explicit scope boundary (Q5/Checkpoint 3): only the prefill
-                # (_forward_dispatch) path has an EP-aware variant so far.
-                # _forward_gathered indexes self.experts with GLOBAL expert
-                # ids, which would silently read out-of-bounds/wrong data
-                # against a round-robin-sharded local Experts tensor -- fail
-                # loud instead of computing silently-wrong decode output.
-                raise NotImplementedError(
-                    "EP decode path (_forward_gathered) not implemented yet -- "
-                    "out of scope for Checkpoint 3"
-                )
+                return self._forward_gathered_ep(x)
             return self._forward_gathered(x)
         if self.ep_size > 1:
             return self._forward_dispatch_ep(x)
@@ -583,7 +574,98 @@ class Qwen35MoE(nn.Module):
         sg = torch.sigmoid(self.shared_expert_gate(x))
         out = out + sg * self.shared_expert(x)
         return out
- 
+
+    def _forward_gathered_ep(self, x: torch.Tensor) -> torch.Tensor:
+        """Expert-parallel, capture-safe MoE forward for decode -- the EP
+        counterpart of _forward_gathered(). Fills the gap _forward_gathered's
+        docstring used to flag as out of scope (NotImplementedError at
+        ep_size>1): this is the decode-time twin of _forward_dispatch_ep(),
+        using the SAME round-robin ownership rule (global expert e is owned
+        by rank e % ep_size, at local slot e // ep_size in this rank's
+        sharded Experts tensor) and the same all_reduce combine, but keeping
+        _forward_gathered's capture-safe shape discipline: no loops, no
+        .item(), no data-dependent branching -- every op's shape is static
+        given N (batch size) and self.top_k.
+
+        Unlike the non-EP _forward_gathered(), self.experts only holds this
+        rank's LOCAL shard (local_num_experts = num_experts // ep_size), so a
+        global expert id can't index it directly. idx // ep_size is always a
+        valid in-bounds local slot regardless of ownership (every global id
+        is < num_experts = local_num_experts * ep_size, so
+        idx // ep_size < local_num_experts unconditionally) -- for (token, k)
+        pairs this rank does NOT own, that indexes into some OTHER expert's
+        weights, computing a value that is deliberately never used: it's
+        multiplied by owned_mask (0 for non-owned pairs) before the sum, so
+        it contributes nothing to the result. This trades some wasted
+        compute on non-owned pairs for a fully static-shape, branch-free
+        gather -- the same trade-off _forward_gathered already makes for
+        every (token, k) pair regardless of EP.
+
+        Combine (weighted sum across top_k, then all_reduce) is promoted to
+        fp32, mirroring _forward_dispatch_ep's measured-correct discipline --
+        deliberately NOT copying the plain _forward_gathered's
+        unpromoted-bf16 combine (its own comment flags that as an unfixed,
+        measured ~1.3% relative error on the non-EP decode path). No reason
+        to carry a known bug into new code when the fix is already
+        established and cheap on the prefill EP path.
+
+        Same reassociation caveat as _forward_dispatch_ep: bitwise-equivalent
+        to a dense fp32 reference for top_k==2 (sum of exactly 2 finite
+        floats is exactly commutative regardless of which rank computed
+        which term); not a general guarantee for top_k > 2 spread across
+        more than 2 ranks.
+
+        Sets self._last_ep_token_id_roundtrip the same way
+        _forward_dispatch_ep does (from the *same* ownership mask the real
+        computation uses), for the same independent-verification purpose.
+        """
+        TK, P = self.top_k, self.ep_size
+        N = x.shape[0]
+
+        w, idx = torch.topk(self.gate(x), TK, dim=-1)            # (N, TK) global expert ids
+        w = F.softmax(w, dim=-1).to(x.dtype)
+
+        local_slots = idx // P                                    # (N, TK) -- always in-bounds, see docstring
+        owned_mask = (idx % P) == self.ep_rank                    # (N, TK) bool
+
+        gate_up = self.experts.gate_up_proj[local_slots]          # (N, TK, 2*MI, H)
+        down = self.experts.down_proj[local_slots]                # (N, TK, H, MI)
+        gw, uw = gate_up.chunk(2, dim=2)                           # each (N, TK, MI, H)
+
+        h_gate = torch.einsum('nkmh,nh->nkm', gw, x)               # (N, TK, MI)
+        h_up = torch.einsum('nkmh,nh->nkm', uw, x)                 # (N, TK, MI)
+        h = F.silu(h_gate) * h_up                                  # (N, TK, MI)
+        out_e = torch.einsum('nkhm,nkm->nkh', down, h)             # (N, TK, H)
+
+        # Weighted-multiply/local-accumulate/all_reduce combine always
+        # happens in fp32 -- see docstring.
+        combine_dtype = torch.float32
+        mask = owned_mask.to(combine_dtype).unsqueeze(-1)          # (N, TK, 1)
+        weighted = out_e.to(combine_dtype) * w.to(combine_dtype).unsqueeze(-1) * mask
+        local_out = weighted.sum(dim=1)                             # (N, H), fp32
+
+        dist.all_reduce(local_out)
+        local_out = local_out.to(x.dtype)
+
+        # Token-id round-trip check, using the exact same owned_mask this
+        # rank's real computation used. A token is "touched" by this rank if
+        # it owns at least one of that token's top_k pairs; every token has
+        # top_k>=1 pairs, each assigned to exactly one rank, so every token
+        # is touched by exactly one rank for each of its pairs -- MAX-combine
+        # across ranks recovers arange(N) with no leftover -1 sentinels.
+        touched = owned_mask.any(dim=1)                             # (N,) bool
+        token_id_local = torch.where(
+            touched,
+            torch.arange(N, device=x.device, dtype=torch.int64),
+            torch.full((N,), -1, dtype=torch.int64, device=x.device),
+        )
+        dist.all_reduce(token_id_local, op=dist.ReduceOp.MAX)
+        self._last_ep_token_id_roundtrip = token_id_local
+
+        sg = torch.sigmoid(self.shared_expert_gate(x))
+        out = local_out + sg * self.shared_expert(x)
+        return out
+
     def _forward_dispatch(self, x: torch.Tensor) -> torch.Tensor:
         """Original sort-by-expert dispatch loop -- unchanged. Used for
         prefill (and any eager, non-graph-captured call), where N can be
