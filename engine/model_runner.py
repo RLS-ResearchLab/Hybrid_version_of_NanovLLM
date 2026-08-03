@@ -49,7 +49,7 @@ def _resolve_dtype(dtype) -> torch.dtype:
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], ack_event: Event | list[Event] | None = None):
         self.config = config
         hf_config = config.hf_config
         hf_config.dtype = _resolve_dtype(hf_config.dtype)
@@ -58,6 +58,13 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        # Paired with `event`: rank>0 sets its own ack_event right after
+        # copying read_shm()'s buffer contents out into local Python objects
+        # (see read_shm/write_shm below) -- lets rank0 know it's safe to
+        # overwrite the shared buffer with the next call's payload. Without
+        # this, rank0 has no way to know rank>0 has actually finished
+        # reading before it writes again.
+        self.ack_event = ack_event
         self.state_manager = None
 
         # enforce_eager elsewhere in this file only gates CUDA graph
@@ -144,10 +151,29 @@ class ModelRunner:
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
         self.event.clear()
+        # Only after the payload is fully copied out into local Python
+        # objects (pickle.loads above) is it safe for rank0 to overwrite
+        # the shared buffer -- signal that now, not after this call's
+        # method actually finishes executing (NCCL collectives inside the
+        # method already provide their own cross-rank synchronization;
+        # this ack is purely about the raw shared-memory bytes).
+        self.ack_event.set()
         return method_name, args
 
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
+        # Wait for every other rank to have finished reading the PREVIOUS
+        # message before overwriting the buffer with this one. Without this
+        # handshake, rank0 can race ahead (nothing throttles it for cheap,
+        # non-collective calls like allocate_state_slot) and overwrite the
+        # shared buffer while a rank>0 process is still mid-read, corrupting
+        # its pickle stream (observed as `pickle data was truncated`) or
+        # desyncing the two ranks onto different method calls entirely,
+        # which then deadlocks forever the moment either side hits a
+        # collective op the other isn't also calling.
+        for ack in self.ack_event:
+            ack.wait()
+            ack.clear()
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
