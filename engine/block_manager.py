@@ -25,12 +25,30 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, disable_prefix_cache: bool = False):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        # Prefix-cache REUSE must be disabled whenever a StateManager is
+        # active (Scheduler passes disable_prefix_cache=True in that case).
+        # Scheduler.schedule() unconditionally resets a sequence's recurrent/
+        # conv state to zero on any fresh block_table allocation, regardless
+        # of whether some of its KV blocks are being reused from the cache --
+        # reusing cached KV for a shared prefix while resetting linear-
+        # attention state to zero is inconsistent: the model would compute
+        # the "new" (uncached) tokens' state as if there were no preceding
+        # context, even though full-attention layers correctly see the
+        # shared prefix via the reused KV. Confirmed empirically: a
+        # partially-cached GSM8K sequence produced a degenerate repetition
+        # loop (see tests/gsm8k_decode_contamination_check.py's
+        # investigation) -- every example in that eval shares a long 8-shot
+        # exemplar prefix, so nearly every one after the first would hit
+        # this. Disabling reuse trades some redundant prefill recompute for
+        # correctness: state and KV cache are always computed together,
+        # fresh, for every sequence.
+        self.disable_prefix_cache = disable_prefix_cache
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -59,7 +77,7 @@ class BlockManager:
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
-        for i in range(seq.num_blocks - 1):
+        for i in ([] if self.disable_prefix_cache else range(seq.num_blocks - 1)):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)

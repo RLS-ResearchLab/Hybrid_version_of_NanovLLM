@@ -12,7 +12,13 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        # disable_prefix_cache=True whenever a StateManager is active -- see
+        # BlockManager.__init__'s docstring comment for why KV-cache reuse
+        # and always-reset-to-zero recurrent state are incompatible.
+        self.block_manager = BlockManager(
+            config.num_kvcache_blocks, config.kvcache_block_size,
+            disable_prefix_cache=(state_manager is not None),
+        )
         self.state_manager = state_manager
         # model_runner is optional -- when given (the real LLMEngine always
         # gives one), allocate/free are dispatched to EVERY tensor-parallel
