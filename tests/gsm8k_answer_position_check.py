@@ -112,6 +112,7 @@ def main():
                 n_no_marker += 1
                 print(f"  idx={i}: NO MARKER FOUND (method={result.method}) -- "
                       f"completion_len={len(token_ids)} tokens")
+                print(f"    last 400 chars: {text[-400:]!r}")
                 continue
             # Re-tokenize the prefix up to (and including) the marker to get
             # an exact token count -- character position alone doesn't map
