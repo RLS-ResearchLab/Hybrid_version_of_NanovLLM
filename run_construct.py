@@ -6,9 +6,12 @@ max_tokens=1 is deliberate: engine/scheduler.py's postprocess() marks a
 sequence finished as soon as num_completion_tokens == max_tokens, in the
 same call that processes the token -- so with max_tokens=1 the first
 (prefill) step's token immediately satisfies completion and the decode
-path (Qwen35MoE._forward_gathered, still NotImplementedError at ep_size>1)
-is never reached. This exercises construction, EP/TP-aware load_model(),
-and one real prefill forward pass -- not decode.
+path is never reached. This exercises construction, EP/TP-aware
+load_model(), and one real prefill forward pass -- not decode. (The decode
+path at ep_size>1, Qwen35MoE._forward_gathered_ep, is now implemented --
+see tests/test_moe_ep_dispatch_decode.py -- but this script still isn't the
+place to exercise it; use tests/gsm8k_smoke_test.py or a dedicated decode
+check for that.)
 """
 import os
 import sys
