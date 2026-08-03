@@ -18,11 +18,17 @@ cosine similarity >= 0.99 AND top-1 (argmax) match, per prompt. Same
 discipline, same threshold, and the same COSINE_SIM_THRESHOLD constant as
 reference_check_phase6.py's HF-vs-engine check.
 
-Uses 4 of Phase 6's own PROMPTS (varied length -- short factual, GSM8K-
-style word problem, bare numeric expression, longer narrative). These are
-the same prompts reference_check_phase6.py already validated
-single-sequence against the HF reference, so any divergence found here is
-attributable to PACKING specifically, not a pre-existing correctness bug.
+CONCURRENCY=8 -- the real target, not a proxy. The first run of this
+script used 4 prompts and passed cleanly (cosine 0.998576-0.998919,
+suspiciously tight/uniform across very different content -- consistent
+with a small, content-independent, batch-shape-driven bf16 effect, not a
+per-prompt sensitivity). That was 4-way concurrency; this run reuses
+those same 4 prompts (already validated against HF by
+reference_check_phase6.py) plus 4 new ones chosen for length/content
+variety again -- a 1-2 token bare word, a question/answer-format prompt,
+a Python code snippet, and a long multi-clause narrative -- and packs all
+8 together in ONE batch, to confirm the result holds at the actual
+production concurrency target instead of extrapolating from 4.
 
 Packing goes through get_prefill_logits(seqs) with a REAL multi-sequence
 list -- the exact function ModelRunner.run() calls internally, driven by
@@ -53,11 +59,27 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(__file__))
 from reference_check_phase6 import CKPT_DIR, PROMPTS, COSINE_SIM_THRESHOLD  # noqa: E402
 
-# Varied length/content, same rationale as reference_check_phase6.py: short
-# factual completion, GSM8K-style arithmetic word problem, bare numeric
-# expression, longer narrative. Skips the 5th (embedded-quotation) prompt
-# to keep this a clean 3-4 prompt batch as requested.
-SELECTED_PROMPTS = PROMPTS[:4]
+# The 4 already validated (single-sequence, against HF, AND at 4-way
+# packed concurrency in this script's first run) -- short factual
+# completion, GSM8K-style arithmetic word problem, bare numeric
+# expression, longer narrative.
+ALREADY_VALIDATED_PROMPTS = PROMPTS[:4]
+
+# 4 more, varied the same way: a bare 1-2 token word (shortest possible),
+# a question/answer-format prompt, a Python code snippet (very different
+# token distribution from natural-language prose), and a long multi-clause
+# narrative (longest prompt in the set, stresses the packed batch's total
+# token count the most).
+NEW_PROMPTS = [
+    "Hello",
+    "Q: What is the boiling point of water in degrees Celsius? A:",
+    "def add(a, b):\n    return",
+    "Once upon a time, in a kingdom far away, there lived a wise old wizard "
+    "who spent his days studying ancient scrolls and brewing potions in his "
+    "tower, always searching for",
+]
+
+SELECTED_PROMPTS = ALREADY_VALIDATED_PROMPTS + NEW_PROMPTS  # 8 total, concurrency=8
 
 
 def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
