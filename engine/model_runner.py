@@ -402,6 +402,12 @@ class ModelRunner:
             logits = self.run_model(input_ids, positions, is_prefill)
  
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        if is_prefill and self.rank == 0:
+            argmax_ids = logits.argmax(dim=-1).tolist()
+            for seq, argmax_id, token_id in zip(seqs, argmax_ids, token_ids):
+                print(f"[PREFILL-SAMPLE DEBUG] seq_id={seq.seq_id} argmax={argmax_id} sampled={token_id} "
+                      f"num_scheduled_tokens={seq.num_scheduled_tokens} num_cached_tokens={seq.num_cached_tokens} "
+                      f"num_tokens={seq.num_tokens}")
         reset_context()
         return token_ids
 
