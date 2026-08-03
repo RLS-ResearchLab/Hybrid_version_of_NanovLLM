@@ -33,6 +33,10 @@ _ANY_NUMBER_PATTERN = re.compile(r"-?[0-9][0-9,]*(?:\.[0-9]+)?")
 class ExtractionResult(NamedTuple):
     value: Optional[float]
     method: str  # "hash" | "answer_is" | "fallback_last_number" | "failed"
+    match_end: Optional[int] = None  # character offset just past the matched marker,
+                                      # None for "failed" -- used by gsm8k_answer_position_check.py
+                                      # to measure how many tokens are needed to reach the answer,
+                                      # not used by scoring (correctness only needs .value/.method)
 
 
 def _to_float(num_str: str) -> Optional[float]:
@@ -54,21 +58,23 @@ def extract_answer_detailed(model_output: str) -> ExtractionResult:
     if m:
         val = _to_float(m.group(1))
         if val is not None:
-            return ExtractionResult(val, "hash")
+            return ExtractionResult(val, "hash", m.end())
 
     m = _ANSWER_IS_PATTERN.search(model_output)
     if m:
         val = _to_float(m.group(1))
         if val is not None:
-            return ExtractionResult(val, "answer_is")
+            return ExtractionResult(val, "answer_is", m.end())
 
-    matches = _ANY_NUMBER_PATTERN.findall(model_output)
-    if matches:
-        val = _to_float(matches[-1])
+    last_match = None
+    for last_match in _ANY_NUMBER_PATTERN.finditer(model_output):
+        pass
+    if last_match is not None:
+        val = _to_float(last_match.group(0))
         if val is not None:
-            return ExtractionResult(val, "fallback_last_number")
+            return ExtractionResult(val, "fallback_last_number", last_match.end())
 
-    return ExtractionResult(None, "failed")
+    return ExtractionResult(None, "failed", None)
 
 
 def extract_answer(model_output: str) -> Optional[float]:
