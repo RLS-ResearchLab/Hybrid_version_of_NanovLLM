@@ -50,6 +50,7 @@ jinja2>=3.1.0                 # chat template rendering
 lm-eval[api]>=0.4.4           # eval/correctness/run_correctness.py (GSM8K-CoT)
 aiohttp                      # eval/throughput/run_throughput.py — async load testing
 tabulate                     # eval/throughput/run_throughput.py — results table
+datasets                     # tests/gsm8k_*.py — loads openai/gsm8k (main, test split)
 
 # ── Future optimization work (Phase 6 follow-ups, not yet wired in) ─────────
 flash-linear-attention        # [CUDA-only] fused chunked-scan GDR kernels
