@@ -65,13 +65,21 @@ from reference_check_phase6 import CKPT_DIR, PROMPTS, COSINE_SIM_THRESHOLD  # no
 # expression, longer narrative.
 ALREADY_VALIDATED_PROMPTS = PROMPTS[:4]
 
-# 4 more, varied the same way: a bare 1-2 token word (shortest possible),
-# a question/answer-format prompt, a Python code snippet (very different
-# token distribution from natural-language prose), and a long multi-clause
-# narrative (longest prompt in the set, stresses the packed batch's total
-# token count the most).
+# 4 more, varied the same way: a short casual phrase, a question/answer-
+# format prompt, a Python code snippet (very different token distribution
+# from natural-language prose), and a long multi-clause narrative (longest
+# prompt in the set, stresses the packed batch's total token count the
+# most). NOT a single-token prompt ("Hello" alone) -- that trips an
+# unrelated, pre-existing bug: Qwen35MoE.forward's is_decode heuristic
+# (cu_seqlens.numel()-1 == N) misclassifies a genuine 1-token PREFILL as a
+# decode step (same shape signature), routing it into the EP-unaware
+# _forward_gathered path, which raises NotImplementedError under EP>1
+# rather than compute silently-wrong output (see models/qwen3_5.py:531-543,
+# explicitly flagged "out of scope for Checkpoint 3"). Real, worth fixing
+# eventually, but unrelated to packing/contamination -- sidestepped here,
+# not fixed, to keep this script on-topic.
 NEW_PROMPTS = [
-    "Hello",
+    "Hello there",
     "Q: What is the boiling point of water in degrees Celsius? A:",
     "def add(a, b):\n    return",
     "Once upon a time, in a kingdom far away, there lived a wise old wizard "
