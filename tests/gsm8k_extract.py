@@ -34,18 +34,26 @@ _ANY_NUMBER_PATTERN = re.compile(r"-?[0-9][0-9,]*(?:\.[0-9]+)?")
 # (same marker + number shape) so "the engine stops generating" and "the
 # extractor would have found a real hash/answer_is match, not just
 # fallback_last_number" are the same condition. One addition beyond the
-# extraction patterns: a REQUIRED trailing delimiter ([.\s]) right after the
-# number. Without it, a partially-generated multi-digit number (e.g. just
-# "1" of "18", if the tokenizer splits it across steps) would already
-# satisfy `\d[\d,]*` and fire a token early, truncating the answer mid-digit.
+# extraction patterns: a REQUIRED trailing delimiter right after the number.
+# Without it, a partially-generated multi-digit number (e.g. just "1" of
+# "18", if the tokenizer splits it across steps) would already satisfy
+# `\d[\d,]*` and fire a token early, truncating the answer mid-digit.
 # Requiring a character AFTER the number means the pattern can't match until
 # the tokenizer has already emitted something past the last digit -- which
 # structurally can't happen until the number is actually finished. No
 # separate "wait one more token and re-check" state machine needed; the
 # regex's own shape enforces it.
+#
+# Delimiter set is [.\s$], not just [.\s]: this checkpoint frequently writes
+# math in LaTeX inline mode ("the answer is $60$." -- closing '$' right
+# after the number, not '.'/whitespace). A live n=24 verification run
+# (gsm8k_answer_position_check.py --stop-strings) caught exactly this --
+# one example's stop fired 143 tokens after its marker instead of the
+# expected 1, because [.\s] alone never matched the "$60$" case and had to
+# wait for a later, cleanly-delimited restatement. [.\s$] closes that gap.
 GSM8K_STOP_PATTERNS = [
-    r"####\s*\$?-?[0-9][0-9,]*(?:\.[0-9]+)?[.\s]",
-    r"the answer is\s*\$?-?[0-9][0-9,]*(?:\.[0-9]+)?[.\s]",
+    r"####\s*\$?-?[0-9][0-9,]*(?:\.[0-9]+)?[.\s$]",
+    r"the answer is\s*\$?-?[0-9][0-9,]*(?:\.[0-9]+)?[.\s$]",
 ]
 
 
