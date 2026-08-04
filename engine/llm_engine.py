@@ -32,18 +32,37 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
             self.ack_events.append(ack_event)
+        # Registered BEFORE constructing rank0's own ModelRunner (below), not
+        # after: rank>0 processes are already alive at this point (started
+        # above), and rank0's construction can itself raise (e.g. OOM) or
+        # hang (e.g. waiting on a collective from a rank>0 peer that already
+        # died) before ever completing. Registering only after a successful
+        # construction left self.ps permanently orphaned -- still holding
+        # their GPU memory -- on any rank0-side failure or Ctrl-C during
+        # this window, since exit() never even got registered to run.
+        atexit.register(self.exit)
         self.model_runner = ModelRunner(config, 0, self.events, self.ack_events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config, self.model_runner.state_manager, self.model_runner)
-        atexit.register(self.exit)
 
     def exit(self):
-        if not hasattr(self, "model_runner"):
-            return
-        self.model_runner.call("exit")
-        del self.model_runner
+        # Do NOT bail out early just because rank0's own ModelRunner never
+        # finished constructing (or failed) -- self.ps (rank>0 processes) are
+        # started earlier and independently, and are exactly the processes
+        # most likely to be orphaned, alive, and holding GPU memory in that
+        # scenario. They must still be cleaned up below.
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            model_runner.call("exit")
+            del self.model_runner
         for p in self.ps:
+            # terminate() (SIGTERM) before join(): a rank>0 peer can be stuck
+            # blocked inside a collective (e.g. dist.barrier()/init_process_group)
+            # that will never complete on its own if rank0 died first -- plain
+            # join() alone would hang this cleanup forever in that case.
+            if p.is_alive():
+                p.terminate()
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
