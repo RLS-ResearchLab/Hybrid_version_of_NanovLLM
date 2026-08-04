@@ -12,11 +12,20 @@ engine (tensor_parallel_size=2 -> ep_size=2, decode-EP active) compared
 token-for-token against the dense HF reference implementation's own
 greedy generate(), same checkpoint, same prompts, same temperature=0.
 
-Deliberately small: 3 prompts (same GSM8K test-set indices used by
-gsm8k_decode_contamination_check.py, for continuity), 30 tokens each --
-enough autoregressive steps to see whether decode-EP's math tracks an
-independent implementation, cheap enough to iterate on if it doesn't.
-This is NOT trying to reach "The answer is N." (gsm8k_dry_run.py's
+Deliberately small: 10 prompts (GSM8K test-set indices 0-9; the original
+version of this script used just the first 3, same indices as
+gsm8k_decode_contamination_check.py -- extended once the 3-prompt run
+surfaced an idx=2 divergence at an empty-<think></think> "skip reasoning"
+branch point, which is a sample size of 1 and can't distinguish "noise
+landed on a near-tied fork once" from "the engine has a systematic
+tendency to skip reasoning that HF doesn't." See the THINK-BRANCH RATES
+section of --phase compare's output for that specific question -- it
+matters beyond decode-EP correctness because CoT-skipping directly and
+predictably hurts multi-step arithmetic accuracy, so a real asymmetry
+here would be a systematic accuracy tax, not symmetric numeric noise),
+30 tokens each -- enough autoregressive steps to see whether decode-EP's
+math tracks an independent implementation, cheap enough to iterate on if
+it doesn't. This is NOT trying to reach "The answer is N." (gsm8k_dry_run.py's
 docstring puts that around 100-200 tokens); it's isolating the math, not
 scoring accuracy.
 
@@ -83,7 +92,13 @@ HF_PATH = os.path.join(CACHE_DIR, "hf.json")
 
 MAX_MODEL_LEN = 2048
 MAX_TOKENS = 30
-TARGET_INDICES = [0, 1, 2]  # same GSM8K test-set indices as gsm8k_decode_contamination_check.py
+# Extended from the original [0, 1, 2] (same GSM8K test-set indices as
+# gsm8k_decode_contamination_check.py) to 10 -- one prompt's empty-<think>
+# divergence (idx=2) is a sample size of 1, not enough to tell "engine has a
+# systematic tendency to skip reasoning" apart from "noise landed on a
+# near-tied fork once." 10 is still small but cheap (single-prompt calls,
+# 30 tokens each) and gives an actual rate to compare, not an anecdote.
+TARGET_INDICES = list(range(10))
 
 
 def _load_gsm8k():
@@ -178,6 +193,32 @@ def _first_divergence(a: list[int], b: list[int]):
     return len(a) if len(a) != len(b) else None  # None means fully identical (over the shared length)
 
 
+def _classify_think(text: str) -> str:
+    """Text-based, not token-ID-based (robust to exact tokenization of the
+    <think>/</think> tags, which this script doesn't otherwise need to know).
+
+    - "no_think_tag": <think> never appears in this budget at all.
+    - "still_reasoning": <think> opened but not yet closed within MAX_TOKENS
+      -- the common case for the verbose branch (its own boilerplate hadn't
+      closed by token 30 in the original 3-prompt run either); NOT the same
+      as "empty_think", just unresolved at this budget.
+    - "empty_think": <think> immediately closed with only whitespace inside
+      -- the "skip reasoning" branch idx=2 took.
+    - "closed_with_content": closed within budget but had real content --
+      rare at MAX_TOKENS=30 for genuine CoT, called out separately rather
+      than lumped into either bucket above.
+    """
+    open_tag, close_tag = "<think>", "</think>"
+    i = text.find(open_tag)
+    if i == -1:
+        return "no_think_tag"
+    j = text.find(close_tag, i + len(open_tag))
+    if j == -1:
+        return "still_reasoning"
+    inner = text[i + len(open_tag):j]
+    return "empty_think" if inner.strip() == "" else "closed_with_content"
+
+
 def phase_compare():
     assert os.path.exists(ENGINE_PATH), f"missing {ENGINE_PATH} -- run --phase engine first"
     assert os.path.exists(HF_PATH), f"missing {HF_PATH} -- run --phase hf first"
@@ -193,6 +234,8 @@ def phase_compare():
     print("=" * 78)
 
     all_first_token_match = True
+    engine_branch_counts: dict[str, int] = {}
+    hf_branch_counts: dict[str, int] = {}
     for idx in TARGET_INDICES:
         er = engine_results[str(idx)]
         hr = hf_results[str(idx)]
@@ -200,10 +243,17 @@ def phase_compare():
         engine_toks = er["token_ids"]
         hf_toks = hr["token_ids"]
 
+        engine_branch = _classify_think(er["text"])
+        hf_branch = _classify_think(hr["text"])
+        engine_branch_counts[engine_branch] = engine_branch_counts.get(engine_branch, 0) + 1
+        hf_branch_counts[hf_branch] = hf_branch_counts.get(hf_branch, 0) + 1
+
         print(f"\n  gsm8k idx={idx}  (prompt_ids match: {ids_match})")
         if not ids_match:
             print(f"    WARNING: tokenization mismatch between engine and HF for this prompt -- "
                   f"the comparison below is confounded by that, not a clean signal.")
+        print(f"    think-branch: engine={engine_branch}  hf={hf_branch}"
+              + ("  <-- DIFFERS" if engine_branch != hf_branch else ""))
 
         exact = engine_toks == hf_toks
         first_diff = _first_divergence(engine_toks, hf_toks)
@@ -249,6 +299,34 @@ def phase_compare():
               "disagrees with independent HF ground truth. Since reference_check_phase6.py "
               "already validated prefill logits (cosine>=0.99) on this checkpoint, a first-token "
               "mismatch here points specifically at decode-EP's own math, not prefill.")
+
+    print("\n" + "-" * 78)
+    print(f"THINK-BRANCH RATES (out of {len(TARGET_INDICES)} prompts) -- does the engine take the "
+          f"empty-<think></think> (skip-reasoning) branch at a different rate than independent HF?")
+    print("-" * 78)
+    engine_empty = engine_branch_counts.get("empty_think", 0)
+    hf_empty = hf_branch_counts.get("empty_think", 0)
+    print(f"  engine: {dict(sorted(engine_branch_counts.items()))}")
+    print(f"  hf:     {dict(sorted(hf_branch_counts.items()))}")
+    print(f"  empty_think count -- engine: {engine_empty}/{len(TARGET_INDICES)}   "
+          f"hf: {hf_empty}/{len(TARGET_INDICES)}")
+    gap = abs(engine_empty - hf_empty)
+    if gap <= 1:
+        print(f"  READ: engine and HF take the empty-think branch at essentially the same rate "
+              f"(gap={gap}) -- consistent with the idx=2 divergence being noise landing on a "
+              f"near-tied fork, as originally concluded, not a systematic engine tendency.")
+    else:
+        print(f"  READ: engine and HF diverge by {gap} on this small sample -- worth extending "
+              f"further (more prompts, or a larger think-budget past MAX_TOKENS={MAX_TOKENS} to "
+              f"resolve any 'still_reasoning' cases either way) before concluding this is noise. "
+              f"A CONSISTENT engine-side tilt toward skipping reasoning is the concerning case: "
+              f"CoT-skipping directly and predictably hurts multi-step arithmetic accuracy, so "
+              f"this would be a real, systematic (if small) accuracy tax specific to decode-EP, "
+              f"not symmetric numeric noise -- and would help explain the gsm8k_full_run.py n=32 "
+              f"accuracy softness independent of Bug B's prefix-cache-disable timing cost.")
+        print(f"  NOTE: n={len(TARGET_INDICES)} is still small -- a {gap}-prompt gap is NOT yet "
+              f"strong statistical evidence of a systematic tendency by itself, just a reason to "
+              f"look closer rather than dismiss it.")
 
 
 def main():
