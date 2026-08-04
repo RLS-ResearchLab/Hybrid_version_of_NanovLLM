@@ -4,14 +4,30 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
+# Bounds the cost of _check_stop_string to a fixed-size decode+scan per step,
+# regardless of how long the sequence has grown -- NOT a full
+# redecode-and-rescan of the whole completion every step (that would be
+# O(completion length) per step, O(length^2) over a sequence). 32 tokens is
+# generous headroom for a marker phrase ("the answer is " / "#### ") plus a
+# multi-digit/decimal number plus the trailing delimiter the stop patterns
+# require -- see gsm8k_extract.py's GSM8K_STOP_PATTERNS docstring.
+_STOP_CHECK_WINDOW_TOKENS = 32
+
 
 class Scheduler:
 
-    def __init__(self, config: Config, state_manager=None, model_runner=None):
+    def __init__(self, config: Config, state_manager=None, model_runner=None, tokenizer=None):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
+        # Only needed for stop-string checking (_check_stop_string decodes a
+        # trailing window of completion tokens back to text). Optional, like
+        # state_manager/model_runner below -- callers that never pass `stop`
+        # in a SamplingParams never need it, and _check_stop_string's
+        # `if not seq.stop_patterns: return False` guard means this is never
+        # dereferenced when unused.
+        self.tokenizer = tokenizer
         # disable_prefix_cache=True whenever a StateManager is active -- see
         # BlockManager.__init__'s docstring comment for why KV-cache reuse
         # and always-reset-to-zero recurrent state are incompatible.
@@ -124,6 +140,24 @@ class Scheduler:
 
         self.waiting.appendleft(seq)
 
+    def _check_stop_string(self, seq: Sequence) -> bool:
+        """Regex match against a bounded trailing window of DECODED
+        COMPLETION text -- see _STOP_CHECK_WINDOW_TOKENS above for why this
+        is a fixed-size window, not the full completion. Deliberately scans
+        seq.completion_token_ids (tokens generated AFTER the prompt), never
+        seq.token_ids (which includes the prompt): every GSM8K prompt this
+        engine is actually run against (gsm8k_prompt.py's 8-shot exemplars)
+        contains "The answer is N." literally in the PROMPT text itself --
+        scanning the prompt would false-trigger before generation even
+        starts. Requires seq.stop_patterns to already be compiled (Sequence
+        does this once at construction, not per-call) and self.tokenizer to
+        be set (only true when the caller passed one -- see __init__)."""
+        if not seq.stop_patterns:
+            return False
+        window_ids = seq.completion_token_ids[-_STOP_CHECK_WINDOW_TOKENS:]
+        window_text = self.tokenizer.decode(window_ids)
+        return any(p.search(window_text) for p in seq.stop_patterns)
+
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
@@ -132,7 +166,16 @@ class Scheduler:
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            # Stop-string match is checked identically to EOS/max_tokens --
+            # same single finish path below, not a separate parallel
+            # mechanism. Short-circuits via `or` so _check_stop_string's
+            # tokenizer.decode() call never runs for sequences with no
+            # stop_patterns (the common case) or once EOS has already fired.
+            if (
+                (not seq.ignore_eos and token_id == self.eos)
+                or self._check_stop_string(seq)
+                or seq.num_completion_tokens == seq.max_tokens
+            ):
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 if self.state_manager is not None:

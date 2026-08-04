@@ -1,3 +1,4 @@
+import re
 from copy import copy
 from enum import Enum, auto
 from itertools import count
@@ -30,6 +31,18 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # Precompiled once here, not re-compiled every decode step in
+        # Scheduler._check_stop_string -- that runs once per active sequence
+        # per decode step (up to max_tokens times), so avoiding repeated
+        # re.compile() calls in that loop actually matters. Not part of
+        # __getstate__/__setstate__ below, same as max_tokens/ignore_eos:
+        # stop-string checking (like EOS/max_tokens checking) only ever runs
+        # in Scheduler.postprocess() on the rank0/LLMEngine process, never on
+        # a tensor-parallel rank>0 process reconstructed from pickled state.
+        self.stop_patterns = (
+            [re.compile(p, re.IGNORECASE) for p in sampling_params.stop]
+            if sampling_params.stop else None
+        )
 
     def __len__(self):
         return self.num_tokens
