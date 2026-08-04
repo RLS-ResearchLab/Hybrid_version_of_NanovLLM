@@ -274,10 +274,20 @@ def phase_compare():
         ctx_lo = max(0, first_diff - 5)
         print(f"    engine tokens around divergence: {engine_toks[ctx_lo:first_diff + 5]}")
         print(f"    hf     tokens around divergence: {hf_toks[ctx_lo:first_diff + 5]}")
-        if first_diff <= 5:
-            print(f"    ASSESSMENT: divergence in the first few tokens against an INDEPENDENT "
-                  f"implementation -- looks like a real decode-EP correctness bug. Investigate "
-                  f"before trusting decode-EP's output.")
+        if first_diff == 0:
+            print(f"    ASSESSMENT: divergence at position 0 -- this is the FIRST generated "
+                  f"token, sampled directly from PREFILL logits (see [PREFILL-SAMPLE DEBUG] for "
+                  f"this seq_id in the --phase engine log), before decode-EP's own forward path "
+                  f"(Qwen35MoE._forward_gathered_ep) ever runs. Implicates PREFILL numerics on "
+                  f"this ~750-800 token GSM8K-formatted prompt specifically, NOT decode-EP -- "
+                  f"reference_check_phase6.py's cosine>=0.99 result never tested a prompt this "
+                  f"long/this shape, only 5-11 token prompts. Worth a direct prefill-logits "
+                  f"cosine measurement on this prompt before concluding either way.")
+        elif first_diff <= 5:
+            print(f"    ASSESSMENT: divergence in the first few DECODE steps (position {first_diff} "
+                  f">= 1, so at least one step has already gone through decode-EP's own forward "
+                  f"path) against an INDEPENDENT implementation -- looks like a real decode-EP "
+                  f"correctness bug. Investigate before trusting decode-EP's output.")
         else:
             print(f"    ASSESSMENT: divergence after {first_diff} tokens of exact agreement -- "
                   f"consistent with expected cross-implementation numeric noise (see this "
@@ -296,9 +306,16 @@ def phase_compare():
               "per-prompt ASSESSMENT lines above.")
     else:
         print("VERDICT: FAIL on the stated bar -- at least one prompt's first decode token "
-              "disagrees with independent HF ground truth. Since reference_check_phase6.py "
-              "already validated prefill logits (cosine>=0.99) on this checkpoint, a first-token "
-              "mismatch here points specifically at decode-EP's own math, not prefill.")
+              "disagrees with independent HF ground truth. CORRECTION vs. this script's original "
+              "reasoning: the first generated token is sampled directly from PREFILL logits (see "
+              "the [PREFILL-SAMPLE DEBUG] line for that seq_id in the --phase engine log) -- "
+              "before Qwen35MoE._forward_gathered_ep (decode-EP) ever runs -- so this implicates "
+              "PREFILL numerics specifically, NOT decode-EP. It also doesn't contradict "
+              "reference_check_phase6.py's cosine>=0.99 result: that script only tested 5 short "
+              "(5-11 token) prompts, never a realistic ~750-800 token GSM8K-formatted prompt like "
+              "the ones here. A first-token mismatch on THIS prompt shape is new evidence worth "
+              "following up with an actual prefill logits cosine-similarity measurement on the "
+              "specific failing prompt(s), not assumed to be the same already-validated case.")
 
     print("\n" + "-" * 78)
     print(f"THINK-BRANCH RATES (out of {len(TARGET_INDICES)} prompts) -- does the engine take the "
