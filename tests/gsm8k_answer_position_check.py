@@ -22,8 +22,20 @@ distribution (mean/median/p90/p95/max) -- pick max_tokens from the tail of
 this distribution plus margin, not the mean, so rare slow-to-answer
 examples don't get truncated.
 
+--stop-strings (default ON): passes gsm8k_extract.py's GSM8K_STOP_PATTERNS
+as SamplingParams.stop, so generation now stops itself right after the
+answer marker instead of rambling to max_tokens=512 regardless. Verification
+against the no-stop-string baseline (this script's own prior output, before
+this flag existed) is by eye: per-example lines below now print completion_len
+AND the extracted value/method, in the same format as before, so the two runs'
+output can be diffed line-for-line -- completion_len should drop sharply for
+examples that found a marker, and (method, value) must be IDENTICAL to the
+baseline for every example that found a marker there. Pass --no-stop-strings
+to reproduce the old always-run-to-512 behavior.
+
 Usage:
     python tests/gsm8k_answer_position_check.py [--num-examples N]
+    python tests/gsm8k_answer_position_check.py --no-stop-strings   # old baseline behavior
 """
 import argparse
 import os
@@ -44,7 +56,7 @@ if _WS_NAME != "nanovllm" and "nanovllm" not in sys.modules:
 
 sys.path.insert(0, os.path.dirname(__file__))
 from gsm8k_prompt import build_prompt  # noqa: E402
-from gsm8k_extract import extract_answer_detailed  # noqa: E402
+from gsm8k_extract import extract_answer_detailed, GSM8K_STOP_PATTERNS  # noqa: E402
 
 CKPT_DIR = os.path.join(ROOT, "qwen35_checkpoint")
 MAX_MODEL_LEN = 2048
@@ -65,6 +77,12 @@ def _percentile(values: list[float], p: float) -> float:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--num-examples", type=int, default=24)
+    parser.add_argument(
+        "--stop-strings", action=argparse.BooleanOptionalAction, default=True,
+        help="Default True -- generation stops itself right after the answer marker "
+             "(gsm8k_extract.py's GSM8K_STOP_PATTERNS) instead of always running to "
+             "max_tokens. --no-stop-strings reproduces the old baseline behavior.",
+    )
     args = parser.parse_args()
     num_examples = args.num_examples
 
@@ -87,7 +105,11 @@ def main():
         max_num_seqs=BATCH_SIZE,
         max_model_len=MAX_MODEL_LEN,
     )
-    sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
+    sp = SamplingParams(
+        temperature=0, max_tokens=MAX_TOKENS,
+        stop=GSM8K_STOP_PATTERNS if args.stop_strings else None,
+    )
+    print(f"stop-strings: {'ON (' + str(len(GSM8K_STOP_PATTERNS)) + ' patterns)' if args.stop_strings else 'OFF (baseline behavior)'}")
 
     answer_token_positions = []  # tokens needed to reach the marker, per example (only where found)
     completion_lengths = []
@@ -110,7 +132,7 @@ def main():
                 # position, and this example wouldn't be safe to truncate
                 # against anyway.
                 n_no_marker += 1
-                print(f"  idx={i}: NO MARKER FOUND (method={result.method}) -- "
+                print(f"  idx={i}: NO MARKER FOUND (method={result.method}, value={result.value}) -- "
                       f"completion_len={len(token_ids)} tokens")
                 print(f"    last 400 chars: {text[-400:]!r}")
                 continue
@@ -121,7 +143,7 @@ def main():
             n_tokens_to_answer = len(prefix_token_ids)
             answer_token_positions.append(n_tokens_to_answer)
             print(f"  idx={i}: answer marker at token ~{n_tokens_to_answer} "
-                  f"(method={result.method}, completion_len={len(token_ids)} tokens)")
+                  f"(method={result.method}, value={result.value}, completion_len={len(token_ids)} tokens)")
 
     print("\n" + "=" * 78)
     print("SUMMARY")

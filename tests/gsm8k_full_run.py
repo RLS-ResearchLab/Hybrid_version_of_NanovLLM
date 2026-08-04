@@ -71,7 +71,7 @@ if _WS_NAME != "nanovllm" and "nanovllm" not in sys.modules:
 
 sys.path.insert(0, os.path.dirname(__file__))
 from gsm8k_prompt import build_prompt  # noqa: E402
-from gsm8k_extract import extract_answer_detailed  # noqa: E402
+from gsm8k_extract import extract_answer_detailed, GSM8K_STOP_PATTERNS  # noqa: E402
 
 CKPT_DIR = os.path.join(ROOT, "qwen35_checkpoint")
 CACHE_DIR = os.path.join(ROOT, "tests", "_gsm8k_cache")
@@ -141,6 +141,16 @@ def main():
         help="Evaluate a fixed-seed random subsample of this many examples instead of the "
              "full 1319 -- see module docstring for the statistical-precision trade-off.",
     )
+    parser.add_argument(
+        "--stop-strings", action=argparse.BooleanOptionalAction, default=False,
+        help="Default False (the ALREADY-scored runs' behavior, kept as-is) -- pass "
+             "--stop-strings to stop generation right after the answer marker "
+             "(gsm8k_extract.py's GSM8K_STOP_PATTERNS) instead of always running to "
+             "max_tokens. Defaults False, not True, specifically because this is new and "
+             "unvalidated here -- verify with gsm8k_answer_position_check.py --stop-strings "
+             "first (extracted value/method must be IDENTICAL to the no-stop-string baseline "
+             "for every example that found a marker) before trusting it in a real scored run.",
+    )
     args = parser.parse_args()
 
     results_path = _results_path(args.num_examples)
@@ -177,6 +187,12 @@ def main():
             f"batch_size={args.batch_size}, max_tokens={args.max_tokens} -- make sure these were "
             f"validated with gsm8k_decode_contamination_check.py before trusting this run's score."
         )
+    if args.stop_strings:
+        print(
+            "STOP-STRINGS ENABLED -- make sure gsm8k_answer_position_check.py --stop-strings "
+            "already confirmed extracted value/method match the no-stop-string baseline exactly "
+            "before trusting this run's score, per this flag's own --help text."
+        )
 
     print(f"Loading engine from {CKPT_DIR} (tensor_parallel_size=2) ...")
     llm = LLM(
@@ -187,7 +203,10 @@ def main():
         max_num_seqs=args.batch_size,
         max_model_len=MAX_MODEL_LEN,
     )
-    sp = SamplingParams(temperature=0, max_tokens=args.max_tokens)
+    sp = SamplingParams(
+        temperature=0, max_tokens=args.max_tokens,
+        stop=GSM8K_STOP_PATTERNS if args.stop_strings else None,
+    )
 
     n_batches = (len(remaining_indices) + args.batch_size - 1) // args.batch_size
     t_run_start = perf_counter()
