@@ -156,7 +156,19 @@ class Scheduler:
             return False
         window_ids = seq.completion_token_ids[-_STOP_CHECK_WINDOW_TOKENS:]
         window_text = self.tokenizer.decode(window_ids)
-        return any(p.search(window_text) for p in seq.stop_patterns)
+        for p in seq.stop_patterns:
+            m = p.search(window_text)
+            if m:
+                # Diagnostic for exactly the "stopped later than expected"
+                # question -- shows what ACTUALLY matched, not what we
+                # assumed would. Cheap: only runs once, at the single step a
+                # match fires, not every step.
+                print(f"[STOP-STRING DEBUG] seq_id={seq.seq_id} stopped at "
+                      f"completion_token={seq.num_completion_tokens} "
+                      f"matched_pattern={p.pattern!r} matched_text={m.group(0)!r} "
+                      f"full_window={window_text!r}")
+                return True
+        return False
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
