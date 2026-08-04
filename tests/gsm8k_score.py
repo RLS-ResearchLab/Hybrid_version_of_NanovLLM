@@ -101,6 +101,18 @@ def main():
     print(f"  Fallback used (last-number, no '####'/'the answer is' marker found): {n_fallback}/{n}")
     print(f"  Extraction failure (no number found at all -- always counted WRONG): {n_extract_failed}/{n}")
     print()
+    print("Accuracy BROKEN OUT BY extraction method -- tells you whether a low score is driven by")
+    print("bad reasoning (low accuracy even where a marker WAS found) or by the marker never")
+    print("appearing at all (high fallback rate, regardless of whether the underlying reasoning was right):")
+    for method in ["hash", "answer_is", "fallback_last_number", "failed"]:
+        method_records = [r for r in records if r["extraction_method"] == method]
+        if not method_records:
+            continue
+        method_correct = sum(1 for r in method_records if r["correct"])
+        method_pct = 100 * method_correct / len(method_records)
+        print(f"  {method:<22} n={len(method_records):>4}  correct={method_correct:>4}  "
+              f"accuracy={method_pct:.1f}%")
+    print()
     print("NOTE: extraction-failure cases are counted as WRONG in the denominator above,")
     print("      not excluded -- excluding them would inflate the score by ignoring genuine failures.")
     print()
