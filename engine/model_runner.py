@@ -120,6 +120,19 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
+                # A pre-existing "nanovllm" segment at this point can only be
+                # a stale leftover from a previous run that crashed/was killed
+                # before exit() could unlink() it (this engine only ever runs
+                # one instance under this fixed name at a time) -- never a
+                # live peer of THIS process group, which is still mid-startup.
+                # Clear it proactively so a crashed prior run doesn't force a
+                # full reload+warmup just to fail again at this exact line.
+                try:
+                    stale = SharedMemory(name="nanovllm")
+                    stale.close()
+                    stale.unlink()
+                except FileNotFoundError:
+                    pass
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
             else:
