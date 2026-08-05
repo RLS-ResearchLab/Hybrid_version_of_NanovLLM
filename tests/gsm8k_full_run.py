@@ -81,10 +81,25 @@ EXPECTED_TOTAL = 1319
 SUBSAMPLE_SEED = 42  # fixed so a given --num-examples always selects the same subset
 
 
-def _results_path(num_examples) -> str:
-    if num_examples is None:
-        return os.path.join(CACHE_DIR, "full_results.jsonl")
-    return os.path.join(CACHE_DIR, f"full_results_n{num_examples}.jsonl")
+def _results_path(num_examples, enforce_eager: bool, batch_size: int, max_tokens: int, stop_strings: bool) -> str:
+    # Keyed by every setting that affects what generate() actually produces,
+    # not just num_examples -- otherwise resuming with a DIFFERENT
+    # max_tokens/stop_strings/etc. against the same --num-examples value
+    # would see the old settings' completed indices already present and
+    # silently do nothing, instead of generating fresh results under the
+    # new settings. Only non-default settings get appended, so the common
+    # (all-default) case keeps the original, unsuffixed filenames.
+    base = "full_results" if num_examples is None else f"full_results_n{num_examples}"
+    suffix = ""
+    if not enforce_eager:
+        suffix += "_graph"
+    if batch_size != 8:
+        suffix += f"_bs{batch_size}"
+    if max_tokens != 512:
+        suffix += f"_mt{max_tokens}"
+    if stop_strings:
+        suffix += "_stop"
+    return os.path.join(CACHE_DIR, f"{base}{suffix}.jsonl")
 
 
 def _select_indices(total: int, num_examples) -> list[int]:
@@ -153,7 +168,9 @@ def main():
     )
     args = parser.parse_args()
 
-    results_path = _results_path(args.num_examples)
+    results_path = _results_path(
+        args.num_examples, args.enforce_eager, args.batch_size, args.max_tokens, args.stop_strings
+    )
     os.makedirs(CACHE_DIR, exist_ok=True)
 
     from datasets import load_dataset
