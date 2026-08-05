@@ -30,6 +30,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +38,22 @@ sys.path.insert(0, os.path.dirname(__file__))
 from gsm8k_extract import extract_answer_detailed  # noqa: E402 -- the FIXED version
 
 DEFAULT_RESULTS_PATH = os.path.join(ROOT, "tests", "_gsm8k_cache", "full_results.jsonl")
+
+_ANSWER_IS_PHRASE = re.compile(r"the answer is", re.IGNORECASE)
+
+
+def _every_occurrence_context(text: str, radius: int = 60) -> list[str]:
+    """Every "the answer is" occurrence in the text with surrounding
+    context, not just the one/two the extractor happened to pick -- for
+    diagnosing WHY a match was accepted/rejected, not just what value came
+    out. Only called for the small number of flipped examples, not the
+    whole dataset, so the extra scan cost is negligible."""
+    out = []
+    for m in _ANSWER_IS_PHRASE.finditer(text):
+        lo = max(0, m.start() - 10)
+        hi = min(len(text), m.end() + radius)
+        out.append(text[lo:hi].replace("\n", "\\n"))
+    return out
 
 
 def load_records(path: str) -> list[dict]:
@@ -102,6 +119,7 @@ def main():
                 "idx": r["idx"], "gold": gold,
                 "old_value": r["extracted_answer"], "old_method": r["extraction_method"],
                 "new_value": new_result.value, "new_method": new_result.method,
+                "model_output": r["model_output"],
             }
             (flips_to_correct if new_correct else flips_to_wrong).append(entry)
 
@@ -123,6 +141,12 @@ def main():
     for e in flips_to_wrong:
         print(f"  idx={e['idx']}: gold={e['gold']}  old={e['old_value']} ({e['old_method']}) -> "
               f"new={e['new_value']} ({e['new_method']})")
+        # This direction is the concerning one -- the fix REJECTED a match
+        # that used to be correct. Show every "the answer is" occurrence in
+        # the text so it's visible exactly which one was the genuine answer
+        # and why the new pattern didn't accept it there.
+        for i, ctx in enumerate(_every_occurrence_context(e["model_output"])):
+            print(f"      occurrence {i}: ...{ctx}...")
     print()
     print(f"New fallback_last_number count: {new_n_fallback}/{n}  "
           f"(informational -- these were never trusted as answer_is either way)")

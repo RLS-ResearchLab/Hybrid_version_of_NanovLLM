@@ -1,13 +1,14 @@
 {
-  "add_prefix_space": null,
+  "add_prefix_space": false,
   "backend": "tokenizers",
-  "bos_token": null,
+  "bos_token": "<|endoftext|>",
   "eos_token": "<|endoftext|>",
-  "is_local": true,
+  "errors": "replace",
+  "is_local": false,
   "local_files_only": false,
-  "merges_file": null,
-  "model_max_length": 1000000000000000019884624838656,
-  "pad_token": "<|endoftext|>",
-  "tokenizer_class": "Qwen3_5Tokenizer",
-  "unk_token": "<|endoftext|>"
+  "model_max_length": 1024,
+  "pad_token": null,
+  "tokenizer_class": "GPT2Tokenizer",
+  "unk_token": "<|endoftext|>",
+  "chat_template": "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}{% if add_generation_prompt %}assistant: {% endif %}"
 }
