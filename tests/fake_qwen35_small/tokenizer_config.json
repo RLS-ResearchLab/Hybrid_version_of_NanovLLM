@@ -1,0 +1,13 @@
+{
+  "add_prefix_space": null,
+  "backend": "tokenizers",
+  "bos_token": null,
+  "eos_token": "<|endoftext|>",
+  "is_local": true,
+  "local_files_only": false,
+  "merges_file": null,
+  "model_max_length": 1000000000000000019884624838656,
+  "pad_token": "<|endoftext|>",
+  "tokenizer_class": "Qwen3_5Tokenizer",
+  "unk_token": "<|endoftext|>"
+}
