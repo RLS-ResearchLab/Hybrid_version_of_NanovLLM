@@ -18,83 +18,80 @@ Both markers use re.search (leftmost/FIRST match), not the last one. This
 matters when max_tokens lets the model ramble past its answer into a
 hallucinated continuation. The intended answer to the ACTUAL question is
 always the first "#### N" / "The answer is N" the model writes; anything
-after that is a hallucinated continuation we must not accidentally prefer
--- BUT ONLY once that first occurrence is confirmed to actually be a
-terminal statement, not an intermediate mention (see _ANSWER_IS_PATTERN's
-trailing-delimiter requirement below).
+after that is a hallucinated continuation we must not accidentally prefer.
 
-HISTORY WORTH KEEPING VISIBLE, because the wrong fix here silently costs
-real accuracy: this trailing-delimiter requirement was added after
-gsm8k_decode_vs_hf_check.py's/gsm8k_answer_position_check.py's
---stop-strings verification surfaced one completion with an intermediate
-"...is 60..." aside AND a genuine final "The answer is $70,000."; the old
-leftmost-match rule with NO delimiter requirement silently extracted the
-wrong (intermediate) value. The FIRST fix tried here excluded plain
-whitespace from the delimiter set (keeping only '.'/newline/'$'/end-of-
-string), reasoning that all 16 genuine answers in a 24-example sample ended
-in "N." directly. That was wrong at scale: re-scoring the real invalidated
-1319-example run with that version flipped 18 examples from correct to
-WRONG and recovered zero, a measured -1.36 point regression -- because
-"The answer is 60 dollars."/"...8 hours." (a genuine final answer with a
-plain trailing unit word before the period) is common, and excluding bare
-whitespace rejected all of those too, same as the intermediate mentions it
-was meant to catch. The delimiter set below is back to including
-whitespace (matching GSM8K_STOP_PATTERNS exactly) -- '%' is still excluded
-(not a delimiter char at all), which is what actually rejects "...is 60% of
-the total...", the specific case that motivated this fix in the first
-place. "...is 60 minutes, but wait..." is NOT reliably rejected by this
-(bare whitespace before a continuing word still matches) -- a real,
-accepted, narrower gap; distinguishing that case would need something
-smarter than a trailing-delimiter char class, and isn't worth reintroducing
-the whitespace-exclusion regression to chase.
+HISTORY WORTH KEEPING VISIBLE, because two different "fixes" here each
+silently cost real accuracy before being caught: a --stop-strings
+verification run surfaced one completion where extraction's leftmost match
+(value 60) didn't match the value gsm8k_decode_vs_hf_check.py's stop
+mechanism confirmed as the completion's actual ending ($70,000), which
+looked like a real leftmost-match bug. Two successive attempts added a
+required trailing delimiter after the number to _ANSWER_IS_PATTERN, first
+excluding bare whitespace, then (after that regressed) excluding just '%'.
+BOTH were re-scored against the real invalidated 1319-example run's stored
+model_output text (zero GPU cost -- see gsm8k_rescore_fixed_extractor.py)
+and BOTH produced the exact same result: 18 examples flipped from correct
+to WRONG, 0 recovered, a measured -1.36 point regression each time. Pulling
+full per-occurrence context for those 18 (not just the two matched values)
+showed why: GSM8K genuinely has percentage-valued answers, the model
+correctly states them as "The answer is 60%.", and EVERY ONE of the 18 was
+this exact shape -- a correct "N%." answer being rejected (since '%' isn't
+a delimiter), falling through to a hallucinated self-invented follow-up
+Q&A pair the model appends after correctly answering the real question
+(its own new "Q: ..." completely unrelated to the prompt, complete with
+its own internally-coherent worked arithmetic and its own "The answer is
+N." conclusion). That last part matters beyond just explaining these 18:
+it means the ORIGINAL single-anecdote case that started this whole
+investigation was never actually confirmed by reading its real text --
+only inferred from a plausible-sounding narrative -- and given how
+convincingly this model hallucinates a FULLY coherent second question
+(not just a stray fragment), that original case may well have been the
+same shape, with the old leftmost-match extractor having been correct all
+along. Two measured regressions and zero measured recoveries is not
+"delimiter needs tuning" -- it's evidence the premise was wrong.
+_ANSWER_IS_PATTERN below is reverted to its original, delimiter-free form.
+Don't re-add a trailing-delimiter requirement here without first reading
+the actual raw text of a specific real failure -- guessing from a
+plausible story has now cost two rounds of regressions on the real
+dataset.
 """
 import re
 from typing import NamedTuple, Optional
 
 _HASH_PATTERN = re.compile(r"####\s*\$?(-?[0-9][0-9,]*(?:\.[0-9]+)?)")
-# Trailing-delimiter requirement: a number immediately followed by '%' or
-# similar (not in [.\s$], not end-of-string) means this "the answer is N" is
-# an intermediate mention (e.g. "...is 60% of the total...") embedded in
-# ongoing reasoning, not the real final answer -- see the module docstring
-# for the measured-regression history of why this is [.\s$], matching
-# GSM8K_STOP_PATTERNS exactly, and not a narrower set. End-of-string is
-# additionally allowed here (`(?:...|$)` -- the alternation's trailing `$`
-# is the regex end-of-input anchor, not the literal dollar-sign character in
-# the char class) because extraction runs on a COMPLETE, already-generated
-# text: if the number is the literal last thing in the text (e.g. truncated
-# right there), there's no more text that could turn it into a false match
-# -- unlike GSM8K_STOP_PATTERNS, checked mid-generation, where "nothing here
-# yet" must NOT be treated as "confirmed no continuation" (more tokens are
-# still coming).
-_ANSWER_IS_PATTERN = re.compile(
-    r"the answer is\s*\$?(-?[0-9][0-9,]*(?:\.[0-9]+)?)(?:[.\s$]|$)", re.IGNORECASE
-)
+_ANSWER_IS_PATTERN = re.compile(r"the answer is\s*\$?(-?[0-9][0-9,]*(?:\.[0-9]+)?)", re.IGNORECASE)
 _ANY_NUMBER_PATTERN = re.compile(r"-?[0-9][0-9,]*(?:\.[0-9]+)?")
 
 # For SamplingParams.stop (engine/scheduler.py's _check_stop_string) --
-# deliberately kept in sync with _HASH_PATTERN/_ANSWER_IS_PATTERN above
-# (same marker + number shape + trailing-delimiter requirement, same
-# [.\s$] delimiter set) so "the engine stops generating" and "the
-# extractor would have found a real hash/answer_is match, not just
-# fallback_last_number" are the same condition. Trailing delimiter is
-# REQUIRED for a different reason here than in _ANSWER_IS_PATTERN: without
-# it, a partially-generated multi-digit number (e.g. just "1" of "18", if
-# the tokenizer splits it across steps) would already satisfy `\d[\d,]*`
+# UNCHANGED and NOT reverted: this one was validated independently, with
+# real generation data (gsm8k_answer_position_check.py --stop-strings,
+# n=24 on the live GPU checkpoint), and every one of 15/16 marker-found
+# completions stopped exactly 1 token after its own genuine answer marker,
+# with matched_text confirmed by direct engine-side debug output -- not
+# inferred from a narrative the way the reverted _ANSWER_IS_PATTERN
+# experiment above was. Trailing delimiter is required here for a
+# completely different, load-bearing reason: without it, a
+# partially-generated multi-digit number (e.g. just "1" of "18", if the
+# tokenizer splits it across decode steps) would already satisfy `\d[\d,]*`
 # and fire a token early, truncating the answer mid-digit. Requiring a
 # character AFTER the number means the pattern can't match until the
 # tokenizer has already emitted something past the last digit -- which
-# structurally can't happen until the number is actually finished. No
-# separate "wait one more token and re-check" state machine needed; the
-# regex's own shape enforces it. '$' is included in the delimiter set
-# because this checkpoint frequently writes math in LaTeX inline mode
-# ("the answer is $60$." -- closing '$' right after the number).
+# structurally can't happen until the number is actually finished. '$' is
+# included in the delimiter set because this checkpoint frequently writes
+# math in LaTeX inline mode ("the answer is $60$." -- closing '$' right
+# after the number).
 #
-# Same "...is 60 minutes..." gap as _ANSWER_IS_PATTERN above, NOT proven
-# safe here either (no case like that appeared in the n=24 verification
-# run) -- a mid-reasoning "...is 60 minutes..." aside could in principle
-# trigger a premature stop. Left as-is pending real evidence one way or
-# the other, same reasoning as the docstring above: don't narrow this
-# again on a hypothesis alone after the last one cost -1.36 points.
+# KNOWN, still-open gap (same root cause as the now-reverted extraction
+# regression above, not yet independently confirmed to matter here): a
+# genuine percentage answer ("the answer is 60%.") won't satisfy this
+# pattern either ('%' isn't a delimiter), so generation won't stop right
+# there -- it'll keep going until a LATER match (e.g. a hallucinated
+# follow-up's own "the answer is N.") or max_tokens. This is an EFFICIENCY
+# gap only, not a correctness one: whatever text ends up captured,
+# _ANSWER_IS_PATTERN's leftmost-match (now delimiter-free again) will still
+# correctly find the real "N%." answer regardless of how much extra text
+# follows it. Not fixed here since it costs decode time, not accuracy --
+# revisit only with real evidence of how much it actually costs.
 GSM8K_STOP_PATTERNS = [
     r"####\s*\$?-?[0-9][0-9,]*(?:\.[0-9]+)?[.\s$]",
     r"the answer is\s*\$?-?[0-9][0-9,]*(?:\.[0-9]+)?[.\s$]",
