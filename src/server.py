@@ -282,8 +282,18 @@ def main():
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384,
                         dest="max_num_batched_tokens")
     parser.add_argument("--enforce-eager", dest="enforce_eager",
-                        action="store_true", default=False,
-                        help="Eager decode, no CUDA graph capture.")
+                        action="store_true", default=True,
+                        help="Default. Eager decode, no CUDA graph capture. Matters "
+                             "beyond just CUDA graphs: engine/model_runner.py only sets "
+                             "torch._dynamo.config.disable = enforce_eager, which is what "
+                             "actually keeps the several @torch.compile decorators in "
+                             "layers/ (layernorm.py, sampler.py, ...) from tracing at all "
+                             "-- leaving this False re-enables torch.compile/inductor, a "
+                             "less-tested path this project's own bench_throughput.py "
+                             "avoids by defaulting to eager too.")
+    parser.add_argument("--cuda-graphs", dest="enforce_eager", action="store_false",
+                        help="Use CUDA-graph decode instead of eager mode (validated in "
+                             "Phase 4, see README.md -- opt in explicitly).")
     parser.add_argument("--fake-config-loader", dest="fake_config_loader",
                         action="store_true", default=False,
                         help="Bypass transformers' real AutoConfig and read config.json "
