@@ -78,6 +78,7 @@ engine to wire it to.
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 import threading
@@ -86,6 +87,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -108,6 +110,54 @@ if os.path.basename(ROOT) != "nanovllm":
 
 from nanovllm.llm import LLM
 from nanovllm.sampling_params import SamplingParams
+
+# ── Fake-config-loader shim (small fixture smoke-testing only) ────────────────
+#
+# tests/make_fake_hf_config.py writes a FLAT config.json (every field --
+# hidden_size, num_hidden_layers, layer_types, etc. -- at the top level).
+# That fixture was written back when model_type "qwen3_5_moe" wasn't
+# registered with transformers' AutoConfig at all (see bench_throughput.py's
+# module docstring / comments), so `_fake_from_pretrained` below (same
+# shim bench_throughput.py and the tests/ scripts already use) was needed
+# just to load it.
+#
+# That assumption is now stale: this environment's transformers ships a
+# real, registered `Qwen3_5MoeConfig`, which nests text-model fields under
+# `text_config` and derives `layer_types` from Qwen3_5MoeTextConfig()'s own
+# DEFAULT num_hidden_layers (40) whenever the source JSON has no
+# `text_config` key -- exactly the fake fixture's flat shape. The result:
+# real `AutoConfig.from_pretrained` silently loads without error, but
+# `hf_config.layer_types` ends up a 40-entry list while `num_hidden_layers`
+# stays 8 (nanovllm/config.py's flatten step only fills top-level attrs
+# that are None, and the flat JSON's top-level `num_hidden_layers=8` is
+# already non-None) -- tripping `_get_layer_types`'s
+# `assert len(layers_block_type) == num_layers` in models/qwen3_5.py.
+# Confirmed by direct repro against `nanovllm.config.Config` alone (no
+# CUDA needed): https://github.com -- N/A, reproduced locally in this repo.
+#
+# This is a config-fixture/transformers-version mismatch, not a server.py
+# bug, and not expected to affect a real checkpoint's own (properly
+# nested) config.json. `--fake-config-loader` (opt-in, default off) routes
+# around it the same way bench_throughput.py does: bypass real AutoConfig
+# entirely and read config.json into a plain attribute-accessible dict.
+_DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+
+class _AttrDict(dict):
+    def __getattr__(self, k):
+        try:
+            return self[k]
+        except KeyError:
+            raise AttributeError(k)
+
+    def __setattr__(self, k, v):
+        self[k] = v
+
+def _fake_from_pretrained(path, *args, **kwargs):
+    with open(os.path.join(path, "config.json")) as f:
+        d = json.load(f)
+    d = _AttrDict(d)
+    d.dtype = _DTYPE_MAP[d.pop("torch_dtype")]
+    return d
 
 # ── Request / response schemas (copied verbatim from the basic engine) ────────
 
@@ -234,7 +284,19 @@ def main():
     parser.add_argument("--enforce-eager", dest="enforce_eager",
                         action="store_true", default=False,
                         help="Eager decode, no CUDA graph capture.")
+    parser.add_argument("--fake-config-loader", dest="fake_config_loader",
+                        action="store_true", default=False,
+                        help="Bypass transformers' real AutoConfig and read config.json "
+                             "directly instead. Only for tests/fake_qwen35_small-style "
+                             "fixtures with a flat (non-nested) config.json -- see the "
+                             "shim's docstring above for why real AutoConfig now "
+                             "mis-derives layer_types for that fixture shape. Do not use "
+                             "this against a real checkpoint's own config.json.")
     args = parser.parse_args()
+
+    if args.fake_config_loader:
+        import nanovllm.config as config_mod
+        config_mod.AutoConfig.from_pretrained = staticmethod(_fake_from_pretrained)
 
     print(f"Building nanovllm engine for model={args.model} "
           f"(tensor_parallel_size={args.tensor_parallel_size})...")
