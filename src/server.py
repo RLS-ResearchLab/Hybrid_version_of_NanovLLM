@@ -302,6 +302,19 @@ def main():
                              "shim's docstring above for why real AutoConfig now "
                              "mis-derives layer_types for that fixture shape. Do not use "
                              "this against a real checkpoint's own config.json.")
+    parser.add_argument("--max-num-seqs", type=int, default=4, dest="max_num_seqs",
+                        help="Default 4, NOT nanovllm's library default of 512. "
+                             "StateManager (engine/state_manager.py) pre-allocates a "
+                             "fixed-size recurrent-state slot pool sized at max_num_seqs "
+                             "-- memory scales linearly with it regardless of actual "
+                             "load. This server's Engine._gen_lock (see its docstring) "
+                             "means at most ONE sequence is ever in flight at a time, so "
+                             "512 slots wastes GBs of VRAM for headroom this server never "
+                             "uses (confirmed: 512 needed 15GB here, on a checkpoint whose "
+                             "weights already consumed most of a 48GB A6000 under TP=2, "
+                             "and OOM'd by ~180MB). A small default is deliberate, not a "
+                             "placeholder -- raise it only if the lock is ever relaxed to "
+                             "allow real concurrent in-flight sequences.")
     args = parser.parse_args()
 
     if args.fake_config_loader:
@@ -316,6 +329,7 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=args.max_num_seqs,
         enforce_eager=args.enforce_eager,
     )
 
