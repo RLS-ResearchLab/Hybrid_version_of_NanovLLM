@@ -232,9 +232,16 @@ def instrument(engine: LLMEngine):
 
 
 def build_engine():
+    # 0.3 was too tight on at least one real machine (num_kvcache_blocks
+    # computed to <=0 -- allocate_kv_cache()'s budget is
+    # total*gpu_memory_utilization - used - peak + current, and `used`/`total`
+    # come from torch.cuda.mem_get_info() for the WHOLE device, not just this
+    # process, so headroom depends on whatever else is resident on the GPU
+    # at the time). 0.9 matches what the real-checkpoint eval scripts
+    # (gsm8k_*.py) already use safely; this model is tiny either way.
     return LLMEngine(
         FAKE_DIR, max_num_batched_tokens=128, max_num_seqs=2, max_model_len=512,
-        gpu_memory_utilization=0.3, tensor_parallel_size=1, enforce_eager=True,
+        gpu_memory_utilization=0.9, tensor_parallel_size=1, enforce_eager=True,
     )
 
 
