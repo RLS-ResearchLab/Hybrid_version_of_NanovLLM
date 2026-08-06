@@ -75,8 +75,19 @@ class Scheduler:
         scheduled_seqs = []
         num_batched_tokens = 0
 
-        # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+        # prefill -- len(self.running) must be counted too, not just this
+        # call's own scheduled_seqs: self.running can already be holding
+        # max_num_seqs sequences from a PREVIOUS schedule() call, and
+        # without this term the loop below only limits how many NEW
+        # sequences THIS call admits, happily over-admitting past
+        # max_num_seqs total once self.waiting is non-empty. Harmless
+        # (just an oversized forward-pass batch) when state_manager is
+        # None, but fatal for the hybrid model: StateManager's slot pool
+        # is sized to exactly max_num_seqs on the assumption that this is
+        # a hard cap on concurrently-running sequences (see its docstring),
+        # and over-admitting empties free_slot_ids before allocate() can
+        # pop from it -- IndexError, not silently wrong output.
+        while self.waiting and len(self.running) + len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
