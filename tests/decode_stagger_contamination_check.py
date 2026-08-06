@@ -87,6 +87,8 @@ Runtime: single process, tiny model (8 layers, hidden_size=512), 4 short
 prompts + 4 tiny isolated re-runs. Should complete in well under a minute
 on either A6000.
 """
+import atexit
+import gc
 import os
 import sys
 import json
@@ -286,6 +288,13 @@ def main():
     try:
         results = engine.generate(prompts, sampling_params, use_tqdm=False)
     finally:
+        # LLMEngine.__init__ does atexit.register(self.exit) -- that keeps a
+        # permanent strong reference to this instance (model weights,
+        # kv_cache, StateManager buffers) alive for the life of the process
+        # no matter what, so plain `del engine` would NOT free GPU memory
+        # before the isolated-run engines below try to allocate their own KV
+        # caches (see tests/test_state_slot_reuse.py, same issue there).
+        atexit.unregister(engine.exit)
         engine.exit()
 
     print("\nCompletions (batched run):")
@@ -300,6 +309,7 @@ def main():
     # submission order) -- safe to zip positionally with `names`/`prompts`.
 
     del engine
+    gc.collect()
     torch.cuda.empty_cache()
 
     print("\n" + "=" * 78)
@@ -335,10 +345,16 @@ def main():
             iso_sp = SamplingParams(max_tokens=1, temperature=1.0, ignore_eos=True)
             iso_engine.generate([full_history[:-1]], iso_sp, use_tqdm=False)
         finally:
+            # Same atexit-strong-reference issue as the batched engine's
+            # teardown above -- must unregister before exit()/del, every
+            # iteration, or each successive isolated engine build in this
+            # loop leaks the previous one's KV cache too.
+            atexit.unregister(iso_engine.exit)
             iso_engine.exit()
         assert len(iso_captured) == 1, f"{name}: expected exactly 1 isolated free-time capture"
         captured_isolated[seq_id] = next(iter(iso_captured.values()))
         del iso_engine
+        gc.collect()
         torch.cuda.empty_cache()
         print(f"  captured isolated state for {name} (seq_id={seq_id}, history_len={len(full_history)})")
 
