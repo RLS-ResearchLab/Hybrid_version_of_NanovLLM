@@ -234,15 +234,19 @@ def instrument(engine: LLMEngine):
 
 
 def run_natural_isolated(prompt: list[int], sp: SamplingParams, seed: int = 42):
-    """Zero-contamination-risk ground truth built via NATURAL prefill +
-    sequential decode (the same compute pattern the batched run's own
-    sequence went through), never a single-shot prefill of the full
-    history. Used as a CONTROL against captured_isolated's single-shot-prefill
-    state: both are contamination-free by construction (neither ever shares
-    a batch with another sequence), so if they disagree by roughly the same
-    margin as a together-vs-isolated FAIL, that FAIL is explained by the
-    prefill-chunked-scan-vs-decode-sequential-scan numeric difference, not
-    contamination -- see main()'s control-check block for how this is used.
+    """Zero-contamination-risk run via NATURAL prefill + sequential decode,
+    letting the sampler pick freely at every step (same compute pattern the
+    batched run's own sequence went through, but NOT the same tokens --
+    see run_teacher_forced_isolated for the version that pins tokens
+    identical). INFORMATIVE ONLY: on random/untrained weights, many logits
+    sit close together, so ordinary batch-size numeric noise (batch-of-1
+    here vs whatever batch size the sequence saw when run "together") can
+    flip an early argmax with zero contamination involved (see
+    test_qwen35_preemption_state.py's docstring). If this run's own tokens
+    diverge from `together`'s before reaching the point of interest, its
+    STATE is not comparable to anything -- different token histories
+    trivially produce different states, telling you nothing about
+    contamination OR the prefill-vs-decode compute-path question.
     Returns (captured_state, generated_token_ids).
     """
     engine = build_engine()
@@ -259,6 +263,46 @@ def run_natural_isolated(prompt: list[int], sp: SamplingParams, seed: int = 42):
     gc.collect()
     torch.cuda.empty_cache()
     return state, out["token_ids"]
+
+
+def run_teacher_forced_isolated(prompt: list[int], forced_completion: list[int], seed: int = 42):
+    """THE decisive control: zero-contamination-risk (own engine, own slot,
+    never shares a batch) AND zero-token-divergence-risk (every token is
+    FORCED to match `forced_completion` exactly, bypassing the sampler's
+    own choice) -- isolating the ONE remaining variable, prefill-chunked-
+    parallel-scan (captured_isolated's single-shot-prefill of the full
+    history) vs prefill-of-prompt-then-sequential-decode (this function,
+    matching the batched run's own compute pattern for this sequence
+    exactly: one prefill over just the prompt, then one decode step per
+    completion token). Drives Scheduler.schedule()/ModelRunner.run()/
+    Scheduler.postprocess() directly instead of LLMEngine.generate()'s own
+    loop, so the sampled token_ids can be overridden with the known ones
+    before postprocess() ever appends/checks them -- ignore_eos=True and
+    max_tokens=len(forced_completion) mean postprocess()'s finish check can
+    only fire on the max_tokens condition, exactly when this loop is done
+    forcing the last token, never earlier from a stray EOS/stop match.
+    """
+    engine = build_engine()
+    init_deterministic_weights(engine, seed=seed)
+    _, captured = instrument(engine)
+    sp = SamplingParams(max_tokens=len(forced_completion), temperature=1.0, ignore_eos=True)
+    engine.add_request(prompt, sp)
+    for forced_token in forced_completion:
+        seqs, is_prefill = engine.scheduler.schedule()
+        engine.model_runner.call("run", seqs, is_prefill)
+        engine.scheduler.postprocess(seqs, [forced_token] * len(seqs), is_prefill)
+    assert engine.scheduler.is_finished(), (
+        "teacher-forced loop ended before the sequence finished -- "
+        "forced_completion length mismatch with the sequence's own max_tokens"
+    )
+    assert len(captured) == 1, f"expected exactly 1 teacher-forced free-time capture, got {len(captured)}"
+    state = next(iter(captured.values()))
+    atexit.unregister(engine.exit)
+    engine.exit()
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+    return state
 
 
 def build_engine():
@@ -417,46 +461,60 @@ def main():
         print("COMPARISON 1b (CONTROL, only for FAILing sequences) -- rules out a confound:")
         print("captured_isolated above used a SINGLE-SHOT prefill of the full known history,")
         print("a DIFFERENT compute path (chunked parallel scan) than the batched run's own")
-        print("prefill+sequential-decode. This control builds a SECOND, also-zero-")
-        print("contamination-risk ground truth via NATURAL prefill+decode (matching the")
-        print("batched run's own compute pattern) and compares it against the first ground")
-        print("truth. Both are contamination-free by construction (neither ever shares a")
-        print("batch) -- if THEY disagree by a similar margin, the FAIL above is that compute-")
-        print("path numeric difference, not contamination. If they agree closely, the FAIL")
-        print("above is NOT explained by that confound and the contamination read stands.")
+        print("prefill-of-prompt+sequential-decode. The decisive control below")
+        print("(run_teacher_forced_isolated) reproduces THAT exact compute pattern -- own")
+        print("engine, own slot, NEVER shares a batch (zero contamination risk) -- while")
+        print("FORCING every token to match the known completion exactly (zero token-")
+        print("divergence risk, unlike letting the sampler pick freely -- see the")
+        print("natural-decode-alone line below, which is context only, NOT part of the")
+        print("verdict, precisely because its tokens are free to diverge and did).")
+        print("Both compared ground truths process the IDENTICAL token sequence -- the")
+        print("only thing that differs between them is compute path. If they disagree by")
+        print("a similar margin to the original FAIL, that FAIL is the compute-path")
+        print("artifact, not contamination. If they agree closely, the confound is ruled")
+        print("out and the original FAIL is a real contamination signal.")
         print("=" * 78)
         for seq_id in failing_seq_ids:
             name = seq_id_to_name[seq_id]
             prompt = seq_id_to_prompt[seq_id]
             sp = seq_id_to_sp[seq_id]
-            natural_state, natural_tokens = run_natural_isolated(prompt, sp)
             together_tokens = seq_id_to_completion[seq_id]
             single_shot_state = captured_isolated[seq_id]
-            num_linear_layers = natural_state.shape[0]
+
+            natural_state, natural_tokens = run_natural_isolated(prompt, sp)
+            print(f"  {name} (seq_id={seq_id}):")
+            print(f"    [context only, not part of the verdict] natural-decode-alone "
+                  f"completion: {natural_tokens}")
+            print(f"    [context only, not part of the verdict] together completion:      "
+                  f"{together_tokens}")
+            print(f"    [context only] tokens match together exactly: "
+                  f"{natural_tokens == together_tokens} -- if False, natural-alone's state "
+                  f"is NOT comparable to anything (different token history) and is skipped below")
+
+            forced_state = run_teacher_forced_isolated(prompt, together_tokens)
+            num_linear_layers = forced_state.shape[0]
             per_layer_cos = []
             for layer_idx in range(num_linear_layers):
-                a = natural_state[layer_idx].float().reshape(-1)
+                a = forced_state[layer_idx].float().reshape(-1)
                 b = single_shot_state[layer_idx].float().reshape(-1)
                 cos = torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
                 per_layer_cos.append(cos)
             min_cos = min(per_layer_cos)
-            tokens_match = natural_tokens == together_tokens
-            print(f"  {name} (seq_id={seq_id}):")
-            print(f"    natural-decode-alone completion:   {natural_tokens}")
-            print(f"    together (batched) completion:     {together_tokens}")
-            print(f"    tokens match together exactly: {tokens_match}")
-            print(f"    natural-alone vs single-shot-prefill (both zero-contamination-risk) "
-                  f"per-layer cosine={[f'{c:.6f}' for c in per_layer_cos]} min={min_cos:.6f}")
+            print(f"    DECISIVE: teacher-forced-sequential-decode vs single-shot-prefill "
+                  f"(same tokens, both zero-contamination-risk) per-layer cosine="
+                  f"{[f'{c:.6f}' for c in per_layer_cos]} min={min_cos:.6f}")
             if min_cos <= STATE_COSINE_THRESHOLD:
-                print(f"    -> CONFOUND EXPLAINS THE FAIL: two contamination-free ground truths "
-                      f"disagree by a similar margin ({min_cos:.6f}) purely from the "
-                      f"prefill-chunk-vs-decode-sequential compute-path difference. The original "
-                      f"together-vs-isolated FAIL for {name} is NOT strong evidence of contamination.")
+                print(f"    -> CONFOUND EXPLAINS THE FAIL: two contamination-free, "
+                      f"identical-token-history ground truths disagree by a similar margin "
+                      f"({min_cos:.6f}) purely from the prefill-chunk-vs-decode-sequential "
+                      f"compute-path difference. The original together-vs-isolated FAIL for "
+                      f"{name} is NOT strong evidence of contamination.")
             else:
-                print(f"    -> CONFOUND RULED OUT: two contamination-free ground truths agree "
-                      f"closely ({min_cos:.6f} > {STATE_COSINE_THRESHOLD}) despite the different "
-                      f"compute paths. The original together-vs-isolated FAIL for {name} is NOT "
-                      f"explained by this confound -- treat it as a real contamination signal.")
+                print(f"    -> CONFOUND RULED OUT: two contamination-free, identical-token-"
+                      f"history ground truths agree closely ({min_cos:.6f} > "
+                      f"{STATE_COSINE_THRESHOLD}) despite the different compute paths. The "
+                      f"original together-vs-isolated FAIL for {name} is NOT explained by "
+                      f"this confound -- treat it as a real contamination signal.")
 
     print("\n" + "=" * 78)
     print("COMPARISON 2 (secondary/diagnostic) -- exact token-for-token completion match")
