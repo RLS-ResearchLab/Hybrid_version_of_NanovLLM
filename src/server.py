@@ -78,6 +78,7 @@ engine to wire it to.
 
 import argparse
 import asyncio
+import atexit
 import json
 import os
 import sys
@@ -199,6 +200,92 @@ class Engine:
             outputs = self.llm.generate([prompt_token_ids], sp, use_tqdm=False)
         return outputs[0]["token_ids"]
 
+
+class BatchedEngine:
+    """Real continuous batching across concurrent requests, gated behind
+    --concurrency-mode batched (see main()'s argparse setup) so FCFS
+    (the `Engine` class above, still the default) stays available to
+    toggle back to without reverting any code.
+
+    IMPORTANT -- this is NOT "Engine with the lock deleted". Naively
+    removing `_gen_lock` and letting multiple threads each call
+    `self.llm.generate(...)` concurrently would be a genuine correctness
+    bug: LLMEngine.generate() runs its own `while not self.is_finished():
+    self.step()` loop, and `step()` mutates Scheduler.waiting/running
+    (plain deques, not thread-safe) and drives the model forward pass --
+    two threads calling it concurrently race on that shared state with no
+    synchronization at all. The fix isn't a smaller lock around the same
+    per-thread-loop shape, it's a different shape: exactly ONE thread
+    (the background loop below) ever calls step()/is_finished(), matching
+    how single-writer async engines normally dispatch. HTTP-handler
+    threads only ever call add_request() (also lock-guarded, since it
+    mutates the same waiting deque the loop thread reads) and then block
+    on a per-request threading.Event that the loop thread sets once that
+    request's seq_id shows up in a step()'s finished-outputs list. This
+    is what actually lets nanovllm's Scheduler batch concurrently-submitted
+    requests into the same forward pass, which is the entire point of
+    relaxing FCFS.
+
+    Heads-up not enforced automatically here (deliberately -- this class
+    doesn't reach into LLM construction args): src/server.py's own
+    --max-num-seqs default (4) is sized for Engine's "at most one sequence
+    ever in flight" invariant (see that flag's help text). Pass a higher
+    --max-num-seqs explicitly when using --concurrency-mode batched, or
+    concurrent requests beyond that count will simply queue in
+    Scheduler.waiting rather than batch, same as today.
+    """
+    def __init__(self, llm: LLM):
+        self.llm = llm
+        self.tok = llm.tokenizer
+        self.eos_id = self.tok.eos_token_id
+        # Guards add_request()/step()/is_finished() only -- never held for
+        # a whole request's duration, unlike Engine._gen_lock. This is what
+        # lets two requests submitted moments apart both be RUNNING and get
+        # swept into the same step() call.
+        self._lock = threading.Lock()
+        self._pending: dict[int, threading.Event] = {}
+        self._results: dict[int, list[int]] = {}
+        self._stop = threading.Event()
+        self._loop_thread = threading.Thread(target=self._loop, daemon=True)
+        self._loop_thread.start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            with self._lock:
+                idle = self.llm.is_finished()
+                if not idle:
+                    outputs, _ = self.llm.step()
+                    for seq_id, token_ids in outputs:
+                        self._results[seq_id] = token_ids
+                        ev = self._pending.pop(seq_id, None)
+                        if ev is not None:
+                            ev.set()
+            if idle:
+                # Nothing scheduled -- no in-flight or waiting requests.
+                # Short poll interval, not a Condition variable woken by
+                # add_request(): kept simple deliberately for a same-day
+                # diagnostic flag; revisit if this ever needs to be the
+                # permanent server path.
+                time.sleep(0.001)
+
+    def generate(self, prompt_token_ids: list[int], max_tokens: int,
+                 temperature: float) -> list[int]:
+        """Run full generation for one request. Blocks caller thread, but
+        (unlike Engine.generate) does NOT block other requests from being
+        admitted into the scheduler and batched alongside this one."""
+        sp = SamplingParams(temperature=temperature, max_tokens=max_tokens)
+        ev = threading.Event()
+        with self._lock:
+            seq_id = self.llm.add_request(prompt_token_ids, sp)
+            self._pending[seq_id] = ev
+        ev.wait()
+        with self._lock:
+            return self._results.pop(seq_id)
+
+    def shutdown(self):
+        self._stop.set()
+        self._loop_thread.join(timeout=5)
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
 app  = FastAPI()
@@ -315,6 +402,17 @@ def main():
                              "and OOM'd by ~180MB). A small default is deliberate, not a "
                              "placeholder -- raise it only if the lock is ever relaxed to "
                              "allow real concurrent in-flight sequences.")
+    parser.add_argument("--concurrency-mode", dest="concurrency_mode",
+                        choices=["fcfs", "batched"], default="fcfs",
+                        help="Default 'fcfs': Engine._gen_lock serialises whole requests "
+                             "(see Engine's docstring) -- unchanged existing behavior. "
+                             "'batched': BatchedEngine (see its docstring), real continuous "
+                             "batching across concurrent requests via nanovllm's Scheduler. "
+                             "Toggle to compare both without reverting code -- e.g. for "
+                             "today's decode-time contamination check, only trust 'batched' "
+                             "numbers/output after tests/decode_stagger_contamination_check.py "
+                             "passes. Raise --max-num-seqs when using 'batched' -- see that "
+                             "flag's help text.")
     args = parser.parse_args()
 
     if args.fake_config_loader:
@@ -333,8 +431,12 @@ def main():
         enforce_eager=args.enforce_eager,
     )
 
-    print("Starting engine...")
-    _engine = Engine(llm)
+    print(f"Starting engine (concurrency_mode={args.concurrency_mode})...")
+    if args.concurrency_mode == "batched":
+        _engine = BatchedEngine(llm)
+        atexit.register(_engine.shutdown)
+    else:
+        _engine = Engine(llm)
 
     print(f"Server ready on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
