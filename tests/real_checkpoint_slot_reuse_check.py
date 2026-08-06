@@ -64,7 +64,11 @@ run -- reusing the already-loaded checkpoint saves a second ~1-2 minute
 reload.
 
 Usage:
-    python tests/real_checkpoint_slot_reuse_check.py
+    python tests/real_checkpoint_slot_reuse_check.py                    # forced reuse (max_num_seqs=3)
+    python tests/real_checkpoint_slot_reuse_check.py --max-num-seqs 8   # control: no reuse at all,
+                                                                          # measures ordinary batch-size
+                                                                          # noise alone for comparison
+                                                                          # (see --help)
 
 Runtime: one real checkpoint load (~1-2 min, TP=2) + 8 short isolated
 generations + 1 packed generation of the same 8 prompts. Should be low
@@ -92,7 +96,6 @@ from nanovllm.llm import LLM
 from nanovllm.sampling_params import SamplingParams
 
 CKPT_DIR = os.path.join(ROOT, "qwen35_checkpoint")
-MAX_NUM_SEQS = 3  # deliberately BELOW len(PROMPTS) -- forces queuing + reuse
 STATE_COSINE_THRESHOLD = 0.999  # same bar used in test_qwen35_preemption_state.py
                                  # and decode_stagger_contamination_check.py's
                                  # state-vs-state comparisons (not the unrelated
@@ -116,14 +119,14 @@ NAMES = [
 ]
 
 
-def build_llm():
+def build_llm(max_num_seqs: int):
     return LLM(
         CKPT_DIR,
         tensor_parallel_size=2,
         gpu_memory_utilization=0.9,
         max_model_len=2048,
         max_num_batched_tokens=2048,
-        max_num_seqs=MAX_NUM_SEQS,
+        max_num_seqs=max_num_seqs,
         enforce_eager=True,
     )
 
@@ -201,19 +204,41 @@ def teardown(llm: LLM):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--max-num-seqs", type=int, default=3, dest="max_num_seqs",
+        help="Default 3 (below the 8 prompts below) -- forces queuing + real slot reuse, "
+             "the scenario this script exists to test. Pass a value >= 8 (e.g. 8) instead "
+             "to run the DECISIVE CONTROL: no reuse occurs at all (every prompt gets its "
+             "own slot immediately, same as the earlier curl test's --max-num-seqs 32), so "
+             "any packed-vs-isolated divergence measured in that run is ISOLATED from "
+             "reuse -- pure ordinary batch-size numeric noise from co-scheduling with "
+             "siblings. Compare that run's cosine numbers for the 'long' sequences "
+             "against a --max-num-seqs 3 run's REUSE CONFIRMED sequences: if they're in "
+             "the same range, the forced-reuse run's divergence is noise, not "
+             "contamination; if the control stays much cleaner, the reuse hypothesis holds.",
+    )
+    args = parser.parse_args()
+
     assert torch.cuda.is_available(), "requires CUDA"
     assert os.path.isdir(CKPT_DIR), f"real checkpoint not found at {CKPT_DIR}"
-    assert MAX_NUM_SEQS < len(PROMPTS_AND_PARAMS), (
-        "MAX_NUM_SEQS must be below the prompt count, or no slot reuse is forced at all -- "
-        "this is the exact gap this script exists to close (see module docstring)"
-    )
+    forces_reuse = args.max_num_seqs < len(PROMPTS_AND_PARAMS)
 
     print("=" * 78)
-    print(f"Loading real checkpoint from {CKPT_DIR} (tensor_parallel_size=2, "
-          f"max_num_seqs={MAX_NUM_SEQS} -- deliberately below the {len(PROMPTS_AND_PARAMS)} "
-          f"prompts below, to FORCE queuing + slot reuse)...")
+    if forces_reuse:
+        print(f"Loading real checkpoint from {CKPT_DIR} (tensor_parallel_size=2, "
+              f"max_num_seqs={args.max_num_seqs} -- deliberately below the "
+              f"{len(PROMPTS_AND_PARAMS)} prompts below, to FORCE queuing + slot reuse)...")
+    else:
+        print(f"Loading real checkpoint from {CKPT_DIR} (tensor_parallel_size=2, "
+              f"max_num_seqs={args.max_num_seqs} -- NO-REUSE CONTROL RUN: every prompt gets "
+              f"its own slot immediately, matching the earlier curl test's config. This run "
+              f"measures ordinary batch-size numeric noise from co-scheduling ALONE, with "
+              f"zero possibility of slot reuse, as a baseline to compare against a "
+              f"--max-num-seqs 3 (forced-reuse) run's numbers.)")
     print("=" * 78)
-    llm = build_llm()
+    llm = build_llm(args.max_num_seqs)
     events, captured = instrument(llm)
 
     prompt_token_ids = [apply_chat_template(llm, text) for text, _ in PROMPTS_AND_PARAMS]
@@ -221,8 +246,8 @@ def main():
 
     print("\n" + "=" * 78)
     print("PHASE 1: ISOLATED baseline -- each of the 8 prompts run ALONE, sequentially")
-    print("(no batching partner ever present -- zero reuse pressure at max_num_seqs=3")
-    print("with only 1 sequence active at a time)")
+    print("(no batching partner ever present regardless of --max-num-seqs, since only 1")
+    print("sequence is ever active at a time in this phase)")
     print("=" * 78)
     isolated_tokens = {}
     isolated_states = {}
@@ -245,8 +270,8 @@ def main():
     name_by_isolated_seq_id = dict(zip(isolated_seq_ids, NAMES))
 
     print("\n" + "=" * 78)
-    print("PHASE 2: PACKED run -- all 8 prompts submitted TOGETHER, max_num_seqs=3")
-    print("forces queuing. Watch [EVENT] lines for actual free->reassign events.")
+    print(f"PHASE 2: PACKED run -- all 8 prompts submitted TOGETHER, max_num_seqs="
+          f"{args.max_num_seqs}. Watch [EVENT] lines for actual free->reassign events.")
     print("=" * 78)
     packed_results = llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
     packed_seq_ids = sorted(sid for sid in captured if sid not in isolated_states)
@@ -343,12 +368,22 @@ def main():
     print("SUMMARY")
     print("=" * 78)
     if not reused_seq_ids:
-        print("[INCONCLUSIVE] No slot-reuse event was actually observed in the packed run -- "
-              "the ALLOC/FREE TIMELINE above never shows a sequence allocated into a slot a "
-              "DIFFERENT sequence just freed. MAX_NUM_SEQS may need to be lowered further, or "
-              "the short prompts' stop=['.'] didn't fire early enough. This run proves nothing "
-              "about reuse safety either way -- do not report it as a PASS.")
-        raise AssertionError("no slot-reuse event observed -- test did not exercise the scenario under test")
+        if forces_reuse:
+            print("[INCONCLUSIVE] No slot-reuse event was actually observed in the packed run -- "
+                  "the ALLOC/FREE TIMELINE above never shows a sequence allocated into a slot a "
+                  "DIFFERENT sequence just freed. --max-num-seqs may need to be lowered further, "
+                  "or the short prompts' stop=['.'] didn't fire early enough. This run proves "
+                  "nothing about reuse safety either way -- do not report it as a PASS.")
+            raise AssertionError("no slot-reuse event observed -- test did not exercise the scenario under test")
+        else:
+            long_names = {n for n in NAMES if n.startswith("long_")}
+            print(f"[CONTROL RUN -- no reuse by design, --max-num-seqs={args.max_num_seqs} >= "
+                  f"{len(PROMPTS_AND_PARAMS)} prompts] Use the per-sequence cosine numbers above "
+                  f"for the 'long_*' sequences as the ordinary-batch-size-noise baseline. Compare "
+                  f"them directly against a --max-num-seqs 3 run's REUSE CONFIRMED sequences of "
+                  f"the SAME name: similar magnitude means the forced-reuse run's divergence is "
+                  f"noise, not contamination; a control run staying much cleaner than the "
+                  f"forced-reuse run means the reuse hypothesis holds and needs deeper investigation.")
     elif any_reuse_fail:
         print(f"[FAIL] {len(reused_seq_ids)} sequence(s) experienced a real slot-reuse event "
               f"(logged above), and at least one of them diverged from its isolated baseline. "
