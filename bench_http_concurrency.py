@@ -33,8 +33,14 @@ Usage:
 
     # 2) run the sweep:
     python bench_http_concurrency.py --tokenizer-dir qwen35_checkpoint \\
-        --levels 1 2 4 8 --trials 2 --warmup-trials 1 \\
+        --levels 1 2 4 8 --trials 2 --warmup-trials 1 --ignore-eos \\
         --prompt-tokens 1024 --max-tokens 1024 --out throughput_batched_http.csv
+
+Note on --ignore-eos: without it, the server lets each completion stop at
+EOS, so tok/s is measured over whatever (possibly short) length the model
+happened to generate -- not a real 1024-out number. Pass --ignore-eos to
+force every completion to run the full --max-tokens for an apples-to-apples
+throughput measurement.
 
 Stop condition (per today's task): if tok/s does NOT increase with
 concurrency, STOP and report -- do not keep sweeping past whatever level
@@ -62,11 +68,13 @@ def build_prompt_text(tokenizer, target_tokens: int) -> str:
     return tokenizer.decode(ids)
 
 
-def post_chat_completion(base_url: str, prompt_text: str, max_tokens: int, timeout: float):
+def post_chat_completion(base_url: str, prompt_text: str, max_tokens: int, timeout: float,
+                          ignore_eos: bool = False):
     payload = json.dumps({
         "messages": [{"role": "user", "content": prompt_text}],
         "max_tokens": max_tokens,
         "temperature": 1.0,
+        "ignore_eos": ignore_eos,
     }).encode("utf-8")
     req = urllib.request.Request(
         f"{base_url}/v1/chat/completions",
@@ -85,12 +93,12 @@ def post_chat_completion(base_url: str, prompt_text: str, max_tokens: int, timeo
         return {"ok": False, "latency_s": dt, "error": repr(e)}
 
 
-def run_wave(base_url, prompt_text, max_tokens, concurrency, timeout):
+def run_wave(base_url, prompt_text, max_tokens, concurrency, timeout, ignore_eos=False):
     t0 = time.perf_counter()
     results = []
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
         futs = [
-            ex.submit(post_chat_completion, base_url, prompt_text, max_tokens, timeout)
+            ex.submit(post_chat_completion, base_url, prompt_text, max_tokens, timeout, ignore_eos)
             for _ in range(concurrency)
         ]
         for f in as_completed(futs):
@@ -140,6 +148,11 @@ def main():
     p.add_argument("--warmup-trials", type=int, default=1, help="Untimed waves per level, discarded.")
     p.add_argument("--retok-sample", type=int, default=3, help="Responses per level to spot-check reported-vs-retokenized token count.")
     p.add_argument("--timeout", type=float, default=600.0, help="Per-request HTTP timeout, seconds.")
+    p.add_argument("--ignore-eos", dest="ignore_eos", action="store_true", default=False,
+                    help="Force every completion to run to --max-tokens instead of stopping at "
+                         "EOS. Without this, tok/s reflects whatever (possibly much shorter than "
+                         "--max-tokens) length the model happened to stop at, not a real "
+                         "--max-tokens-out throughput number -- pass this for throughput sweeps.")
     p.add_argument("--out", default="throughput_batched_http.csv")
     args = p.parse_args()
 
@@ -178,7 +191,7 @@ def main():
         print(f"\n=== concurrency={level} ===")
 
         for w in range(args.warmup_trials):
-            res = run_wave(args.base_url, prompt_text, args.max_tokens, level, args.timeout)
+            res = run_wave(args.base_url, prompt_text, args.max_tokens, level, args.timeout, args.ignore_eos)
             print(f"  warmup {w + 1}/{args.warmup_trials}: wall_s={res['wall_s']:.2f} "
                   f"tok/s={res['tok_s']:.1f} success={res['n_success']}/{res['n_requests']} (discarded)")
             if res["failures"]:
@@ -186,7 +199,7 @@ def main():
 
         tok_s_values = []
         for t in range(args.trials):
-            res = run_wave(args.base_url, prompt_text, args.max_tokens, level, args.timeout)
+            res = run_wave(args.base_url, prompt_text, args.max_tokens, level, args.timeout, args.ignore_eos)
             tok_s_values.append(res["tok_s"])
             print(f"  trial {t + 1}/{args.trials}: wall_s={res['wall_s']:.2f} "
                   f"total_tokens={res['total_completion_tokens']} tok/s={res['tok_s']:.1f} "

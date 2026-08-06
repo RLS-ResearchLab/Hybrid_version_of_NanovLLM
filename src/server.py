@@ -172,6 +172,8 @@ class ChatRequest(BaseModel):
     max_tokens: int = 1024
     temperature: float = 0.0
     top_p: float = 1.0  # accepted, not applied -- see module docstring
+    ignore_eos: bool = False  # passthrough to SamplingParams -- see sampling_params.py
+    stop: list[str] | None = None  # passthrough to SamplingParams -- see sampling_params.py
 
 # ── Engine ────────────────────────────────────────────────────────────────────
 
@@ -193,9 +195,11 @@ class Engine:
         self._gen_lock = threading.Lock()
 
     def generate(self, prompt_token_ids: list[int], max_tokens: int,
-                 temperature: float) -> list[int]:
+                 temperature: float, ignore_eos: bool = False,
+                 stop: list[str] | None = None) -> list[int]:
         """Run full generation for one request. Blocks caller thread."""
-        sp = SamplingParams(temperature=temperature, max_tokens=max_tokens)
+        sp = SamplingParams(temperature=temperature, max_tokens=max_tokens,
+                             ignore_eos=ignore_eos, stop=stop)
         with self._gen_lock:
             outputs = self.llm.generate([prompt_token_ids], sp, use_tqdm=False)
         return outputs[0]["token_ids"]
@@ -269,11 +273,13 @@ class BatchedEngine:
                 time.sleep(0.001)
 
     def generate(self, prompt_token_ids: list[int], max_tokens: int,
-                 temperature: float) -> list[int]:
+                 temperature: float, ignore_eos: bool = False,
+                 stop: list[str] | None = None) -> list[int]:
         """Run full generation for one request. Blocks caller thread, but
         (unlike Engine.generate) does NOT block other requests from being
         admitted into the scheduler and batched alongside this one."""
-        sp = SamplingParams(temperature=temperature, max_tokens=max_tokens)
+        sp = SamplingParams(temperature=temperature, max_tokens=max_tokens,
+                             ignore_eos=ignore_eos, stop=stop)
         ev = threading.Event()
         with self._lock:
             seq_id = self.llm.add_request(prompt_token_ids, sp)
@@ -326,6 +332,8 @@ async def chat_completions(req: ChatRequest):
         input_ids,
         req.max_tokens,
         req.temperature,
+        req.ignore_eos,
+        req.stop,
     )
 
     output_text = _engine.tok.decode(output_ids, skip_special_tokens=True)
