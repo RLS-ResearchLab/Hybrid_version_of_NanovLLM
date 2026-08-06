@@ -27,12 +27,14 @@ ground truth for every formula.
 | 4 — CUDA graphs for decode | ✅ Done | Yes — cosine 1.000000, 3 batch sizes |
 | 5 — Tensor parallelism | ⚠️ Loader math verified, engine untested | Shard-selection math verified TP=2 (CPU-only); full engine run needs 2×H200 |
 | Pre-35B validation gate — real checkpoint, tokenizer, throughput harness | ✅ Done (small model) | Yes — see below |
+| 7 — FCFS→batched relaxation, decode-time slot-reuse safety | ⚠️ Reuse safety confirmed; batch-composition argmax-divergence rate flagged as new open risk | Reuse-specific: yes, on fake model + real checkpoint. Batch-composition-noise-in-general: **new finding, not previously assessed at decode scale — see below** |
 
 **Immediate open items, in priority order** — see full detail in each phase's section below:
-1. Phase 2: run two designed-but-unexecuted control tests to determine whether a cosine≈0.947 result on one sequence is numerical noise or a real bug. **Still not run — unchanged by the validation-gate work below.**
-2. Phase 3: extend the preemption test's memory-pressure search until a preemption actually fires, then verify byte-identical output. **Not re-verified in the latest work — status as last recorded.**
-3. Phase 5: run full TP=2 engine validation once 2×H200 hardware is available tonight. The shard-selection math itself is now verified in isolation (see validation-gate section) — what's left is the actual multi-process/NCCL engine construction, which needs the real hardware.
-4. Two narrow gaps found (not fixed, low priority): `load_model()` cannot accept a checkpoint using a model's native fused parameter name (only HF-style split names), and `LLMEngine`'s `atexit.register(self.exit)` permanently pins every engine instance alive for the process's lifetime, preventing GPU memory from being reclaimed between sequentially-built engines in one process. Both documented below.
+1. **Phase 7 (new, highest priority given real-checkpoint evidence):** batch-composition alone (no slot reuse involved) produced actual argmax/token divergence in 2 of 5 real-checkpoint sequences tested (40%) at 55-128 decode steps — a materially different risk profile than Phase 6's short-prompt/prefill-only assessment. Needs a larger-sample measurement before any output-reproducibility guarantee is made for batched mode. **Not yet sized — see Phase 7 section.**
+2. Phase 2: run two designed-but-unexecuted control tests to determine whether a cosine≈0.947 result on one sequence is numerical noise or a real bug. **Still not run — unchanged by the validation-gate work below.**
+3. Phase 3: extend the preemption test's memory-pressure search until a preemption actually fires, then verify byte-identical output. **Not re-verified in the latest work — status as last recorded.**
+4. Phase 5: run full TP=2 engine validation once 2×H200 hardware is available tonight. The shard-selection math itself is now verified in isolation (see validation-gate section) — what's left is the actual multi-process/NCCL engine construction, which needs the real hardware.
+5. Two narrow gaps found (not fixed, low priority): `load_model()` cannot accept a checkpoint using a model's native fused parameter name (only HF-style split names), and `LLMEngine`'s `atexit.register(self.exit)` permanently pins every engine instance alive for the process's lifetime, preventing GPU memory from being reclaimed between sequentially-built engines in one process. Both documented below.
 
 ---
 
@@ -529,6 +531,167 @@ state caching. Documentation only, per the original plan — not implemented.
 
 ---
 
+## Phase 7 — FCFS→batched relaxation, decode-time slot-reuse safety ⚠️ Reuse safety confirmed; new open risk flagged
+
+**Scope:** `src/server.py`'s `Engine._gen_lock` serialized every request
+(matching a comparison engine's non-batching behavior) — one sequence per
+forward pass, strict FCFS. That comparison stopped mattering; this phase
+relaxes the lock to use nanovllm's actual continuous batching, and answers
+the specific correctness question that relaxation raises: `StateManager`'s
+fixed-size recurrent-state slot pool is architecturally distinct from the
+growing KV-cache, and a slot freed **mid-batch** (a sequence hits its
+`SamplingParams.stop` string or EOS while siblings keep decoding) needs to
+be fully reset before a new sequence inherits it — a scenario `Phase 2`'s
+existing contamination check and `tests/gsm8k_decode_contamination_check.py`
+did not exercise (see those tests' own docstrings for exactly what they did
+and didn't cover).
+
+**Delivered:**
+- `src/server.py` — `BatchedEngine`, gated behind `--concurrency-mode
+  {fcfs,batched}` (default `fcfs`, unchanged behavior). Not "`Engine` with
+  the lock deleted" — `LLMEngine.generate()`/`step()` mutate
+  `Scheduler.waiting`/`running` (plain deques, not thread-safe) and drive
+  the GPU from whatever thread calls them, so naively removing the lock
+  would race two threads on that shared state. `BatchedEngine` instead runs
+  exactly one background thread as the sole caller of `step()`/
+  `is_finished()` (single-writer, matching how async engines normally
+  dispatch); HTTP-handler threads only call `add_request()` (lock-guarded,
+  since it mutates the same `waiting` deque the loop thread reads) and
+  block on a per-request `threading.Event`.
+- `engine/llm_engine.py` — `add_request()` now returns `seq.seq_id` (purely
+  additive), needed by `BatchedEngine` to correlate a finished output back
+  to the request that submitted it.
+- `tests/decode_stagger_contamination_check.py` (NEW) — fake-tiny-model
+  (random weights, no real checkpoint, matching `test_qwen35_preemption_state.py`'s
+  harness) reuse-under-staggered-termination check: 4 sequences,
+  `max_num_seqs=2`, one sequence's `stop=[r"\d+ \d+ \d+"]` fires
+  deterministically at completion token 3 while a sibling keeps decoding.
+- `tests/real_checkpoint_slot_reuse_check.py` (NEW) — same design against
+  the real Qwen3.5-35B-A3B checkpoint: 8 prompts (4 short, real
+  `stop=["."]` finish; 4 long, 55-128 decode steps), `--max-num-seqs`
+  configurable so reuse can be forced (`< 8`, the default `3`) or made
+  structurally impossible (`>= 8`) as a control. Both scripts instrument
+  `StateManager.allocate`/`free` directly to log an explicit alloc/free
+  timeline — reuse is *confirmed from logged events*, never inferred from
+  timing or co-existence.
+
+**Bugs found and fixed:**
+
+| # | Bug | Fix |
+|---|---|---|
+| 1 | **`Scheduler.schedule()`'s prefill admission never checked `len(self.running)`.** The prefill while-loop's only cap was `len(scheduled_seqs) < max_num_seqs` — `scheduled_seqs` resets to `[]` every call, so once `self.running` already held `max_num_seqs` sequences from a *previous* call, the very next call would still try to admit more from `self.waiting`, calling `StateManager.allocate()` on an exhausted slot pool. Crashed with `IndexError: pop from an empty deque` the first time real queued demand (`waiting` non-empty while `running` was already at capacity) was exercised — exactly the ordinary condition continuous batching exists to handle. Not hybrid-model-specific in principle (the non-hybrid path would just silently over-batch past its configured `max_num_seqs`), but fatal specifically because `StateManager`'s slot pool is sized to exactly `max_num_seqs`. | `engine/scheduler.py:79` — condition changed to `len(self.running) + len(scheduled_seqs) < self.max_num_seqs`, bounding total concurrent sequences (already-running + newly-admitted-this-call), not just this call's own admissions. |
+
+**Test-methodology lesson worth keeping** (cost real GPU-hour time to
+discover, cheap to avoid next time): a **single-shot prefill of a full known
+token history is not a valid ground truth** for comparing GDR/Mamba
+recurrent state against a trajectory that was actually built via
+prefill+sequential-decode — the two are different kernels/algorithms
+(chunked parallel scan vs. sequential recurrence), mathematically equivalent
+but numerically different in bf16/fp32, independent of any contamination.
+First surfaced as a false-positive `FAIL` in the fake-model test
+(`seq_new_a`, cosine 0.995860 against a single-shot-prefill baseline);
+confirmed as a pure compute-path artifact by a teacher-forced control
+(forcing the same known tokens through prefill+sequential-decode instead —
+cosine 0.997018 between the *two* contamination-free ground truths, closely
+matching the original "FAIL," with zero contamination possible in either).
+Both new test scripts use natural or teacher-forced prefill+sequential-decode
+ground truths, never single-shot-prefill reconstructions, for exactly this
+reason.
+
+**Validated results — decode-time slot-reuse safety:**
+
+| Check | Result |
+|---|---|
+| Fake model, staggered stop-string reuse (`decode_stagger_contamination_check.py`) | Reuse confirmed via logged alloc/free timeline (slot 0: seq1→seq3→seq4). Teacher-forced control (same tokens, zero contamination possible, prefill+decode compute path matched) reproduced the one apparent divergence almost exactly (0.997018 vs. the original 0.995860) — confound, not contamination. |
+| Real checkpoint, forced reuse, `--max-num-seqs 3` (`real_checkpoint_slot_reuse_check.py`) | 5 sequences confirmed reused a slot via logged events. 3/5 matched isolated baseline within the *originally assumed* 0.999 bar; 2/5 (`long_ocean_paragraph`, `long_photosynthesis`) diverged in actual output tokens. |
+| Real checkpoint, **no-reuse control**, `--max-num-seqs 8` (same script) | Every reuse-confirmed sequence's divergence from the forced-reuse run was reproduced at equal or *greater* magnitude with reuse structurally impossible: `long_photosynthesis` diverged to the **byte-identical** wrong completion in both runs; `long_ocean_paragraph` diverged *earlier* (token 49/128) with no reuse than *with* reuse (token 69/128). This rules out slot reuse as the cause of both the cosine dips and the token divergences observed in the forced-reuse run. |
+
+**Bottom line on the original question:** no decode-time `StateManager`
+slot-reuse contamination detected, on either model. Three independent lines
+of evidence agree: the static code-path analysis (stop-string/EOS/max_tokens/
+preemption all free state through the identical, already-fixed cross-rank
+dispatch — see `engine/scheduler.py`'s `_free_state`/`_allocate_state` and
+`engine/model_runner.py`'s `allocate_state_slot`/`free_state_slot`), the
+fake-model teacher-forced control, and the real-checkpoint no-reuse control.
+
+**Threshold calibration for solo-vs-co-batched state comparisons — stated
+explicitly, not left implicit.** The pre-existing `> 0.999` bar
+(`test_qwen35_preemption_state.py`) was measured on a **same-batch-size**
+comparison — preempted-and-recomputed state vs. an isolated run, both
+effectively batch-size 1 at the moment of comparison. It does not transfer
+to a **solo-vs-co-batched** comparison (one side run alone, the other
+co-scheduled with siblings), which is a different, noisier measurement by
+construction: ordinary bf16 batch-composition/batch-size non-associativity
+alone — with *zero* possibility of reuse or contamination, confirmed by the
+no-reuse control above — produced cosine as low as **0.992462**
+(`long_count_to_50`, 128 decode steps) and as high as 0.999978 (`short_*`,
+1 decode step) across the 8 sequences measured. **For solo-vs-co-batched
+state comparisons on this checkpoint, the threshold is set at 0.99**, with
+margin below the lowest observed no-bug value (0.992462) to absorb
+sampling noise from a small (n=8) measurement, while still catching
+qualitatively large corruption. This is a distinct threshold, for a
+distinct comparison type, from the 0.999 same-batch-size preemption bar —
+not a loosened version of it. Not yet validated at longer sequence lengths
+(GSM8K-scale, ~512 decode steps) — the noise floor may sit lower there;
+re-measure before treating 0.99 as a general-purpose gate past ~128 steps.
+
+**New open risk, higher priority than the reuse question above — not yet
+sized.** The no-reuse control's real value wasn't just clearing the reuse
+hypothesis: it independently demonstrates that **batch composition alone,
+with zero slot reuse anywhere in the run, flips actual generated tokens**,
+not just cosine similarity. 2 of 5 sequences measured (40%) diverged to a
+genuinely different completion under co-batching vs. solo, at 42-128 decode
+steps, with both divergences reproducible identically regardless of reuse.
+This is the *same* underlying bf16 batch-size/accumulation sensitivity
+already known from `Phase 6`'s prefill contamination check
+(`tests/phase6_packed_contamination_check.py`) and partially addressed
+elsewhere (the MoE combine step's fp32-accumulation fix;
+`tests/test_shared_expert_allreduce_precision.py`'s still-open
+shared-expert allreduce investigation) — but it is materially **new
+evidence about its consequence at decode scale**, not a new bug introduced
+by anything in this phase:
+- Phase 6's acceptance criterion was cosine ≥ 0.99 **AND top-1 (argmax)
+  match**, measured on **prefill logits only**, on **short prompts**
+  (4-8 prompts, single forward pass) — it passed at cosine 0.998576-0.998919
+  with top-1 matching every time. It never observed — and by construction,
+  as a single-forward-pass prefill check, could not have observed — an
+  actual argmax mismatch. "Isolated residual, accepted as bounded" was a
+  fair characterization of *that* measurement.
+- This phase measured **full autoregressive decode** (42-128 steps,
+  argmax feeding back as the next step's input every time) on **longer
+  generations**, and found actual token-level divergence, not bounded
+  cosine drift, at a 40% rate in a 5-sequence sample. A cosine bar alone
+  cannot gate this: cosine is a continuous quantity, argmax is a
+  discontinuous function of it, and a small perturbation compounding over
+  many decode steps is enough to flip a close call — exactly what happened
+  here, twice, in a run with reuse structurally disabled.
+- **Practical consequence:** at `temperature=0`, batched mode is not
+  guaranteed to reproduce the exact same completion FCFS mode would give
+  for the same prompt, once generations run long enough — confirmed
+  separately by this phase's own curl comparison, which showed
+  byte-identical output for a short, low-ambiguity completion
+  ("count from 1 to 20", high-confidence logits throughout) but was never
+  a test of longer, more open-ended generations, and should not have been
+  read as one.
+- **Not yet sized**: n=5 (or n=4 "long" sequences) is not enough to state a
+  real rate. Before treating this as either "acceptable, bounded noise" or
+  "needs a precision fix," it needs the same treatment Phase 6 got —
+  a larger sample (≥20-30 longer generations), varied lengths, and a
+  measurement of *where* in the decode the divergence tends to occur
+  (early vs. late — late is more consistent with ordinary compounding
+  noise, per `gsm8k_decode_contamination_check.py`'s own calibration note;
+  both divergences observed here were fairly late, 39-60% through, which
+  is *suggestive* but not dispositive at this sample size).
+
+**Immediate next action:** size the argmax-divergence rate properly on
+longer, GSM8K-scale generations before relying on batched-mode output
+matching FCFS-mode output for any application that needs reproducibility
+across concurrency levels — accuracy-gate-style evaluation (aggregate
+correctness across many examples) is far more robust to this than any
+single-completion reproducibility claim would be.
+
+---
+
 ## Design notes carried forward from planning review
 
 - **MoE weight loading is unresolved for the real checkpoint.** The real
@@ -591,6 +754,11 @@ python bench_throughput.py --model tests/fake_qwen35_small \
 python tests/test_state_slot_reuse.py
 python tests/test_loader_shard_merge.py
 python tests/test_tp_shard_loader.py   # CPU-only, no GPU required
+
+# Phase 7 — decode-time StateManager slot-reuse safety under staggered termination
+python tests/decode_stagger_contamination_check.py           # fake model, seconds
+python tests/real_checkpoint_slot_reuse_check.py              # real checkpoint, forces reuse (default --max-num-seqs 3)
+python tests/real_checkpoint_slot_reuse_check.py --max-num-seqs 8   # same script, no-reuse control (see Phase 7)
 ```
 
 ## Running the base dense-Qwen3 engine (unaffected by this work)
