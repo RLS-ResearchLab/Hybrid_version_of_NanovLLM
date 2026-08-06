@@ -233,6 +233,34 @@ def instrument(engine: LLMEngine):
     return events, captured_states
 
 
+def run_natural_isolated(prompt: list[int], sp: SamplingParams, seed: int = 42):
+    """Zero-contamination-risk ground truth built via NATURAL prefill +
+    sequential decode (the same compute pattern the batched run's own
+    sequence went through), never a single-shot prefill of the full
+    history. Used as a CONTROL against captured_isolated's single-shot-prefill
+    state: both are contamination-free by construction (neither ever shares
+    a batch with another sequence), so if they disagree by roughly the same
+    margin as a together-vs-isolated FAIL, that FAIL is explained by the
+    prefill-chunked-scan-vs-decode-sequential-scan numeric difference, not
+    contamination -- see main()'s control-check block for how this is used.
+    Returns (captured_state, generated_token_ids).
+    """
+    engine = build_engine()
+    init_deterministic_weights(engine, seed=seed)
+    _, captured = instrument(engine)
+    try:
+        out = engine.generate([prompt], sp, use_tqdm=False)[0]
+    finally:
+        atexit.unregister(engine.exit)
+        engine.exit()
+    assert len(captured) == 1, f"expected exactly 1 natural-isolated free-time capture, got {len(captured)}"
+    state = next(iter(captured.values()))
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+    return state, out["token_ids"]
+
+
 def build_engine():
     # 0.3 was too tight on at least one real machine (num_kvcache_blocks
     # computed to <=0 -- allocate_kv_cache()'s budget is
@@ -332,6 +360,7 @@ def main():
     seq_id_to_name = dict(zip(ordered_seq_ids, names))
     seq_id_to_prompt = dict(zip(ordered_seq_ids, prompts))
     seq_id_to_completion = dict(zip(ordered_seq_ids, [results[i]["token_ids"] for i in range(4)]))
+    seq_id_to_sp = dict(zip(ordered_seq_ids, sampling_params))
 
     captured_isolated = {}
     for seq_id in ordered_seq_ids:
@@ -363,6 +392,7 @@ def main():
           f"threshold > {STATE_COSINE_THRESHOLD}")
     print("=" * 78)
     all_state_pass = True
+    failing_seq_ids = []
     for seq_id in ordered_seq_ids:
         name = seq_id_to_name[seq_id]
         together_state = captured_together[seq_id]
@@ -378,8 +408,55 @@ def main():
         status = "PASS" if min_cos > STATE_COSINE_THRESHOLD else "FAIL"
         if status == "FAIL":
             all_state_pass = False
+            failing_seq_ids.append(seq_id)
         print(f"  {name} (seq_id={seq_id}): per-layer cosine={[f'{c:.6f}' for c in per_layer_cos]} "
               f"min={min_cos:.6f} [{status}]")
+
+    if failing_seq_ids:
+        print("\n" + "=" * 78)
+        print("COMPARISON 1b (CONTROL, only for FAILing sequences) -- rules out a confound:")
+        print("captured_isolated above used a SINGLE-SHOT prefill of the full known history,")
+        print("a DIFFERENT compute path (chunked parallel scan) than the batched run's own")
+        print("prefill+sequential-decode. This control builds a SECOND, also-zero-")
+        print("contamination-risk ground truth via NATURAL prefill+decode (matching the")
+        print("batched run's own compute pattern) and compares it against the first ground")
+        print("truth. Both are contamination-free by construction (neither ever shares a")
+        print("batch) -- if THEY disagree by a similar margin, the FAIL above is that compute-")
+        print("path numeric difference, not contamination. If they agree closely, the FAIL")
+        print("above is NOT explained by that confound and the contamination read stands.")
+        print("=" * 78)
+        for seq_id in failing_seq_ids:
+            name = seq_id_to_name[seq_id]
+            prompt = seq_id_to_prompt[seq_id]
+            sp = seq_id_to_sp[seq_id]
+            natural_state, natural_tokens = run_natural_isolated(prompt, sp)
+            together_tokens = seq_id_to_completion[seq_id]
+            single_shot_state = captured_isolated[seq_id]
+            num_linear_layers = natural_state.shape[0]
+            per_layer_cos = []
+            for layer_idx in range(num_linear_layers):
+                a = natural_state[layer_idx].float().reshape(-1)
+                b = single_shot_state[layer_idx].float().reshape(-1)
+                cos = torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
+                per_layer_cos.append(cos)
+            min_cos = min(per_layer_cos)
+            tokens_match = natural_tokens == together_tokens
+            print(f"  {name} (seq_id={seq_id}):")
+            print(f"    natural-decode-alone completion:   {natural_tokens}")
+            print(f"    together (batched) completion:     {together_tokens}")
+            print(f"    tokens match together exactly: {tokens_match}")
+            print(f"    natural-alone vs single-shot-prefill (both zero-contamination-risk) "
+                  f"per-layer cosine={[f'{c:.6f}' for c in per_layer_cos]} min={min_cos:.6f}")
+            if min_cos <= STATE_COSINE_THRESHOLD:
+                print(f"    -> CONFOUND EXPLAINS THE FAIL: two contamination-free ground truths "
+                      f"disagree by a similar margin ({min_cos:.6f}) purely from the "
+                      f"prefill-chunk-vs-decode-sequential compute-path difference. The original "
+                      f"together-vs-isolated FAIL for {name} is NOT strong evidence of contamination.")
+            else:
+                print(f"    -> CONFOUND RULED OUT: two contamination-free ground truths agree "
+                      f"closely ({min_cos:.6f} > {STATE_COSINE_THRESHOLD}) despite the different "
+                      f"compute paths. The original together-vs-isolated FAIL for {name} is NOT "
+                      f"explained by this confound -- treat it as a real contamination signal.")
 
     print("\n" + "=" * 78)
     print("COMPARISON 2 (secondary/diagnostic) -- exact token-for-token completion match")
