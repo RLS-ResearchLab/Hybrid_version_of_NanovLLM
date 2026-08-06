@@ -65,11 +65,17 @@ class LLMEngine:
                 p.terminate()
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams) -> int:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        # Returned so a caller driving step() from a single dedicated thread
+        # (see src/server.py's BatchedEngine) can correlate a finished
+        # output back to the request that submitted it, without needing to
+        # also drive generate()'s own while-loop -- purely additive, every
+        # existing caller already ignores this return value.
+        return seq.seq_id
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
