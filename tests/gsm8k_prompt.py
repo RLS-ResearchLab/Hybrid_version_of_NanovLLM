@@ -83,3 +83,27 @@ def build_prompt(question: str, exemplars=EXEMPLARS) -> str:
     blocks = [f"Q: {ex['question']}\n\nA: {ex['answer']}" for ex in exemplars]
     blocks.append(f"Q: {question}\n\nA:")
     return "\n\n".join(blocks)
+
+
+def build_chat_messages(question: str, exemplars=EXEMPLARS) -> list[dict]:
+    """Same exemplar content as build_prompt(), as a single chat user turn instead
+    of a raw completion string, so it can go through
+    tokenizer.apply_chat_template(..., enable_thinking=False).
+
+    Rationale: with build_prompt()'s raw "Q: ... A:" text fed straight to
+    generate(), nothing ever tells the model thinking is off, so it opens an
+    unprompted <think> block on its own (27/32 examples in
+    full_results_n32_mt706_stop.jsonl) and, in the 9 that never produce a
+    clean "The answer is N" statement, spends the whole token budget on a
+    "Pattern Analysis" -> "Drafting the Response" -> "Draft:" ritual instead
+    of imitating the exemplars' solve-then-state style directly -- see that
+    investigation for the full trace examples. Wrapping the identical content
+    as a chat turn and forcing enable_thinking=False emits a pre-closed
+    '<think>\\n\\n</think>\\n\\n' prefix (see the checkpoint's chat_template),
+    which should remove that ritual entirely. Unvalidated against the real
+    checkpoint as of this writing -- compare against build_prompt()'s cached
+    results before trusting it for a scored run.
+    """
+    blocks = [f"Q: {ex['question']}\n\nA: {ex['answer']}" for ex in exemplars]
+    blocks.append(f"Q: {question}\n\nA:")
+    return [{"role": "user", "content": "\n\n".join(blocks)}]

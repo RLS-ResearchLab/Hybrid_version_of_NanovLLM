@@ -49,6 +49,43 @@ Usage (resumes automatically if RESULTS_PATH already has partial results):
     python tests/gsm8k_full_run.py
     python tests/gsm8k_full_run.py --no-enforce-eager --batch-size 16 --max-tokens 256   # after validating each
     python tests/gsm8k_full_run.py --num-examples 660
+
+--prompt-format 3-way comparison -- PRE-REGISTERED PREDICTIONS, written before running any
+of the three arms against the real checkpoint (see --prompt-format's own --help for what
+each arm isolates and why chat-no-think alone vs. the existing 'raw' cache is confounded):
+
+    python tests/gsm8k_full_run.py --num-examples 32 --stop-strings --prompt-format raw
+    python tests/gsm8k_full_run.py --num-examples 32 --stop-strings --prompt-format chat-think
+    python tests/gsm8k_full_run.py --num-examples 32 --stop-strings --prompt-format chat-no-think
+
+The 'raw' arm's baseline (full_results_n32_mt706_stop.jsonl) already has 9/32
+fallback_last_number: idx 15, 275, 479, 608, 906, 945, 1005, 1122, 1132. Of those, 8 (all
+but 608) computed the correct answer somewhere in the trace but got truncated before
+restating it in "The answer is N" form; 608 never converged on an interpretation at all
+(genuine non-convergence, not a formatting problem) -- see that investigation's findings
+for the full traces.
+
+Reading on fallback_last_number count, for chat-no-think specifically:
+  - ~1 (608 survives, the other 8 recover): consistent with the thinking-prefix hypothesis.
+    Expected result if enable_thinking=False is the mechanism.
+  - 0: mildly suspicious -- check whether 608 got a wrong answer via fallback rather than a
+    recovered correct one (i.e. still fails, just no longer LOOKS like a formatting failure).
+    Don't read 0 as strictly better than ~1 without checking the accuracy field.
+  - 5+: thinking-prefix is not the dominant mechanism -- fall back to the trace-aware
+    extractor route instead of trusting this prompt-format change.
+
+chat-think (thinking wrapped but not suppressed) exists specifically to catch a confound:
+if chat-think ALSO drops fallback_last_number relative to 'raw', the fix is "move to a chat
+turn" broadly, not "disable thinking" specifically, and the eventual write-up must not claim
+the narrower mechanism.
+
+Necessary but not sufficient: fallback_last_number dropping does not by itself mean the fix
+worked. Track exact-match accuracy (correct: true/false in each record) for all three arms,
+not just extraction_method counts -- suppressing the thinking trace recovers formatting but
+could cost reasoning quality (the meta-planning ritual was wasteful, but the arithmetic
+inside it was already correct in 8/9 of the 'raw' arm's fallback cases). A fallback-count
+drop paired with flat-or-lower accuracy vs. 'raw' is a red flag, not a win, and should be
+reported as such rather than as a fix.
 """
 import argparse
 import json
@@ -70,7 +107,7 @@ if _WS_NAME != "nanovllm" and "nanovllm" not in sys.modules:
     sys.modules["nanovllm"] = nanovllm_pkg
 
 sys.path.insert(0, os.path.dirname(__file__))
-from gsm8k_prompt import build_prompt  # noqa: E402
+from gsm8k_prompt import build_prompt, build_chat_messages  # noqa: E402
 from gsm8k_extract import extract_answer_detailed, GSM8K_STOP_PATTERNS  # noqa: E402
 
 CKPT_DIR = os.path.join(ROOT, "qwen35_checkpoint")
@@ -81,7 +118,8 @@ EXPECTED_TOTAL = 1319
 SUBSAMPLE_SEED = 42  # fixed so a given --num-examples always selects the same subset
 
 
-def _results_path(num_examples, enforce_eager: bool, batch_size: int, max_tokens: int, stop_strings: bool) -> str:
+def _results_path(num_examples, enforce_eager: bool, batch_size: int, max_tokens: int, stop_strings: bool,
+                   prompt_format: str = "raw") -> str:
     # Keyed by every setting that affects what generate() actually produces,
     # not just num_examples -- otherwise resuming with a DIFFERENT
     # max_tokens/stop_strings/etc. against the same --num-examples value
@@ -99,6 +137,8 @@ def _results_path(num_examples, enforce_eager: bool, batch_size: int, max_tokens
         suffix += f"_mt{max_tokens}"
     if stop_strings:
         suffix += "_stop"
+    if prompt_format != "raw":
+        suffix += f"_{prompt_format}"
     return os.path.join(CACHE_DIR, f"{base}{suffix}.jsonl")
 
 
@@ -166,10 +206,33 @@ def main():
              "first (extracted value/method must be IDENTICAL to the no-stop-string baseline "
              "for every example that found a marker) before trusting it in a real scored run.",
     )
+    parser.add_argument(
+        "--prompt-format", choices=["raw", "chat-think", "chat-no-think"], default="raw",
+        help="Three-arm design to isolate WHICH of two variables fixes the no-marker-found "
+             "failures -- the thinking prefix, or just moving from raw continuation to a "
+             "chat-wrapped user turn (a chat-vs-raw framing effect would be a different, less "
+             "generalizable fix than 'disable thinking'). Comparing chat-no-think directly "
+             "against the existing 'raw' cache changes BOTH variables at once and cannot "
+             "distinguish them -- run all three at matched --num-examples before attributing "
+             "any recovery to enable_thinking=False specifically. "
+             "'raw' (default): the ALREADY-scored 86.50%% run's format -- build_prompt()'s bare "
+             "'Q: ... A:' text passed straight to generate(), no chat template, no thinking "
+             "control -- the model opens an unprompted <think> block on its own in 27/32 "
+             "examples. "
+             "'chat-think': identical exemplar content via build_chat_messages(), routed through "
+             "apply_chat_template(..., add_generation_prompt=True) with enable_thinking left "
+             "unset (defaults to thinking ON, per the checkpoint's chat_template) -- isolates "
+             "the chat-wrapping variable alone. "
+             "'chat-no-think': same chat wrapping, enable_thinking=False -- forces a pre-closed "
+             "'<think></think>' prefix, isolating thinking-suppression on top of chat-wrapping. "
+             "All UNVALIDATED as of this writing -- see gsm8k_prompt.build_chat_messages()'s "
+             "docstring and the pre-registered predictions in this script's module docstring.",
+    )
     args = parser.parse_args()
 
     results_path = _results_path(
-        args.num_examples, args.enforce_eager, args.batch_size, args.max_tokens, args.stop_strings
+        args.num_examples, args.enforce_eager, args.batch_size, args.max_tokens, args.stop_strings,
+        args.prompt_format,
     )
     os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -204,6 +267,16 @@ def main():
             f"batch_size={args.batch_size}, max_tokens={args.max_tokens} -- make sure these were "
             f"validated with gsm8k_decode_contamination_check.py before trusting this run's score."
         )
+    if args.prompt_format != "raw":
+        print(
+            f"NON-DEFAULT PROMPT FORMAT IN USE: --prompt-format {args.prompt_format} -- this has "
+            f"never been scored against the real checkpoint. This is one arm of a 3-way "
+            f"raw / chat-think / chat-no-think comparison -- run all three at matched "
+            f"--num-examples before attributing any fallback_last_number change to "
+            f"enable_thinking specifically, and check exact-match accuracy, not just "
+            f"extraction_method counts (a fallback drop with flat-or-lower accuracy is a "
+            f"red flag, not a win)."
+        )
     if args.stop_strings:
         print(
             "STOP-STRINGS ENABLED -- make sure gsm8k_answer_position_check.py --stop-strings "
@@ -233,7 +306,24 @@ def main():
         for b in range(n_batches):
             batch_indices = remaining_indices[b * args.batch_size:(b + 1) * args.batch_size]
             batch_examples = [ds[i] for i in batch_indices]
-            prompts = [build_prompt(ex["question"]) for ex in batch_examples]
+            if args.prompt_format == "chat-no-think":
+                prompts = [
+                    llm.tokenizer.apply_chat_template(
+                        build_chat_messages(ex["question"]),
+                        tokenize=True, add_generation_prompt=True, enable_thinking=False,
+                    )
+                    for ex in batch_examples
+                ]
+            elif args.prompt_format == "chat-think":
+                prompts = [
+                    llm.tokenizer.apply_chat_template(
+                        build_chat_messages(ex["question"]),
+                        tokenize=True, add_generation_prompt=True,
+                    )
+                    for ex in batch_examples
+                ]
+            else:
+                prompts = [build_prompt(ex["question"]) for ex in batch_examples]
 
             t0 = perf_counter()
             try:
