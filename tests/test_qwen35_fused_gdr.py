@@ -17,9 +17,23 @@ Compares, at multiple sequence lengths and in the packed multi-segment
      compares against the reference DIRECTLY as well, rather than relying
      solely on that transitivity, per the task's correctness requirements.
 
-Uses the SAME cosine-similarity thresholds already established in
-tests/test_qwen35_standalone.py (0.99 for the vs-reference / cross-path
-comparison) -- see that file's test_linear_attention_vs_reference.
+Threshold: cosine > 0.999, with a HARD (exact, not fractional) argmax/top-1
+match assertion alongside it in every sub-case below. Sourced from
+tests/test_qwen35_standalone.py:496 (test_reference_incremental -- the
+file's own "Phase 1" single-forward-pass self-consistency test: same
+weights, same input, only the call pattern differs) via
+`assert cos > 0.999`, corroborated by the GDR-specific analog at
+tests/test_qwen35_standalone.py:402-403 (test_linear_attention_incremental,
+`assert cos_last > 0.999` / `assert cos_state > 0.999` -- same value).
+
+NOT 0.99: that number is test_qwen35_standalone.py's threshold for
+solo-vs-co-batched comparisons, calibrated to absorb genuine bf16
+reduction-order noise from different batch compositions (documented as low
+as 0.992 with zero bugs present). This file's comparisons are same single
+sequence, same batch composition, same weights -- only the GDR recurrence
+implementation differs (sequential Python loop vs. fla's chunked kernel) --
+so there is no batch-composition noise source here, and the tighter
+same-implementation bar applies instead.
 
 Requires flash-linear-attention ('fla') installed and a CUDA GPU (the
 kernel is Triton-based). Skips with a clear message if unavailable --
@@ -115,19 +129,21 @@ def test_single_segment(device, T, config=None):
     cos_vs_off = cosine_sim(y_on, y_off)
     cos_state_vs_off = cosine_sim(s_on, s_off)
     cos_vs_ref = cosine_sim(y_on, y_ref)
-    argmax_match = (
-        y_on.float().argmax(dim=-1) == y_off.float().argmax(dim=-1)
-    ).float().mean().item()
+    argmax_off = y_off.float().argmax(dim=-1)
+    argmax_on = y_on.float().argmax(dim=-1)
+    argmax_mismatches = (argmax_on != argmax_off).sum().item()
 
     print(f"  fused vs sequential  output cosine: {cos_vs_off:.6f}")
     print(f"  fused vs sequential  state  cosine: {cos_state_vs_off:.6f}")
     print(f"  fused vs reference   output cosine: {cos_vs_ref:.6f}")
-    print(f"  fused vs sequential  argmax match:  {argmax_match:.4f}")
+    print(f"  fused vs sequential  argmax mismatches: {argmax_mismatches}/{T}")
 
-    assert cos_vs_off > 0.99, f"fused vs sequential output mismatch: {cos_vs_off}"
-    assert cos_state_vs_off > 0.99, f"fused vs sequential state mismatch: {cos_state_vs_off}"
-    assert cos_vs_ref > 0.99, f"fused vs reference output mismatch: {cos_vs_ref}"
-    assert argmax_match > 0.99, f"fused vs sequential argmax mismatch: {argmax_match}"
+    assert cos_vs_off > 0.999, f"fused vs sequential output mismatch: {cos_vs_off}"
+    assert cos_state_vs_off > 0.999, f"fused vs sequential state mismatch: {cos_state_vs_off}"
+    assert cos_vs_ref > 0.999, f"fused vs reference output mismatch: {cos_vs_ref}"
+    assert torch.equal(argmax_on, argmax_off), (
+        f"fused vs sequential argmax mismatch on {argmax_mismatches}/{T} tokens"
+    )
     print("  [PASS]")
 
 
@@ -155,17 +171,19 @@ def test_packed_multi_segment(device, seg_lens=(37, 129, 5), config=None):
 
     cos_y = cosine_sim(y_on, y_off)
     cos_s = cosine_sim(s_on, s_off)
-    argmax_match = (
-        y_on.float().argmax(dim=-1) == y_off.float().argmax(dim=-1)
-    ).float().mean().item()
+    argmax_off = y_off.float().argmax(dim=-1)
+    argmax_on = y_on.float().argmax(dim=-1)
+    argmax_mismatches = (argmax_on != argmax_off).sum().item()
 
     print(f"  output cosine: {cos_y:.6f}")
     print(f"  state  cosine: {cos_s:.6f}")
-    print(f"  argmax match:  {argmax_match:.4f}")
+    print(f"  argmax mismatches: {argmax_mismatches}/{N}")
 
-    assert cos_y > 0.99, f"packed output mismatch: {cos_y}"
-    assert cos_s > 0.99, f"packed state mismatch: {cos_s}"
-    assert argmax_match > 0.99, f"packed argmax mismatch: {argmax_match}"
+    assert cos_y > 0.999, f"packed output mismatch: {cos_y}"
+    assert cos_s > 0.999, f"packed state mismatch: {cos_s}"
+    assert torch.equal(argmax_on, argmax_off), (
+        f"packed argmax mismatch on {argmax_mismatches}/{N} tokens"
+    )
 
     # Also check EACH segment in isolation reproduces the same slice of the
     # packed fused output -- catches cross-segment leakage specifically.
@@ -176,7 +194,7 @@ def test_packed_multi_segment(device, seg_lens=(37, 129, 5), config=None):
         y_solo, _, _ = _run_packed(la_on, x[start:end], cu_solo)
         cos_solo = cosine_sim(y_solo, y_on[start:end])
         print(f"  segment {i} (len={L}) solo-vs-packed cosine: {cos_solo:.6f}")
-        assert cos_solo > 0.99, f"segment {i} solo-vs-packed mismatch: {cos_solo}"
+        assert cos_solo > 0.999, f"segment {i} solo-vs-packed mismatch: {cos_solo}"
         start = end
 
     print("  [PASS]")

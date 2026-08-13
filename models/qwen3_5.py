@@ -493,47 +493,95 @@ class Qwen35LinearAttention(nn.Module):
         with one call to flash-linear-attention's chunked gated-delta-rule
         kernel across the whole packed prefill batch.
 
-        UNVERIFIED against an installed fla / a CUDA GPU in this environment
-        (see investigation report) -- the shapes/dtypes below follow
-        fla.ops.gated_delta_rule.chunk_gated_delta_rule's documented varlen
-        (cu_seqlens) contract as of the version this was written against.
-        Confirm the kwarg names and the accumulation dtype against whatever
-        fla version actually gets installed before trusting this on real
-        weights -- see the deliverable's precision-risk note.
+        Verified against fla==0.5.2's actual installed source
+        (.venv/Lib/site-packages/fla/ops/gated_delta_rule/chunk.py) -- NOT
+        via inspect.signature (blocked: fla.ops requires `triton`, which has
+        no Windows wheel at all, confirmed by a failed `pip install triton`
+        on this machine) but by reading chunk_gated_delta_rule's actual
+        def/docstring directly. Three corrections vs. the original
+        recollection-based draft, in order of severity:
+
+        1. (correctness bug, would NOT have been caught by the cosine/argmax
+           test) `scale` was never passed, so it defaulted to
+           `k.shape[-1] ** -0.5` = lhd**-0.5 *inside* the kernel -- but q
+           passed in is ALREADY pre-scaled by lhd**-0.5 upstream (same
+           convention as the sequential path). That's scale applied twice:
+           output would come out uniformly scaled by lhd**-1 instead of
+           lhd**-0.5. Because q's scale only ever affects the final
+           `S @ q_t` readout (never the state-update recurrence itself),
+           this multiplies every element of this layer's y by the same
+           positive constant -- and Qwen35RMSNormGated (self.norm below)
+           divides by the RMS of its input per token, which exactly cancels
+           a uniform positive multiplicative factor. So this bug would have
+           produced ~1.0 cosine similarity AND identical argmax against the
+           sequential path while being numerically wrong -- exactly the
+           "passes small-context comparison, silently wrong" failure mode
+           the original task warned about for GDR/MoE. Fixed by passing
+           `scale=1.0` explicitly (q already carries the scale).
+        2. `cu_seqlens` must be `torch.LongTensor` (int64) per the function's
+           own type hint and its docstring's example
+           (`q.new_tensor([...], dtype=torch.long)`) -- was being cast to
+           int32 here (that's FlashAttention's convention, not fla's;
+           wrong library's convention carried over). Fixed.
+        3. (lower-confidence, no GPU here to confirm empirically) the
+           docstring's only shown calling convention has q/k/v/g/beta/
+           initial_state all in bf16, with fp32 accumulation happening
+           internally in the chunked kernel regardless of I/O dtype --
+           standard practice for this class of fused kernel, same as
+           flash-attention. This codebase's upstream prep casts everything
+           to float32 (matching the sequential scan's own accumulation
+           discipline). Now casting down to `dt` (bf16) immediately before
+           the call, then upcasting the returned final_state back to
+           float32 before storing into new_states, to preserve the
+           existing state-buffer dtype contract the rest of this class
+           (and StateManager) relies on. Flag this one for empirical
+           confirmation once run on real GPU hardware -- unlike (1) and
+           (2) above, this isn't proven by the source, only by the
+           docstring's sole example.
 
         Inputs are the SAME per-segment, post-conv, post-repeat_interleave,
-        post-L2-norm, float32 tensors the sequential path already computes
-        (q pre-scaled by lhd**-0.5, matching the manual loop exactly) --
-        this function only replaces the recurrence itself, not the
+        post-L2-norm tensors the sequential path already computes (q
+        pre-scaled by lhd**-0.5, matching the manual loop exactly) -- this
+        function only replaces the recurrence itself, not the
         projections/conv/normalization around it.
         """
         # (1, T_i, LVH, LHD)/(1, T_i, LVH) per segment -> (1, N, LVH, LHD)/(1, N, LVH)
-        q = torch.cat(q_list, dim=1)
-        k = torch.cat(k_list, dim=1)
-        v = torch.cat(v_list, dim=1)
-        g = torch.cat(g_list, dim=1)
-        beta = torch.cat(beta_list, dim=1)
+        # Cast fp32 prep tensors down to model dtype -- see point 3 above.
+        q = torch.cat(q_list, dim=1).to(dt)
+        k = torch.cat(k_list, dim=1).to(dt)
+        v = torch.cat(v_list, dim=1).to(dt)
+        g = torch.cat(g_list, dim=1).to(dt)
+        beta = torch.cat(beta_list, dim=1).to(dt)
         # (1, LVH, LHD, LHD) per segment -> (num_segments, LVH, LHD, LHD)
-        initial_state = torch.cat(S0_list, dim=0)
+        initial_state = torch.cat(S0_list, dim=0).to(dt)
 
-        cu = cu_seqlens.to(dtype=torch.int32, device=q.device)
+        # fla's own type hint (`cu_seqlens: torch.LongTensor`) and its
+        # docstring example both use int64 -- NOT int32 (that's
+        # FlashAttention's convention). See point 2 above.
+        cu = cu_seqlens.to(dtype=torch.int64, device=q.device)
 
-        # NOTE: use_qk_l2norm_in_kernel deliberately left False -- q/k are
-        # already L2-normalized (and q pre-scaled by lhd**-0.5) above,
-        # exactly like the sequential path. Do not also ask the kernel to
-        # normalize, or q/k get normalized+scaled twice.
+        # use_qk_l2norm_in_kernel deliberately left False -- q/k are already
+        # L2-normalized above, exactly like the sequential path. Do not also
+        # ask the kernel to normalize, or k gets normalized twice.
+        #
+        # scale=1.0 explicitly -- q already carries the lhd**-0.5 scale from
+        # upstream; letting the kernel apply its own default
+        # (k.shape[-1]**-0.5) on top would double-scale. See point 1 above.
         o, final_state = self._fla_chunk_gated_delta_rule(
             q=q, k=k, v=v, g=g, beta=beta,
+            scale=1.0,
             initial_state=initial_state,
             output_final_state=True,
             cu_seqlens=cu,
             use_qk_l2norm_in_kernel=False,
         )
-        # o: (1, N, LVH, LHD) float32/model-dtype depending on fla version;
-        # final_state: (num_segments, LVH, LHD, LHD)
+        # o: (1, N, LVH, LHD) in model dtype (fla returns o.to(q.dtype));
+        # final_state: (num_segments, LVH, LHD, LHD) in model dtype --
+        # upcast to float32 to match the sequential path's state-buffer
+        # dtype contract (see point 3 above).
 
         o = o.to(dt).squeeze(0)  # (N, LVH, LHD)
-        new_states = [final_state[i].detach() for i in range(final_state.shape[0])]
+        new_states = [final_state[i].float().detach() for i in range(final_state.shape[0])]
 
         y_chunks = []
         for i in range(len(seg_z_list)):
