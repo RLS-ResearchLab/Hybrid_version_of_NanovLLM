@@ -38,6 +38,8 @@ import os
 import sys
 import types
 
+import torch
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _PARENT = os.path.dirname(ROOT)
 if _PARENT not in sys.path:
@@ -55,6 +57,46 @@ from gsm8k_extract import extract_answer_detailed  # noqa: E402
 
 CKPT_DIR = os.path.join(ROOT, "tests", "fake_qwen35_small")
 CACHE_DIR = os.path.join(ROOT, "tests", "_gsm8k_cache")
+
+_DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+
+
+class AttrDict(dict):
+    def __getattr__(self, k):
+        try:
+            return self[k]
+        except KeyError:
+            raise AttributeError(k)
+
+    def __setattr__(self, k, v):
+        self[k] = v
+
+
+def _fake_from_pretrained(path, *args, **kwargs):
+    """Same shim as bench_throughput.py's build_engine. Confirmed root
+    cause (checked directly, not guessed): transformers==5.14.1 actually
+    HAS "qwen3_5_moe" registered now (Qwen3_5MoeConfig) and correctly
+    reads our flat config.json's num_hidden_layers=8 onto the top-level
+    object. But that config class nests a `text_config` sub-object with
+    its OWN independent defaults -- including a real 40-layer,
+    3-GDR+1-full-attention `layer_types` list (transformers ships the
+    actual Qwen3.5-35B-A3B shape as ITS default now). Our fake
+    config.json never overrides text_config, so it keeps that 40-entry
+    default. config.py's own __post_init__ flattening (written generally
+    to support VLM checkpoints that nest fields under text_config) then
+    copies text_config.layer_types onto the top-level object because the
+    top-level one is None -- landing a 40-element list next to
+    num_hidden_layers=8, which is exactly what crashed
+    _get_layer_types's `assert len(layers_block_type) == num_layers`.
+    Bypassing AutoConfig entirely and reading config.json as a flat dict
+    (no text_config, no derived defaults) sidesteps this -- same fix
+    bench_throughput.py already uses successfully against this exact
+    fake checkpoint, reused here rather than reinvented."""
+    with open(os.path.join(path, "config.json")) as f:
+        d = json.load(f)
+    d = AttrDict(d)
+    d.dtype = _DTYPE_MAP[d.pop("torch_dtype")]
+    return d
 
 MAX_MODEL_LEN = 2048
 MAX_TOKENS = 64  # short on purpose -- consistency check, not a real eval; enough
@@ -79,6 +121,9 @@ def main():
     results_path = os.path.join(CACHE_DIR, f"fused_gdr_check_{tag}.jsonl")
     if os.path.exists(results_path):
         os.remove(results_path)
+
+    import nanovllm.config as config_mod
+    config_mod.AutoConfig.from_pretrained = staticmethod(_fake_from_pretrained)
 
     from datasets import load_dataset
     from nanovllm.llm import LLM
