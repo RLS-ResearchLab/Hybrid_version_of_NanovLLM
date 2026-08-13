@@ -107,6 +107,7 @@ def build_engine(args):
         gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
+        use_fused_gdr_kernel=args.use_fused_gdr_kernel,
     )
 
 
@@ -171,6 +172,15 @@ def main():
         "--cuda-graphs", dest="enforce_eager", action="store_false",
         help="Use CUDA-graph decode instead of eager mode.",
     )
+    p.add_argument(
+        "--use-fused-gdr-kernel", dest="use_fused_gdr_kernel", action="store_true", default=False,
+        help="QLLM Stage 2: use flash-linear-attention's chunked kernel for GDR "
+             "prefill instead of the sequential scan (models/qwen3_5.py, "
+             "Qwen35LinearAttention). Default off -- matches the existing "
+             "behavior for every caller that doesn't pass this flag. See "
+             "tests/test_qwen35_fused_gdr.py for the correctness validation "
+             "this should only be trusted after passing.",
+    )
     p.add_argument("--trials", type=int, default=5, help="Timed trials per concurrency level.")
     p.add_argument(
         "--warmup-trials", type=int, default=2,
@@ -202,7 +212,7 @@ def main():
     engine = build_engine(args)
 
     fieldnames = [
-        "timestamp", "model", "enforce_eager", "tensor_parallel_size",
+        "timestamp", "model", "enforce_eager", "use_fused_gdr_kernel", "tensor_parallel_size",
         "gpu_memory_utilization", "max_model_len", "prompt_len", "output_len",
         "concurrency", "trial_index", "batch_composition_json",
         "total_output_tokens", "wall_s", "tok_s",
@@ -241,6 +251,7 @@ def main():
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     "model": args.model,
                     "enforce_eager": args.enforce_eager,
+                    "use_fused_gdr_kernel": args.use_fused_gdr_kernel,
                     "tensor_parallel_size": args.tensor_parallel_size,
                     "gpu_memory_utilization": args.gpu_memory_utilization,
                     "max_model_len": args.max_model_len,
