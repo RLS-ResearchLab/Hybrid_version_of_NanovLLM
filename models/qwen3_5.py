@@ -498,7 +498,8 @@ class Qwen35LinearAttention(nn.Module):
         via inspect.signature (blocked: fla.ops requires `triton`, which has
         no Windows wheel at all, confirmed by a failed `pip install triton`
         on this machine) but by reading chunk_gated_delta_rule's actual
-        def/docstring directly. Three corrections vs. the original
+        def/docstring directly, plus reading the cumsum and output kernels
+        it calls to settle a dtype question. Four points vs. the original
         recollection-based draft, in order of severity:
 
         1. (correctness bug, would NOT have been caught by the cosine/argmax
@@ -523,21 +524,47 @@ class Qwen35LinearAttention(nn.Module):
            (`q.new_tensor([...], dtype=torch.long)`) -- was being cast to
            int32 here (that's FlashAttention's convention, not fla's;
            wrong library's convention carried over). Fixed.
-        3. (lower-confidence, no GPU here to confirm empirically) the
-           docstring's only shown calling convention has q/k/v/g/beta/
-           initial_state all in bf16, with fp32 accumulation happening
-           internally in the chunked kernel regardless of I/O dtype --
-           standard practice for this class of fused kernel, same as
-           flash-attention. This codebase's upstream prep casts everything
-           to float32 (matching the sequential scan's own accumulation
-           discipline). Now casting down to `dt` (bf16) immediately before
-           the call, then upcasting the returned final_state back to
-           float32 before storing into new_states, to preserve the
-           existing state-buffer dtype contract the rest of this class
-           (and StateManager) relies on. Flag this one for empirical
-           confirmation once run on real GPU hardware -- unlike (1) and
-           (2) above, this isn't proven by the source, only by the
-           docstring's sole example.
+        3. q/k/v/beta/initial_state cast down to `dt` (bf16) immediately
+           before the call -- matching the docstring's only shown calling
+           convention -- then the returned final_state is upcast back to
+           float32 before storing into new_states, to preserve the existing
+           state-buffer dtype contract the rest of this class (and
+           StateManager) relies on.
+        4. `g` (log-decay) is deliberately KEPT in float32, NOT cast down
+           with the rest -- this preserves the original stated design
+           (matching the sequential scan's float32-accumulation discipline
+           for exactly this quantity) rather than quietly abandoning it,
+           and it is empirically justified, not a guess: the kernel does
+           NOT require uniform dtype across its tensor arguments.
+             - `chunk_gated_delta_rule_fwd` (chunk.py:62-69) runs `g`
+               through `chunk_local_cumsum`, whose `output_dtype` parameter
+               DEFAULTS to `torch.float` (fla/ops/utils/cumsum.py:453) --
+               i.e. the library's own default is to upcast g's cumulative
+               sum to fp32 internally regardless of what dtype g arrives
+               as. Feeding fp32 g in loses nothing there and matches what
+               the kernel does by default anyway.
+             - `chunk_fwd_kernel_o` (fla/ops/common/chunk_o.py:43-140), the
+               Triton kernel that combines g with q/k/v/h to produce the
+               output, loads each tensor through its OWN independent
+               pointer (`b_q = tl.load(p_q, ...)`, `b_g = tl.load(p_g,
+               ...)`, etc. -- chunk_o.py:106-122) with no dtype-equality
+               check between them, and accumulates in a hard-coded
+               `tl.float32` buffer (`b_o = tl.zeros([BT, BV],
+               dtype=tl.float32)`, chunk_o.py:88) regardless of input
+               dtypes. Mixed dtype across q/k/v/g is therefore a supported
+               pattern at the kernel level, not an unverified assumption.
+           Residual caveat: this traces the cumsum stage and the final
+           output-combination kernel specifically (the two places g is
+           actually consumed on the path this call takes with
+           use_gate_in_kernel=False); it does not exhaustively trace every
+           internal kernel fla ships. Should still be empirically
+           re-confirmed on real GPU hardware -- see the test file's
+           dedicated g-dtype sensitivity check at T=1024, which forces a
+           bf16-g fused call as a diagnostic comparison specifically
+           because compounding decay error is most visible at longer T
+           (this project's own precedent: Phase 6's short-prompt tests
+           passed while longer-generation tests exposed real problems, so
+           a T=8-only check here would not be trustworthy evidence).
 
         Inputs are the SAME per-segment, post-conv, post-repeat_interleave,
         post-L2-norm tensors the sequential path already computes (q
@@ -546,11 +573,12 @@ class Qwen35LinearAttention(nn.Module):
         projections/conv/normalization around it.
         """
         # (1, T_i, LVH, LHD)/(1, T_i, LVH) per segment -> (1, N, LVH, LHD)/(1, N, LVH)
-        # Cast fp32 prep tensors down to model dtype -- see point 3 above.
+        # q/k/v/beta cast down to model dtype -- see point 3 above.
+        # g deliberately kept float32 -- see point 4 above; do not cast it.
         q = torch.cat(q_list, dim=1).to(dt)
         k = torch.cat(k_list, dim=1).to(dt)
         v = torch.cat(v_list, dim=1).to(dt)
-        g = torch.cat(g_list, dim=1).to(dt)
+        g = torch.cat(g_list, dim=1)
         beta = torch.cat(beta_list, dim=1).to(dt)
         # (1, LVH, LHD, LHD) per segment -> (num_segments, LVH, LHD, LHD)
         initial_state = torch.cat(S0_list, dim=0).to(dt)

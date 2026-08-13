@@ -200,6 +200,94 @@ def test_packed_multi_segment(device, seg_lens=(37, 129, 5), config=None):
     print("  [PASS]")
 
 
+def test_g_dtype_sensitivity(device, config=None, T_values=(8, 1024)):
+    """Probes the design decision documented in Qwen35LinearAttention.
+    _fused_gdr_scan (models/qwen3_5.py): g (log-decay) is deliberately kept
+    float32 into the fla kernel while q/k/v/beta/initial_state go to bf16,
+    justified by reading fla's chunk_local_cumsum (defaults to fp32 output
+    regardless of input dtype) and chunk_fwd_kernel_o (loads each tensor via
+    an independent pointer, accumulates in fp32 regardless of input dtype)
+    directly from the installed source -- not empirically confirmed on GPU
+    since this was written on a CPU-only machine.
+
+    This test forces the counterfactual (g downcast to bf16 right before the
+    kernel call, via a wrapper around the instance's stored kernel
+    reference -- production code / _fused_gdr_scan itself is untouched) and
+    compares both variants against the sequential (flag-off) path at SHORT
+    (T=8) and LONG (T=1024) sequence length.
+
+    Why both lengths matter: decay compounds multiplicatively over the
+    sequence, so any precision cost from downcasting g would show up as
+    progressive degradation with T, not as a fixed offset -- a T=8-only
+    check could not distinguish "g dtype doesn't matter" from "g dtype
+    matters but 8 tokens isn't enough compounding to reveal it." This
+    project has direct precedent for exactly that trap: Phase 6's
+    short-prompt tests passed while later longer-generation tests exposed
+    real problems that hadn't been visible at short T.
+
+    Does not assert a fixed threshold on the bf16-g variant (it may or may
+    not degrade -- that's the open question this test exists to answer).
+    Asserts only that the SHIPPED fp32-g variant does not get WORSE, in
+    cosine-vs-sequential terms, than the bf16-g counterfactual at either
+    length -- i.e. that keeping g in fp32 is not actively harmful and the
+    published rationale for choosing it is empirically consistent with
+    what's actually run once GPU hardware is available.
+    """
+    print("\n" + "=" * 70)
+    print("g-dtype sensitivity: fp32 g (shipped) vs bf16 g (forced counterfactual)")
+    print("=" * 70)
+    config = config or make_small_config()
+
+    results = {}
+    for T in T_values:
+        la_off, la_on_fp32g, _ = _build_pair(config, device)
+
+        # Second instance, identical weights, with g forced to bf16 right
+        # before the kernel call -- via a wrapper around the stored kernel
+        # reference, NOT by editing _fused_gdr_scan. Isolates exactly the
+        # g-dtype variable; everything else (scale=1.0, int64 cu_seqlens,
+        # bf16 q/k/v/beta) stays identical to the shipped path.
+        _, la_on_bf16g, _ = _build_pair(config, device)
+        real_kernel = la_on_bf16g._fla_chunk_gated_delta_rule
+
+        def _bf16_g_kernel(*args, **kwargs):
+            kwargs["g"] = kwargs["g"].to(torch.bfloat16)
+            return real_kernel(*args, **kwargs)
+
+        la_on_bf16g._fla_chunk_gated_delta_rule = _bf16_g_kernel
+
+        torch.manual_seed(2024)
+        x = torch.randn(T, config.hidden_size, device=device, dtype=torch.bfloat16)
+        cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device=device)
+
+        y_off, _, _ = _run_packed(la_off, x, cu_seqlens)
+        y_fp32g, _, _ = _run_packed(la_on_fp32g, x, cu_seqlens)
+        y_bf16g, _, _ = _run_packed(la_on_bf16g, x, cu_seqlens)
+
+        cos_fp32g = cosine_sim(y_fp32g, y_off)
+        cos_bf16g = cosine_sim(y_bf16g, y_off)
+        results[T] = (cos_fp32g, cos_bf16g)
+        print(f"  T={T:>5}  fp32-g cosine vs sequential: {cos_fp32g:.6f}   "
+              f"bf16-g cosine vs sequential: {cos_bf16g:.6f}   "
+              f"delta: {cos_fp32g - cos_bf16g:+.6f}")
+
+    for T, (cos_fp32g, cos_bf16g) in results.items():
+        assert cos_fp32g >= cos_bf16g - 1e-4, (
+            f"T={T}: shipped fp32-g variant ({cos_fp32g:.6f}) is WORSE than the "
+            f"bf16-g counterfactual ({cos_bf16g:.6f}) -- the design rationale in "
+            f"_fused_gdr_scan's docstring (point 4) does not hold empirically; "
+            f"revisit that decision before trusting this path."
+        )
+        assert cos_fp32g > 0.999, f"T={T}: shipped fp32-g variant itself regressed: {cos_fp32g:.6f}"
+
+    if len(T_values) >= 2:
+        t_short, t_long = min(T_values), max(T_values)
+        degradation = results[t_short][0] - results[t_long][0]
+        print(f"  fp32-g degradation from T={t_short} to T={t_long}: {degradation:+.6f}")
+
+    print("  [PASS]")
+
+
 def main():
     init_dist()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -217,6 +305,7 @@ def main():
     test_single_segment(device, T=1024, config=config)
     test_packed_multi_segment(device, seg_lens=(37, 129, 5), config=config)
     test_packed_multi_segment(device, seg_lens=(1, 1, 1, 1), config=config)  # decode-shaped: fused must fall back
+    test_g_dtype_sensitivity(device, config=config, T_values=(8, 1024))
     print("\nAll fused-GDR correctness tests passed.")
 
 
