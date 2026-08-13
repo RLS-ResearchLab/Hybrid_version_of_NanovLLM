@@ -13,6 +13,7 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     use_fused_gdr_kernel: bool = False
+    use_vectorized_moe: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -53,3 +54,4 @@ class Config:
         # from hf_config, not this Config object -- see Qwen35DecoderLayer's
         # getattr(config, "use_fused_gdr_kernel", False) read.
         self.hf_config.use_fused_gdr_kernel = self.use_fused_gdr_kernel
+        self.hf_config.use_vectorized_moe = self.use_vectorized_moe

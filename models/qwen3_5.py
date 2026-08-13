@@ -696,11 +696,25 @@ class Qwen35MoE(nn.Module):
         shared_intermediate_size: int,
         num_experts: int,
         top_k: int,
+        use_vectorized_moe: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.top_k = top_k
+
+        # QLLM Stage 2 intervention: replace _forward_dispatch's per-expert
+        # Python loop with two torch._grouped_mm calls (grouped/batched GEMM)
+        # for the non-EP prefill path. Default False so nothing changes
+        # unless explicitly opted in; _forward_dispatch remains fully intact
+        # as the flag-off path and as ground truth for correctness
+        # comparisons. Scoped to ep_size==1 ONLY -- see forward()'s branch
+        # and the investigation report for why _forward_dispatch_ep (the
+        # EP prefill loop) is deliberately NOT touched here: extending
+        # grouped_mm to the round-robin local-expert-slot indexing +
+        # all_reduce combine there needs its own careful pass, flagged
+        # rather than guessed at.
+        self.use_vectorized_moe = use_vectorized_moe
 
         # ep_size==1 (the default/existing single-process and non-EP-TP case)
         # must allocate identically to before: Experts(num_experts, ...), same
@@ -724,6 +738,8 @@ class Qwen35MoE(nn.Module):
             return self._forward_gathered(x)
         if self.ep_size > 1:
             return self._forward_dispatch_ep(x)
+        if self.use_vectorized_moe:
+            return self._forward_dispatch_vectorized(x)
         return self._forward_dispatch(x)
  
     def _forward_gathered(self, x: torch.Tensor) -> torch.Tensor:
@@ -920,6 +936,120 @@ class Qwen35MoE(nn.Module):
         out = out + sg * self.shared_expert(xf)
         return out.view(original_shape)
 
+    def _forward_dispatch_vectorized(self, x: torch.Tensor) -> torch.Tensor:
+        """QLLM Stage 2: same routing/sort/combine as _forward_dispatch, but
+        the per-expert Python loop (one matmul per expert) is replaced by
+        two torch._grouped_mm calls -- one grouped GEMM for gate_up_proj,
+        one for down_proj, batching every active expert's computation into
+        a single call each instead of looping.
+
+        Every detail below was verified empirically against the actual
+        installed torch build (torch._grouped_mm has no docstring; the
+        schema and behavior were probed directly with synthetic tensors,
+        not assumed from general knowledge of similar APIs) before writing
+        this, per the investigation report:
+
+        - Real schema (confirmed via torch.ops.aten._grouped_mm.default
+          ._schema): `_grouped_mm(self, mat2, offs=None, bias=None,
+          out_dtype=None)`.
+        - `offs` convention (confirmed via value-level probe with
+          distinguishable per-group scale factors, not just shape checks):
+          CUMULATIVE END-of-group counts across ALL groups in mat2's batch
+          dim -- i.e. `expert_counts.cumsum(0)`, NOT the exclusive-START
+          `expert_offsets` _forward_dispatch computes for its own loop.
+          Must be int32 -- int64 raises a clear "Offsets have to be int32"
+          error (fails loudly, not silently), so offs is cast explicitly
+          below.
+        - `mat2` layout requirement (confirmed via value-level probe):
+          `(num_groups, in_features, out_features)` -- the TRANSPOSE of how
+          Experts.gate_up_proj/down_proj are actually stored
+          ((E, out_features, in_features), matching nn.Linear's convention).
+          Confirmed via utils/loader.py's shard_experts_tensor /
+          load_model: checkpoints are read directly into this (E, out, in)
+          layout with no transpose anywhere in the loading path, so this is
+          the checkpoint-native layout, not just this file's convention --
+          changing the STORED layout would mean touching weight loading.
+          Instead, .transpose(-1, -2) is applied at call time -- confirmed
+          empirically that torch._grouped_mm accepts this non-contiguous
+          transposed VIEW directly at realistic MoE dims (hidden=256,
+          intermediate=512 in the probe) with no .contiguous() copy needed
+          (contiguous copies were only required in a small K=N=4/16 probe,
+          which hit an unrelated small-tensor alignment constraint --
+          "strides should be multiple of 16 bytes" -- not a general
+          transposed-view limitation).
+        - Zero-token experts (an expert selected by no token in this batch)
+          are handled correctly: confirmed via a value-level probe with an
+          explicit zero-width group (offs[i] == offs[i-1]) sitting between
+          two nonzero groups with very different weight scales -- the
+          zero-width expert's weights were correctly never touched.
+
+        Precision: the fp32-promoted combine step below is copied VERBATIM
+        in placement from _forward_dispatch's (see that method's comment for
+        the full measured justification -- ~1.3% relative error before this
+        promotion was added, exactly zero after, for top_k=8 bf16 inputs).
+        Both expert matmuls (gate_up_proj and down_proj) stay in x.dtype
+        (bf16), matching _forward_dispatch's per-expert `h = ... ; h = h @
+        down_proj[e].t()` exactly -- promotion to fp32 happens ONLY at the
+        weighted-combine step, same as before. Deliberately NOT using
+        _grouped_mm's own `out_dtype` parameter to request fp32 output
+        directly from the second grouped_mm call: that would skip the
+        bf16-rounding step _forward_dispatch's reference behavior actually
+        has (compute in bf16, round to bf16, THEN promote to fp32 for the
+        combine) in favor of a different, more-precise-but-unverified-and-
+        unrequested behavior. Preserving the exact existing behavior here,
+        not quietly improving on it.
+
+        Scoped to ep_size==1 only -- see forward()'s branch and __init__'s
+        comment.
+        """
+        original_shape = x.shape
+        H = self.hidden_size
+        NE = self.num_experts
+        TK = self.top_k
+
+        xf = x.reshape(-1, H)
+        N = xf.shape[0]
+
+        w, idx = torch.topk(self.gate(xf), TK, dim=-1)
+        w = F.softmax(w, dim=-1).to(x.dtype)
+
+        flat_idx = idx.reshape(-1)
+        flat_w = w.reshape(-1)
+        token_rep = xf.unsqueeze(1).expand(N, TK, H).reshape(N * TK, H)
+
+        sort_order = torch.argsort(flat_idx, stable=True)
+        sorted_idx = flat_idx[sort_order]
+        sorted_tokens = token_rep[sort_order]
+        sorted_weights = flat_w[sort_order]
+        expert_counts = torch.zeros(NE, dtype=torch.long, device=x.device)
+        expert_counts.scatter_add_(0, sorted_idx, torch.ones_like(sorted_idx))
+
+        # Cumulative END counts, int32 -- see docstring. Length == NE
+        # (mat2's batch dim), including zero-width entries for untouched
+        # experts -- confirmed handled correctly, see docstring.
+        offs = expert_counts.cumsum(0).to(torch.int32)
+
+        # Transposed VIEWs, not copies -- see docstring.
+        gate_up_t = self.experts.gate_up_proj.transpose(-1, -2)  # (NE, H, 2*MI)
+        down_t = self.experts.down_proj.transpose(-1, -2)        # (NE, MI, H)
+
+        gate_up_out = torch._grouped_mm(sorted_tokens, gate_up_t, offs=offs)  # (N*TK, 2*MI), x.dtype
+        gate, up = gate_up_out.chunk(2, dim=-1)
+        h = F.silu(gate) * up                                                  # (N*TK, MI), x.dtype
+        h = torch._grouped_mm(h, down_t, offs=offs)                            # (N*TK, H), x.dtype
+
+        # fp32-promoted combine -- see docstring, matches _forward_dispatch
+        # exactly.
+        combine_dtype = torch.float32
+        sorted_out = sorted_weights.unsqueeze(-1).to(combine_dtype) * h.to(combine_dtype)
+
+        unsort_order = torch.argsort(sort_order, stable=True)
+        out = sorted_out[unsort_order].reshape(N, TK, H).sum(dim=1).to(x.dtype)
+
+        sg = torch.sigmoid(self.shared_expert_gate(xf))
+        out = out + sg * self.shared_expert(xf)
+        return out.view(original_shape)
+
     def _forward_dispatch_ep(self, x: torch.Tensor) -> torch.Tensor:
         """Expert-parallel prefill forward.
 
@@ -1091,6 +1221,7 @@ class Qwen35DecoderLayer(nn.Module):
             shared_intermediate_size=getattr(config, "shared_expert_intermediate_size", getattr(config, "intermediate_size", None)),
             num_experts=getattr(config, "num_experts", 256),
             top_k=getattr(config, "num_experts_per_tok", 8),
+            use_vectorized_moe=getattr(config, "use_vectorized_moe", False),
         )
 
     def forward(
