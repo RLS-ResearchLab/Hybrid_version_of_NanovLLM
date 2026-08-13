@@ -12,6 +12,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    use_fused_gdr_kernel: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -48,3 +49,7 @@ class Config:
                     setattr(hf_config, key, value)
         self.hf_config = hf_config
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+        # Rides along on hf_config since model_cls() is only ever constructed
+        # from hf_config, not this Config object -- see Qwen35DecoderLayer's
+        # getattr(config, "use_fused_gdr_kernel", False) read.
+        self.hf_config.use_fused_gdr_kernel = self.use_fused_gdr_kernel

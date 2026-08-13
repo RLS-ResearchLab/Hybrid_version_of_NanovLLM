@@ -175,11 +175,33 @@ class Qwen35LinearAttention(nn.Module):
         linear_attn_head_dim: int,   # LHD
         conv_kernel_size: int,       # CK
         rms_norm_eps: float,
+        use_fused_gdr_kernel: bool = False,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
         tp_rank = dist.get_rank()
-       
+
+        # QLLM Stage 2 intervention: replace the O(T) sequential Python scan
+        # below with flash-linear-attention's chunked gated-delta-rule kernel
+        # for prefill (T_i > 1 segments). Decode (T_i == 1) always keeps the
+        # sequential path -- see forward()'s use of is_decode_shape below.
+        # Default False so nothing changes unless explicitly opted in; the
+        # sequential scan remains fully intact as the flag-off path and as
+        # ground truth for correctness comparisons.
+        self.use_fused_gdr_kernel = use_fused_gdr_kernel
+        self._fla_chunk_gated_delta_rule = None
+        if use_fused_gdr_kernel:
+            try:
+                from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+            except ImportError as e:
+                raise ImportError(
+                    "use_fused_gdr_kernel=True requires the 'flash-linear-attention' "
+                    "package (import name 'fla') and a CUDA GPU with Triton support. "
+                    "Install it or leave use_fused_gdr_kernel=False to use the "
+                    "existing sequential GDR scan."
+                ) from e
+            self._fla_chunk_gated_delta_rule = chunk_gated_delta_rule
+
         assert linear_attn_kq_heads % tp_size == 0
         assert linear_attn_v_heads % tp_size == 0
         self.total_lkh = linear_attn_kq_heads
@@ -338,7 +360,19 @@ class Qwen35LinearAttention(nn.Module):
         b = self.in_proj_b(hidden_states)        # (N, LVH)
         qkv = self.in_proj_qkv(hidden_states)    # (N, QKV)
 
+        # Fused kernel is only used for real multi-token prefill segments --
+        # decode (every segment T_i==1) keeps the sequential path unconditionally.
+        # Rationale (see investigation report): at T_i==1 the chunked kernel
+        # degenerates to one step per segment with no chunking benefit, while
+        # still paying a Triton kernel-launch/dispatch cost the plain tensor
+        # ops below don't have -- and decode is the latency-critical path, so
+        # we don't want to risk regressing it while only prefill throughput
+        # was the target of this optimization.
+        use_fused = self.use_fused_gdr_kernel and not is_decode_shape
+
         y_chunks, new_states, new_conv_states = [], [], []
+        fused_q, fused_k, fused_v, fused_g, fused_beta = [], [], [], [], []
+        fused_seg_z, fused_S0 = [], []
 
         for i in range(num_segments):
             if is_decode_shape:
@@ -401,6 +435,21 @@ class Qwen35LinearAttention(nn.Module):
             else:
                 S = seg_state.float()
 
+            new_conv_states.append(seg_new_conv.squeeze(0))
+
+            if use_fused:
+                # Defer the actual recurrence to a single batched kernel call
+                # after this loop -- stash this segment's prepared (post-conv,
+                # post-L2-norm, float32) tensors instead of scanning here.
+                fused_q.append(q)
+                fused_k.append(k)
+                fused_v.append(v)
+                fused_g.append(g)
+                fused_beta.append(beta)
+                fused_seg_z.append(seg_z)
+                fused_S0.append(S)
+                continue
+
             # ── Sequential scan — identical math to before, scoped to this segment ──
             ys = []
             for t in range(T_i):
@@ -425,13 +474,77 @@ class Qwen35LinearAttention(nn.Module):
 
             y_chunks.append(seg_y)
             new_states.append(seg_new_state.squeeze(0))
-            new_conv_states.append(seg_new_conv.squeeze(0))
+
+        if use_fused:
+            y_chunks, new_states = self._fused_gdr_scan(
+                fused_q, fused_k, fused_v, fused_g, fused_beta,
+                fused_seg_z, fused_S0, cu_seqlens, dt, lvh, lhd,
+            )
 
         y = torch.cat(y_chunks, dim=0)               # (N, LVH*LHD)
         new_states = torch.stack(new_states, dim=0)          # (num_segments, LVH, LHD, LHD)
         new_conv_states = torch.stack(new_conv_states, dim=0)  # (num_segments, QKV, CK-1)
 
         return self.out_proj(y), new_states, new_conv_states
+
+    def _fused_gdr_scan(self, q_list, k_list, v_list, g_list, beta_list,
+                         seg_z_list, S0_list, cu_seqlens, dt, lvh, lhd):
+        """QLLM Stage 2: replace the per-segment sequential delta-rule scan
+        with one call to flash-linear-attention's chunked gated-delta-rule
+        kernel across the whole packed prefill batch.
+
+        UNVERIFIED against an installed fla / a CUDA GPU in this environment
+        (see investigation report) -- the shapes/dtypes below follow
+        fla.ops.gated_delta_rule.chunk_gated_delta_rule's documented varlen
+        (cu_seqlens) contract as of the version this was written against.
+        Confirm the kwarg names and the accumulation dtype against whatever
+        fla version actually gets installed before trusting this on real
+        weights -- see the deliverable's precision-risk note.
+
+        Inputs are the SAME per-segment, post-conv, post-repeat_interleave,
+        post-L2-norm, float32 tensors the sequential path already computes
+        (q pre-scaled by lhd**-0.5, matching the manual loop exactly) --
+        this function only replaces the recurrence itself, not the
+        projections/conv/normalization around it.
+        """
+        # (1, T_i, LVH, LHD)/(1, T_i, LVH) per segment -> (1, N, LVH, LHD)/(1, N, LVH)
+        q = torch.cat(q_list, dim=1)
+        k = torch.cat(k_list, dim=1)
+        v = torch.cat(v_list, dim=1)
+        g = torch.cat(g_list, dim=1)
+        beta = torch.cat(beta_list, dim=1)
+        # (1, LVH, LHD, LHD) per segment -> (num_segments, LVH, LHD, LHD)
+        initial_state = torch.cat(S0_list, dim=0)
+
+        cu = cu_seqlens.to(dtype=torch.int32, device=q.device)
+
+        # NOTE: use_qk_l2norm_in_kernel deliberately left False -- q/k are
+        # already L2-normalized (and q pre-scaled by lhd**-0.5) above,
+        # exactly like the sequential path. Do not also ask the kernel to
+        # normalize, or q/k get normalized+scaled twice.
+        o, final_state = self._fla_chunk_gated_delta_rule(
+            q=q, k=k, v=v, g=g, beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu,
+            use_qk_l2norm_in_kernel=False,
+        )
+        # o: (1, N, LVH, LHD) float32/model-dtype depending on fla version;
+        # final_state: (num_segments, LVH, LHD, LHD)
+
+        o = o.to(dt).squeeze(0)  # (N, LVH, LHD)
+        new_states = [final_state[i].detach() for i in range(final_state.shape[0])]
+
+        y_chunks = []
+        for i in range(len(seg_z_list)):
+            start, end = int(cu_seqlens[i]), int(cu_seqlens[i + 1])
+            T_i = end - start
+            seg_y = o[start:end].reshape(T_i * lvh, lhd)
+            seg_z_flat = seg_z_list[i].reshape(T_i * lvh, lhd)
+            seg_y = self.norm(seg_y, seg_z_flat)
+            y_chunks.append(seg_y.reshape(T_i, lvh * lhd))
+
+        return y_chunks, new_states
 
 # ─── MoE FFN ────────────────────────────────────────────────────────────────────
 
@@ -892,6 +1005,7 @@ class Qwen35DecoderLayer(nn.Module):
                     config, "linear_conv_kernel_dim", getattr(config, "conv_kernel_size", 4)
                 ),
                 rms_norm_eps=rms_norm_eps,
+                use_fused_gdr_kernel=getattr(config, "use_fused_gdr_kernel", False),
             )
 
         # MoE FFN
