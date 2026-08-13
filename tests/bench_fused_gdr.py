@@ -18,15 +18,32 @@ Requires flash-linear-attention ('fla') installed and a CUDA GPU. Prints a
 [SKIP] message and exits cleanly if unavailable, same as
 tests/test_qwen35_fused_gdr.py.
 
+--real-dims switches from the small 290M synthetic config (hidden_size=512,
+LKH=8, LVH=16, LHD=64 -- convenient for the correctness tests, which this
+script's default matched for consistency) to the real Qwen3.5-35B-A3B GDR
+dims (hidden_size=2048, LKH=16, LVH=32, LHD=128, per
+src/model_small_qwen3.5.py's own docstring listing both). This matters:
+at the small dims, actual per-token compute is tiny relative to the fixed
+Python/Triton-kernel-launch overhead chunk_gated_delta_rule pays per call
+(it issues several separate Triton kernels internally -- cumsum, intra-
+chunk, recurrent-state, output-combination), so a small-dims run can show
+fused time that's flat across T (dispatch-overhead-dominated) rather than
+scaling with compute -- exactly what the default config's first run showed
+(2.5ms flat from T=128 to T=1024, while sequential scaled ~9x). --real-dims
+uses random-init weights at the real shapes (timing doesn't depend on
+weight values) without needing the actual checkpoint downloaded.
+
 Usage:
     python tests/bench_fused_gdr.py
     python tests/bench_fused_gdr.py --seq-lens 128 512 1024 --trials 10 --warmup-trials 3
+    python tests/bench_fused_gdr.py --real-dims --seq-lens 128 512 1024 --trials 10 --warmup-trials 3
 """
 
 import argparse
 import os
 import sys
 import time
+from types import SimpleNamespace
 
 import torch
 
@@ -38,6 +55,23 @@ try:
     _FLA_AVAILABLE = True
 except ImportError:
     _FLA_AVAILABLE = False
+
+
+def make_real_dims_config():
+    """Real Qwen3.5-35B-A3B GDR dims (src/model_small_qwen3.5.py's docstring:
+    'H 2048 (was 512)', 'LKH 16 (was 8)', 'LVH 32 (was 16)', 'LHD 128
+    (was 64)'). conv_kernel_size (CK=4) is unchanged between small/real per
+    that same docstring. Only the fields build_layer() actually reads are
+    populated -- this is NOT a full model config, just enough to construct
+    a standalone Qwen35LinearAttention at real shapes for timing."""
+    return SimpleNamespace(
+        hidden_size=2048,
+        linear_attn_kq_heads=16,
+        linear_attn_v_heads=32,
+        linear_attn_head_dim=128,
+        conv_kernel_size=4,
+        rms_norm_eps=1e-6,
+    )
 
 
 def build_layer(config, device, use_fused):
@@ -77,6 +111,10 @@ def main():
     ap.add_argument("--seq-lens", type=int, nargs="+", default=[128, 512, 1024])
     ap.add_argument("--trials", type=int, default=10)
     ap.add_argument("--warmup-trials", type=int, default=3)
+    ap.add_argument("--real-dims", action="store_true",
+                     help="Use real Qwen3.5-35B-A3B GDR dims instead of the small "
+                          "290M synthetic config -- see module docstring for why "
+                          "this matters before trusting a speedup number.")
     args = ap.parse_args()
 
     init_dist()
@@ -86,7 +124,10 @@ def main():
         print("  [SKIP] no CUDA GPU available in this environment")
         return
 
-    config = make_small_config()
+    config = make_real_dims_config() if args.real_dims else make_small_config()
+    print(f"  config: hidden_size={config.hidden_size}, "
+          f"LKH={config.linear_attn_kq_heads}, LVH={config.linear_attn_v_heads}, "
+          f"LHD={config.linear_attn_head_dim} ({'real' if args.real_dims else 'small'}-dims)")
     la_off = build_layer(config, device, use_fused=False)
 
     if not _FLA_AVAILABLE:
