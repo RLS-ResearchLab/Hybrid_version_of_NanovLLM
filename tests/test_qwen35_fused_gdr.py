@@ -358,12 +358,38 @@ def main():
         return
 
     config = make_small_config()
-    test_single_segment(device, T=8, config=config)
-    test_single_segment(device, T=512, config=config)
-    test_single_segment(device, T=1024, config=config)
-    test_packed_multi_segment(device, seg_lens=(37, 129, 5), config=config)
-    test_packed_multi_segment(device, seg_lens=(1, 1, 1, 1), config=config)  # decode-shaped: fused must fall back
-    test_g_dtype_sensitivity(device, config=config, T_values=(8, 1024))
+    # Each sub-case runs independently -- one environment-level hiccup (e.g.
+    # a cuDNN library mismatch on conv1d, unrelated to use_fused_gdr_kernel)
+    # must not hide whether the OTHER sub-cases -- especially
+    # test_g_dtype_sensitivity, the least-verified check -- pass or fail.
+    cases = [
+        ("single_segment T=8", lambda: test_single_segment(device, T=8, config=config)),
+        ("single_segment T=512", lambda: test_single_segment(device, T=512, config=config)),
+        ("single_segment T=1024", lambda: test_single_segment(device, T=1024, config=config)),
+        ("packed_multi_segment (37,129,5)",
+         lambda: test_packed_multi_segment(device, seg_lens=(37, 129, 5), config=config)),
+        ("packed_multi_segment (1,1,1,1) decode-shaped",
+         lambda: test_packed_multi_segment(device, seg_lens=(1, 1, 1, 1), config=config)),
+        ("g_dtype_sensitivity", lambda: test_g_dtype_sensitivity(device, config=config, T_values=(8, 1024))),
+    ]
+
+    results = {}
+    for name, fn in cases:
+        try:
+            fn()
+            results[name] = "PASS"
+        except Exception as e:  # noqa: BLE001 -- deliberately broad: report every case, then re-raise the first failure
+            results[name] = f"FAIL: {type(e).__name__}: {e}"
+            print(f"  [FAIL] {name}: {type(e).__name__}: {e}")
+
+    print("\n" + "=" * 70)
+    print("Summary")
+    print("=" * 70)
+    for name, status in results.items():
+        print(f"  {'PASS' if status == 'PASS' else 'FAIL':4}  {name}")
+
+    if any(status != "PASS" for status in results.values()):
+        raise SystemExit(1)
     print("\nAll fused-GDR correctness tests passed.")
 
 
