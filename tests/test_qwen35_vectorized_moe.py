@@ -5,36 +5,44 @@ Compares use_vectorized_moe=True vs. False (same weights, same input) at
 multiple token counts, and separately against src/model_small_qwen3.5.py's
 MoEFFN directly.
 
-IMPORTANT setup note (found during investigation, not obvious from a first
-read): Experts.gate_up_proj / down_proj are raw nn.Parameter(torch.empty(...))
-with NO auto-initialization anywhere -- confirmed true of BOTH this port and
-the reference (src/model_small_qwen3.5.py's own Qwen35MoESmall() construction
-never calls anything on them either). Left as torch.empty(...), these can
-read back as literal all-zero memory, which makes both dispatch paths
-degenerate to an all-zero output (cosine between two zero vectors is 0.0 by
-F.cosine_similarity's epsilon convention -- NOT evidence of a bug, just a
-meaningless comparison). Every test below explicitly randomizes Experts
-weights before comparing, unlike some of this project's existing MoE tests
-which may not (test_qwen35_standalone.py's test_moe_vs_reference copies
-weights from a freshly-constructed, likewise-never-initialized reference
-Experts -- flagging this as a pre-existing gap in that test's rigor, not
-fixed here since it's out of this task's scope; if the numbers there ever
-looked suspiciously close to a degenerate case, this is why).
+IMPORTANT setup note (found during investigation the hard way -- via a real
+GPU-only NaN failure, not caught by CPU testing): NONE of this codebase's
+weight-bearing modules auto-initialize. Experts.gate_up_proj/down_proj are
+raw nn.Parameter(torch.empty(...)) with no init call anywhere (confirmed
+true of both this port and the reference -- src/model_small_qwen3.5.py's
+own Qwen35MoESmall() construction never calls anything on them either).
+Qwen35MoE.gate / shared_expert_gate (ReplicatedLinear) and
+shared_expert.gate_up_proj/down_proj (MergedColumnParallelLinear /
+RowParallelLinear) are ALSO LinearBase subclasses with the same
+uninitialized-torch.empty pattern -- unlike stock nn.Linear, none of this
+project's custom linear wrappers call reset_parameters() or equivalent,
+consistent with a "weights always arrive via a checkpoint's weight_loader"
+design where auto-random-init would be wasted work. This test never loads
+a checkpoint, so ALL of these need explicit initialization, not just
+Experts -- an earlier version of this file only initialized Experts, which
+was enough to avoid the all-zero-output degenerate case on CPU, but on GPU
+the leftover memory these OTHER tensors read back as happened to contain
+NaN bit patterns, poisoning both moe_off AND moe_on identically (since
+moe_on.load_state_dict(moe_off.state_dict()) copies the same NaN weights
+over) -- producing cosine=nan that looked exactly like a correctness
+regression in the new code, when the new code was never the problem. Fixed
+below by initializing every parameter, not a hand-picked subset.
 
 Threshold: unlike the GDR kernel (which genuinely reassociates the
 delta-rule recurrence's summation order via chunking, and only ever reached
 ~0.999985 cosine against the sequential scan), grouped-GEMM dispatch does
 NOT reorder any single token's K-dimension reduction -- each token's dot
 product is the same set of terms in the same order, just launched via a
-batched kernel instead of a per-expert Python loop. Empirically (see
-investigation notes and this file's own results when run) this reaches
-BITWISE-IDENTICAL output on the CPU backend at several token counts, not
-just high cosine -- so this file asserts torch.equal exactly, not a cosine
-threshold, as the primary check. If a real run ever shows torch.equal fail
-but cosine remains high, that would itself be a meaningful new finding
-(evidence the GPU grouped-gemm kernel reassociates differently than CPU's)
-worth reporting explicitly rather than silently downgrading to a cosine
-check.
+batched kernel instead of a per-expert Python loop. On the CPU backend this
+reaches bitwise-identical output, not just high cosine. On the actual CUDA
+backend (confirmed empirically, not hypothetical) it does NOT stay bitwise
+exact at larger T (T=37/96/129 measured cosine ~0.99995-0.99999,
+max_abs_diff up to ~0.001) -- evidence the CUDA grouped-gemm kernel
+genuinely reassociates differently than the per-expert loop, the same class
+of finding as the GDR kernel's chunk-boundary reassociation. This is why
+the assertion below is a cosine threshold (0.999), not torch.equal --
+bitwise-exact is reported/logged when it happens (T=1/T=6/T=3 measured
+exact) but is not required.
 
 Usage:
     python tests/test_qwen35_vectorized_moe.py
@@ -62,14 +70,18 @@ def _build_pair(config, device, seed=42, init_std=0.02):
         use_vectorized_moe=False,
     ).to(device).to(torch.bfloat16)
 
-    # Explicit init -- see module docstring. Real, nonzero weights are
-    # required for a meaningful comparison; torch.empty(...) is not
-    # guaranteed zero in general, but was observed to read back as exactly
-    # zero in this environment, which silently degenerates the comparison
-    # to two zero vectors (cosine 0.0, not a bug signal) if skipped.
+    # Explicit init for EVERY parameter -- see module docstring. Nothing in
+    # this module tree auto-initializes (Experts' raw nn.Parameters, nor
+    # the LinearBase-derived gate/shared_expert layers), and leaving any of
+    # them as torch.empty(...) risks reading back as zero (silently
+    # degenerate cosine=0.0 comparison, seen on CPU) or NaN (seen on GPU,
+    # poisoning both flag-off and flag-on identically since they share
+    # weights via load_state_dict -- looks exactly like a correctness
+    # regression in the new code until traced, when neither path was at
+    # fault).
     with torch.no_grad():
-        moe_off.experts.gate_up_proj.normal_(0, init_std)
-        moe_off.experts.down_proj.normal_(0, init_std)
+        for p in moe_off.parameters():
+            p.normal_(0, init_std)
 
     moe_on = Qwen35MoE(
         hidden_size=config.hidden_size,
