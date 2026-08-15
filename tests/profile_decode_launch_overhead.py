@@ -334,26 +334,35 @@ def analyze_profile(prof, iters):
     key_averages() table (see caller) is the ground truth if any of this
     extraction disagrees with it due to a profiler API difference across
     torch versions. Returns None (with a printed warning, not a crash) if
-    the extraction itself fails -- e.g. an attribute renamed in a torch
-    version this wasn't written against -- since the raw table printed by
-    the caller regardless is still fully usable evidence on its own."""
+    the extraction itself fails.
+
+    Deliberately does NOT report an aggregate "GPU busy time" or
+    "launch-dispatch time as a fraction of wall-clock" anymore -- a real run
+    proved that unreliable: key_averages() gives graph.replay (a
+    record_function label wrapping torch.cuda.graph().replay()) its own row
+    whose self_device_time_total is the SUM of every kernel that executed
+    during that replay, AND ALSO gives each of those same kernels their own
+    separate named rows (e.g. "cutlass::Kernel2...",
+    "elementwise_kernel..."). Blindly summing self_device_time_total across
+    every DeviceType.CUDA row therefore double(+)-counts everything inside
+    a captured graph -- confirmed by a real GPU run reporting GPU busy time
+    exceeding total wall-clock time and "launch-dispatch fraction" at
+    100.3%, both physically impossible for a true non-overlapping CPU
+    dispatch cost. The per-LABEL numbers below (regions_per_iter) don't have
+    this problem -- each key is looked up individually, not summed across
+    every CUDA-typed row -- so they're kept. See the caller's
+    top_level_events_only=True table for a correct, non-double-counted
+    aggregate CPU-side view instead."""
     try:
-        from torch.autograd import DeviceType
+        from torch.autograd import DeviceType  # noqa: F401  (kept for callers' own use)
 
         avgs = prof.key_averages()
 
         launch_count = 0
-        launch_cpu_us = 0
         for e in avgs:
             key = e.key or ""
             if any(h.lower() in key.lower() for h in LAUNCH_NAME_HINTS):
                 launch_count += e.count
-                launch_cpu_us += e.self_cpu_time_total
-
-        gpu_busy_us = 0
-        for e in avgs:
-            if e.device_type == DeviceType.CUDA:
-                gpu_busy_us += e.self_device_time_total
 
         regions = {}
         for e in avgs:
@@ -366,8 +375,6 @@ def analyze_profile(prof, iters):
 
         return {
             "launch_count_per_iter": launch_count / iters,
-            "launch_cpu_ms_per_iter": (launch_cpu_us / iters) / 1000.0,
-            "gpu_busy_ms_per_iter": (gpu_busy_us / iters) / 1000.0,
             "regions_per_iter": {
                 k: {
                     "count": v["count"] / iters,
@@ -384,7 +391,22 @@ def analyze_profile(prof, iters):
         return None
 
 
-def print_analysis(label, host_ms, device_ms, analysis, top_k_table=None):
+def _top_level_table(prof, sort_by="cpu_time_total", row_limit=15):
+    """Excludes nested children (e.g. the individual kernels replayed inside
+    a captured CUDA graph, or the ops inside compute_logits/state_manager
+    calls) -- a correct, non-double-counted view of CPU-side work, unlike
+    blindly summing every row of key_averages(). Best-effort: returns None
+    (caller just skips printing it) if this torch version's EventList.table
+    doesn't support top_level_events_only the way this was written against."""
+    try:
+        return prof.key_averages().table(sort_by=sort_by, row_limit=row_limit, top_level_events_only=True)
+    except Exception as e:
+        print(f"  [WARN] top_level_table failed ({type(e).__name__}: {e}) -- skipping, "
+              f"use the full key_averages table below instead")
+        return None
+
+
+def print_analysis(label, host_ms, device_ms, analysis, top_k_table=None, top_level_table=None):
     print(f"\n--- {label} ---")
     print(f"  wall-clock (unprofiled, host perf_counter):  {host_ms:.3f} ms/iter")
     print(f"  wall-clock (unprofiled, CUDA event):          {device_ms:.3f} ms/iter")
@@ -393,18 +415,20 @@ def print_analysis(label, host_ms, device_ms, analysis, top_k_table=None):
         print(f"  [WARN] host vs device timing disagree by {disagreement*100:.0f}% "
               f"-- possible async-completion gap, investigate before trusting either number")
     if analysis is not None:
-        print(f"  kernel launches/iter (cudaLaunchKernel+cudaGraphLaunch+memcpy/memset async): "
+        print(f"  CPU-side launch/copy API calls per iter (cudaLaunchKernel+cudaGraphLaunch+"
+              f"memcpy/memset async -- note a captured CUDA graph replays as ONE "
+              f"cudaGraphLaunch regardless of how many kernels it contains, so this is "
+              f"NOT a per-kernel count once a graph is involved): "
               f"{analysis['launch_count_per_iter']:.1f}")
-        print(f"  launch-dispatch CPU time/iter:                {analysis['launch_cpu_ms_per_iter']:.3f} ms")
-        print(f"  GPU kernel busy time/iter (sum of self device time, assumes single-stream): "
-              f"{analysis['gpu_busy_ms_per_iter']:.3f} ms")
-        if host_ms > 0:
-            frac = analysis["launch_cpu_ms_per_iter"] / host_ms
-            print(f"  -> launch-dispatch as fraction of wall-clock: {frac*100:.1f}%")
         if analysis["regions_per_iter"]:
-            print("  labeled regions (count / cpu_ms / device_ms per iter):")
+            print("  labeled regions (count / cpu_ms / device_ms per iter -- each individually "
+                  "trustworthy, not summed across rows):")
             for k, v in analysis["regions_per_iter"].items():
                 print(f"    {k:<24s} count={v['count']:.1f}  cpu={v['cpu_ms']:.3f}ms  device={v['device_ms']:.3f}ms")
+    if top_level_table:
+        print("  top-level-only view (excludes nested children -- correct, non-double-counted "
+              "CPU-side breakdown):")
+        print(top_level_table)
     if top_k_table:
         print(top_k_table)
 
@@ -527,37 +551,46 @@ def main():
     print("PREFILL STEP")
     print("=" * 78)
 
+    # SAME seed on every single prefill call below -- warmup, timed, AND
+    # profiled -- not a fresh one per iteration. Varied lengths ACROSS the
+    # batch (make_prefill_batch's own per-prompt randint) are still real;
+    # what must NOT vary is the total packed token count N *between*
+    # iterations of this timing loop, since several ops in layers/ are
+    # @torch.compile'd (layernorm.py's rms_forward, etc.) and dynamo
+    # recompiles on every new shape it sees -- confirmed the hard way: an
+    # earlier version of this script incremented the seed every call,
+    # producing a different N each of the ~18 warmup+timed+profiled prefill
+    # calls, and measured 910ms/iter wall-clock on an 8-layer, hidden=512
+    # toy model at bs=4 -- two to three orders of magnitude more than
+    # genuine compute for that size, and a dead match for this project's
+    # own documented issue (bench_throughput.py's docstring: "dynamo
+    # recompiles per new input shape... Sticking to {1,2,4} keeps total
+    # distinct compiled shapes... under torch._dynamo's default
+    # cache_size_limit of 8"). Holding N fixed lets warmup pay the
+    # compilation cost once, off the clock, exactly like that precedent.
+    PREFILL_SEED = 4242
+
     for w in range(args.warmup_iters):
-        seed = 1000 + w
-        added = make_prefill_batch(scheduler, Sequence, args.prefill_batch_size, args.prefill_len, seed)
+        added = make_prefill_batch(scheduler, Sequence, args.prefill_batch_size, args.prefill_len, PREFILL_SEED)
         run_prefill_to_completion(runner, scheduler, added)
         cleanup_running(scheduler, added)
 
-    # Unprofiled timing: fresh batch each iter (prefill consumes the queue).
-    def make_and_run_prefill(seed_box=[5000]):
-        added = make_prefill_batch(scheduler, Sequence, args.prefill_batch_size, args.prefill_len, seed_box[0])
-        seed_box[0] += 1
+    def make_and_run_prefill():
+        added = make_prefill_batch(scheduler, Sequence, args.prefill_batch_size, args.prefill_len, PREFILL_SEED)
         run_prefill_to_completion(runner, scheduler, added)
         cleanup_running(scheduler, added)
 
     host_ms, device_ms = time_iters(make_and_run_prefill, args.timed_iters)
 
     with RegionInstrumentation(runner):
-        seed_box = [6000]
-
-        def profiled_prefill():
-            added = make_prefill_batch(scheduler, Sequence, args.prefill_batch_size, args.prefill_len, seed_box[0])
-            seed_box[0] += 1
-            run_prefill_to_completion(runner, scheduler, added)
-            cleanup_running(scheduler, added)
-
         trace_path = os.path.join(args.trace_dir, "prefill_trace.json")
-        prof = profile_iters(profiled_prefill, args.profiled_iters, trace_path)
+        prof = profile_iters(make_and_run_prefill, args.profiled_iters, trace_path)
 
     analysis = analyze_profile(prof, args.profiled_iters)
     table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=25)
+    tl_table = _top_level_table(prof)
     print_analysis(f"prefill (bs={args.prefill_batch_size}, len~{args.prefill_len})",
-                    host_ms, device_ms, analysis, top_k_table=table)
+                    host_ms, device_ms, analysis, top_k_table=table, top_level_table=tl_table)
     print(f"  chrome trace: {trace_path}")
 
     # ── decode profiling, per batch size ───────────────────────────────────
@@ -600,7 +633,8 @@ def main():
 
         analysis = analyze_profile(prof, args.profiled_iters)
         table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=25)
-        print_analysis(f"decode (bs={bs})", host_ms, device_ms, analysis, top_k_table=table)
+        tl_table = _top_level_table(prof)
+        print_analysis(f"decode (bs={bs})", host_ms, device_ms, analysis, top_k_table=table, top_level_table=tl_table)
         print(f"  chrome trace: {trace_path}")
 
         # Also profile eager decode at this batch size for the layer-type
