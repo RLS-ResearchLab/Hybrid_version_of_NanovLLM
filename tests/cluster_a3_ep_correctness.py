@@ -54,7 +54,7 @@ _forward_gathered_ep at all; --dry-run-no-hf-reference below only confirms
 the histogram phase's real-weight routing plumbing works end-to-end):
 
     python tests/cluster_a3_ep_correctness.py --phase histogram \\
-        --checkpoint tests/fake_qwen35_small --tp 1 --dry-run-no-hf-reference
+        --checkpoint tests/fake_qwen35_small --tp 1 --dry-run-no-hf-reference --fake-config-loader
 
 Intermediate artifacts land in tests/_cluster_day_cache/a3_ep/ (repo-relative,
 safe to delete after --phase compare / --phase histogram).
@@ -76,7 +76,9 @@ if "nanovllm" not in sys.modules:
 
 sys.path.insert(0, os.path.dirname(__file__))
 from gsm8k_prompt import build_prompt  # noqa: E402
-from cluster_a2_tp_correctness import REFERENCE_PATH, PROMPTS  # noqa: E402
+from cluster_a2_tp_correctness import (  # noqa: E402
+    REFERENCE_PATH, PROMPTS, _maybe_install_fake_config_loader,
+)
 
 DEFAULT_CKPT = os.path.join(ROOT, "qwen35_checkpoint")
 CACHE_DIR = os.path.join(ROOT, "tests", "_cluster_day_cache", "a3_ep")
@@ -104,6 +106,7 @@ def phase_engine(args):
     noise doesn't contaminate the EP-dispatch-specific comparison) so A3
     tests the EP MECHANISM specifically, not the whole decoder stack."""
     os.makedirs(CACHE_DIR, exist_ok=True)
+    _maybe_install_fake_config_loader(args)
     from nanovllm.llm import LLM
     from nanovllm.engine.sequence import Sequence
     from nanovllm.models.qwen3_5 import Qwen35MoE
@@ -215,6 +218,7 @@ def phase_histogram(args):
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
     from datasets import load_dataset
+    _maybe_install_fake_config_loader(args)
     from nanovllm.llm import LLM
     from nanovllm.engine.sequence import Sequence
     from nanovllm.models.qwen3_5 import Qwen35MoE
@@ -322,6 +326,10 @@ def main():
     ap.add_argument("--tp", type=int, default=2)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     ap.add_argument("--dry-run-no-hf-reference", action="store_true", default=False)
+    ap.add_argument("--fake-config-loader", action="store_true", default=False,
+                     help="Required against tests/fake_qwen35_small (default OFF -- never needed "
+                          "against the real checkpoint). See cluster_a2_tp_correctness.py's "
+                          "_AttrDict docstring for why.")
     args = ap.parse_args()
 
     if args.phase == "engine":

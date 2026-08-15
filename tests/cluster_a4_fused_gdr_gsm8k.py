@@ -46,7 +46,7 @@ flag-on/flag-off produce equal-length, non-crashing, well-formed output
 through the real multi-step decode path):
 
     python tests/cluster_a4_fused_gdr_gsm8k.py --checkpoint tests/fake_qwen35_small \\
-        --tp 1 --num-examples 8 --dry-run
+        --tp 1 --num-examples 8 --dry-run --fake-config-loader
 """
 import argparse
 import json
@@ -66,6 +66,7 @@ if "nanovllm" not in sys.modules:
 sys.path.insert(0, os.path.dirname(__file__))
 from gsm8k_prompt import build_prompt  # noqa: E402
 from gsm8k_extract import extract_answer_detailed  # noqa: E402
+from cluster_a2_tp_correctness import _maybe_install_fake_config_loader  # noqa: E402
 
 DEFAULT_CKPT = os.path.join(ROOT, "qwen35_checkpoint")
 CACHE_DIR = os.path.join(ROOT, "tests", "_cluster_day_cache", "a4_fused_gdr")
@@ -117,6 +118,7 @@ def _run_and_cache(args, examples, use_fused: bool, results_path: str):
         with open(results_path, encoding="utf-8") as f:
             return json.load(f)
 
+    _maybe_install_fake_config_loader(args)
     from nanovllm.llm import LLM
     from nanovllm.sampling_params import SamplingParams
 
@@ -161,6 +163,10 @@ def main():
                      help="Small fake model: skip gold-answer scoring (meaningless on random "
                           "untrained weights), only check flag-on/flag-off both run end-to-end "
                           "and produce well-formed, non-crashing output through real multi-step decode.")
+    ap.add_argument("--fake-config-loader", action="store_true", default=False,
+                     help="Required against tests/fake_qwen35_small (default OFF -- never needed "
+                          "against the real checkpoint). See cluster_a2_tp_correctness.py's "
+                          "_AttrDict docstring for why.")
     args = ap.parse_args()
 
     os.makedirs(CACHE_DIR, exist_ok=True)

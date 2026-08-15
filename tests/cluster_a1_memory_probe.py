@@ -38,7 +38,7 @@ Usage (defaults: try tp=4 first, degrade to tp=2; ~15min timeout per attempt):
 
 Dry run (small model, single GPU -- see this task's cluster-day prep):
     python tests/cluster_a1_memory_probe.py --checkpoint tests/fake_qwen35_small --tp-sizes 1 \\
-        --out tests/_cluster_day_cache/a1_dry_run.jsonl --timeout-s 300
+        --out tests/_cluster_day_cache/a1_dry_run.jsonl --timeout-s 300 --fake-config-loader
 """
 import argparse
 import json
@@ -98,6 +98,8 @@ def run_one_attempt(tp_size: int, args, out_jsonl_fh) -> dict:
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--out", worker_out_path,
     ]
+    if args.fake_config_loader:
+        cmd.append("--fake-config-loader")
     print(f"[a1-probe] launching: {' '.join(cmd)}")
 
     popen_kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -175,6 +177,10 @@ def main():
                           "for a slow first-touch load from disk without letting a genuine hang "
                           "burn the whole cluster window.")
     ap.add_argument("--out", default=DEFAULT_OUT)
+    ap.add_argument("--fake-config-loader", action="store_true", default=False,
+                     help="Required against tests/fake_qwen35_small (default OFF -- never needed "
+                          "against the real checkpoint). Forwarded to the worker subprocess. See "
+                          "cluster_a1_probe_worker.py's _AttrDict docstring for why.")
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

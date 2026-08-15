@@ -56,6 +56,35 @@ if "nanovllm" not in sys.modules:
 DEFAULT_CKPT = os.path.join(ROOT, "qwen35_checkpoint")
 
 
+class _AttrDict(dict):
+    """Same shim bench_throughput.py / cluster_a2_tp_correctness.py already
+    use -- needed ONLY against tests/fake_qwen35_small (pass
+    --fake-config-loader). See cluster_a2_tp_correctness.py's _AttrDict
+    docstring for the full root-cause writeup (installed transformers'
+    Qwen3_5MoeConfig nests a `text_config` with a real-checkpoint-shaped
+    40-entry default layer_types, which clobbers the fake model's flat
+    8-layer config unless AutoConfig.from_pretrained is bypassed). Never
+    needed against the real checkpoint -- default OFF."""
+
+    def __getattr__(self, k):
+        try:
+            return self[k]
+        except KeyError:
+            raise AttributeError(k)
+
+    def __setattr__(self, k, v):
+        self[k] = v
+
+
+def _fake_from_pretrained(path, *args, **kwargs):
+    import torch
+    with open(os.path.join(path, "config.json")) as f:
+        d = json.load(f)
+    d = _AttrDict(d)
+    d.dtype = getattr(torch, d.pop("torch_dtype"))
+    return d
+
+
 def _nvidia_smi_snapshot():
     """[{"index": int, "used_mib": int, "total_mib": int}, ...] or None (with
     a printed reason) if nvidia-smi isn't reachable -- never raises, this is
@@ -88,6 +117,9 @@ def main():
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     ap.add_argument("--out", required=True, help="Path to write this attempt's RESULT_JSON.")
+    ap.add_argument("--fake-config-loader", action="store_true", default=False,
+                     help="Required against tests/fake_qwen35_small (default OFF -- never needed "
+                          "against the real checkpoint). See _AttrDict's docstring for why.")
     args = ap.parse_args()
 
     result = {
@@ -109,6 +141,11 @@ def main():
     engine = None
     try:
         assert os.path.isdir(args.checkpoint), f"checkpoint dir not found: {args.checkpoint}"
+        if args.fake_config_loader:
+            import nanovllm.config as config_mod
+            config_mod.AutoConfig.from_pretrained = staticmethod(_fake_from_pretrained)
+            print("[a1-worker] --fake-config-loader: AutoConfig.from_pretrained monkeypatched "
+                  "(see _AttrDict's docstring)")
         print(f"[a1-worker] constructing LLMEngine(tensor_parallel_size={args.tensor_parallel_size}) "
               f"from {args.checkpoint} ...")
         from nanovllm.llm import LLM

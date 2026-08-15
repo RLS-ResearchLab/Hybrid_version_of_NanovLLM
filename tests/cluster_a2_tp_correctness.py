@@ -50,7 +50,7 @@ Dry run (small model, single GPU, tp=1 -- see this task's cluster-day prep;
 --phase reference is SKIPPED for the dry run, see --dry-run-no-hf-reference):
 
     python tests/cluster_a2_tp_correctness.py --phase engine --tp 1 \\
-        --checkpoint tests/fake_qwen35_small --dry-run-no-hf-reference
+        --checkpoint tests/fake_qwen35_small --dry-run-no-hf-reference --fake-config-loader
     python tests/cluster_a2_tp_correctness.py --phase compare --tp 1 --dry-run-no-hf-reference
 
 Intermediate artifacts land in tests/_cluster_day_cache/a2_tp/ (repo-relative,
@@ -77,6 +77,53 @@ DEFAULT_CKPT = os.path.join(ROOT, "qwen35_checkpoint")
 CACHE_DIR = os.path.join(ROOT, "tests", "_cluster_day_cache", "a2_tp")
 REFERENCE_PATH = os.path.join(CACHE_DIR, "reference.pt")
 MAX_MODEL_LEN = 2048
+
+_DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+
+
+class _AttrDict(dict):
+    """Same shim bench_throughput.py / gsm8k_fused_gdr_check.py /
+    test_qwen35_preemption_state.py already use -- needed ONLY against
+    tests/fake_qwen35_small, pass --fake-config-loader for that. Root cause
+    (confirmed directly on the real cluster GPU box, not guessed): the
+    installed transformers registers "qwen3_5_moe" with a Qwen3_5MoeConfig
+    that nests a `text_config` sub-object carrying its OWN real-checkpoint-
+    shaped default `layer_types` (40 entries). The fake model's flat
+    8-layer config.json never overrides text_config, so config.py's
+    __post_init__ flattening copies that 40-entry default onto the
+    top-level object next to num_hidden_layers=8 -- exactly what crashes
+    models/qwen3_5.py's `_get_layer_types`'s `assert len(layers_block_type)
+    == num_layers`. Bypassing AutoConfig entirely (read config.json as a
+    flat dict, no text_config, no nested defaults) sidesteps this. The REAL
+    checkpoint's config.json already has all fields flat at the top level
+    (no nested text_config -- it's a text-only MoE checkpoint, not a VLM),
+    so this is never needed there -- default OFF.
+    """
+
+    def __getattr__(self, k):
+        try:
+            return self[k]
+        except KeyError:
+            raise AttributeError(k)
+
+    def __setattr__(self, k, v):
+        self[k] = v
+
+
+def _fake_from_pretrained(path, *args, **kwargs):
+    with open(os.path.join(path, "config.json")) as f:
+        d = json.load(f)
+    d = _AttrDict(d)
+    d.dtype = _DTYPE_MAP[d.pop("torch_dtype")]
+    return d
+
+
+def _maybe_install_fake_config_loader(args):
+    if getattr(args, "fake_config_loader", False):
+        import nanovllm.config as config_mod
+        config_mod.AutoConfig.from_pretrained = staticmethod(_fake_from_pretrained)
+        print("--fake-config-loader: AutoConfig.from_pretrained monkeypatched to read "
+              "config.json as a flat dict (see _AttrDict's docstring)")
 DECODE_MAX_TOKENS = 10  # short on purpose -- isolating math agreement, not a real eval
 
 # Same set as reference_check_phase6.py -- varied length/content, kept
@@ -164,6 +211,7 @@ def phase_engine(args):
 
     loader_mod.default_weight_loader = _tracking_default
 
+    _maybe_install_fake_config_loader(args)
     from nanovllm.llm import LLM
     from nanovllm.engine.sequence import Sequence
     from nanovllm.sampling_params import SamplingParams
@@ -313,6 +361,9 @@ def main():
                           "confirm --phase engine's own output is finite/non-empty. Use this for "
                           "single-GPU dry runs against the small fake model, where an HF reference "
                           "would be meaningless (random untrained weights).")
+    ap.add_argument("--fake-config-loader", action="store_true", default=False,
+                     help="Required for --phase engine against tests/fake_qwen35_small (default OFF -- "
+                          "never needed against the real checkpoint). See _AttrDict's docstring for why.")
     args = ap.parse_args()
 
     if args.phase == "reference":
