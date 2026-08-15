@@ -31,6 +31,25 @@ ARCH_DISPATCH = {
     "Qwen35ForCausalLM": Qwen35ForCausalLM,
     "Qwen35MoEForCausalLM": Qwen35ForCausalLM,
     "Qwen3_5MoeForConditionalGeneration": Qwen35ForCausalLM,
+    # The REAL checkpoint's config.json (qwen35_checkpoint/config.json,
+    # model_type "qwen3_5_moe_text", a text-only MoE checkpoint, not the VLM
+    # variant the "ForConditionalGeneration" entry above targets) reports
+    # this exact string. Missing this key silently fell through to
+    # ARCH_DISPATCH.get(arch, Qwen3ForCausalLM)'s dense-model DEFAULT instead
+    # of raising -- discovered via a real cluster-day A1 run against real
+    # weights (never caught by this repo's other tests/scripts, which all
+    # construct SimpleNamespace fake configs or the small fake model's
+    # config.json, "architectures": ["Qwen35MoEForCausalLM"], which DOES
+    # match a pre-existing key). Symptom was two different downstream
+    # crashes depending on tp_size, both inside the WRONG (dense) model
+    # class: `assert num_key_value_heads % tp_size == 0` at tp=4 (real
+    # num_key_value_heads=2 fails that), and `config.intermediate_size`
+    # AttributeError at tp=2 (dense-only field; the MoE config only has
+    # moe_intermediate_size/shared_expert_intermediate_size) -- neither
+    # error mentions "wrong model class" directly, so this is worth knowing
+    # if a similarly-shaped AttributeError/AssertionError ever recurs against
+    # a DIFFERENT checkpoint variant's architectures string.
+    "Qwen3_5MoeForCausalLM": Qwen35ForCausalLM,
 }
 
 
@@ -84,8 +103,31 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
 
-        arch = getattr(hf_config, "architectures", ["Qwen3ForCausalLM"])[0]
-        model_cls = ARCH_DISPATCH.get(arch, Qwen3ForCausalLM)
+        # No `architectures` field at all -> assume dense Qwen3 (silent, same
+        # as before -- this is a genuinely missing-field default, not the
+        # dangerous case below). An `architectures` field that IS present but
+        # doesn't match any ARCH_DISPATCH key is different: silently falling
+        # back to the dense model there is exactly what caused a real
+        # incident (a cluster-day A1 run against the real Qwen3.5 checkpoint,
+        # whose "Qwen3_5MoeForCausalLM" string wasn't yet a dict key,
+        # silently got the WRONG -- dense -- model class, surfacing only much
+        # later as an unrelated-looking AttributeError/AssertionError deep
+        # inside Qwen3Attention, not as an obvious "wrong model" error). Fail
+        # loudly there instead.
+        arch_list = getattr(hf_config, "architectures", None)
+        if arch_list is None:
+            arch, model_cls = "Qwen3ForCausalLM", Qwen3ForCausalLM
+        else:
+            arch = arch_list[0]
+            if arch not in ARCH_DISPATCH:
+                raise ValueError(
+                    f"Unrecognized architectures[0]={arch!r} in this checkpoint's config -- "
+                    f"ARCH_DISPATCH only knows {sorted(ARCH_DISPATCH)}. Add {arch!r} to "
+                    f"ARCH_DISPATCH (pointing at Qwen3ForCausalLM or Qwen35ForCausalLM, "
+                    f"whichever this checkpoint actually is) rather than letting this fall "
+                    f"through silently -- see the comment above for the incident this guards against."
+                )
+            model_cls = ARCH_DISPATCH[arch]
         self._is_hybrid_model = (model_cls is Qwen35ForCausalLM)
 
         self.model = model_cls(hf_config)
