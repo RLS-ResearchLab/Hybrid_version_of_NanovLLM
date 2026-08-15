@@ -87,7 +87,24 @@ class Scheduler:
         # a hard cap on concurrently-running sequences (see its docstring),
         # and over-admitting empties free_slot_ids before allocate() can
         # pop from it -- IndexError, not silently wrong output.
-        while self.waiting and len(self.running) + len(scheduled_seqs) < self.max_num_seqs:
+        #
+        # running_at_round_start is a FIXED snapshot, not a live re-read of
+        # self.running, deliberately: a sequence whose entire prompt fits in
+        # this same round is appended to self.running a few lines below,
+        # inside this very loop, the moment it completes -- re-reading
+        # len(self.running) on the next iteration would then count that
+        # sequence AGAIN on top of its still-present entry in scheduled_seqs,
+        # double-counting every single-shot-completing admission and capping
+        # this round at max_num_seqs // 2 instead of max_num_seqs whenever
+        # self.running started empty (confirmed: reproduces exactly the
+        # tests/cuda_graph_consistency_test.py bs=8 failure -- 8 tiny prompts,
+        # 50 total tokens against a 256-token budget, 11685 free KV blocks,
+        # yet only 4 got admitted before the live-mutating bound tripped).
+        # Sequences already running BEFORE this schedule() call -- the actual
+        # case this bound exists to protect against -- are still fully
+        # captured by this snapshot, taken before the loop touches anything.
+        running_at_round_start = len(self.running)
+        while self.waiting and running_at_round_start + len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
