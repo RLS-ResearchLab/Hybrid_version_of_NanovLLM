@@ -581,6 +581,16 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        # DECODE ONLY -- never called for prefill (see run_model()/run() above:
+        # graph replay is only used when `not is_prefill`). Load-bearing, not
+        # incidental: the fused-GDR kernel path (models/qwen3_5.py's
+        # Qwen35LinearAttention._fla_chunk_gated_delta_rule) is NOT capturable
+        # inside torch.cuda.graph() (reproduced as
+        # cudaErrorStreamCaptureInvalidated) -- this only stays safe because
+        # (a) that class's `use_fused` gate guarantees decode never takes the
+        # fused branch, and (b) this method never captures prefill, the only
+        # shape the fused branch is ever reached for. Do not extend graph
+        # capture to prefill without re-checking that constraint first.
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)

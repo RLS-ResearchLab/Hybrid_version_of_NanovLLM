@@ -12,7 +12,6 @@ Design:
     torch.multiprocessing.spawn with gloo -- genuine multi-rank
     communication (dist.all_reduce), not the single-process RANK=0/WORLD=1
     construction-only trick used elsewhere in this codebase.
-  - Hidden-state rows uniquely tagged: row i = (i+1) * ones(H).
   - A companion token_id tensor rides through the *real* dispatch/combine
     path (Qwen35MoE._forward_dispatch_ep sets self._last_ep_token_id_roundtrip
     from the exact same ownership mask used for the real computation, not a
@@ -24,8 +23,34 @@ Design:
     (bitwise-equal bool + max abs diff), not assumed -- a generous
     torch.allclose is still asserted as a sanity bound to catch genuine
     bugs, not to claim bitwise exactness that hasn't been proven.
+
+ROUTING CONSTRUCTION -- FIXED post-hoc, read before changing SCALE.hidden:
+Originally every hidden-state row was tagged row_i = (i+1) * ones(H). Since
+gate(x) = x @ gate.weight.T is linear, a positive scalar multiple of the same
+vector can never change which coordinates (expert logits) rank highest --
+every token routed to the SAME top-k expert set, whichever the random gate
+happened to rank highest. The top_k=8 "measured, not assumed" reassociation
+number this file was designed to produce was therefore only ever one
+summation ordering, replayed at eight different magnitudes -- divergent
+per-token routing (the entire mechanism EP dispatch exists to implement) was
+never actually exercised. Found during the pre-cluster-day verification pass
+(see QLLM Stage 2 task notes item B1); test_moe_ep_dispatch_edge_cases.py had
+already independently discovered and fixed the identical bug for its own
+(smaller, hand-constructed) scenarios.
+
+Fixed the same way test_moe_ep_dispatch_edge_cases.py fixes it: SCALE.hidden
+MUST equal SCALE.num_experts (square gate.weight), gate.weight is overwritten
+to an exact identity matrix after the normal random init, and each token's
+input row is a 0/1 indicator vector with exactly top_k ones at RANDOMLY
+CHOSEN coordinates (see _build_divergent_x below) -- since gate(x) = x @ I.T
+= x exactly, torch.topk(gate(x), top_k) deterministically selects exactly
+those coordinates, giving genuine per-token routing control through the real,
+unmodified gate/topk/softmax/dispatch/combine code. build_reference() asserts
+scale.hidden == scale.num_experts up front so a future caller can't silently
+reintroduce the degenerate case by picking mismatched dimensions.
 """
 import os
+import random
 import sys
 import tempfile
 import types
@@ -67,9 +92,11 @@ def _isolate_routed_expert_output(moe, x):
     0.0 regardless of any floating-point noise in shared_expert's own
     (possibly TP-sharded) computation -- isolates the routed-expert-only
     contribution using the model's real, unmodified forward() and real
-    weights, no reimplementation. Relies on x being all-positive (true for
-    this test's row_i = (i+1)*ones(H) tagging), so weight=-1000 dot a
-    positive row is guaranteed very negative.
+    weights, no reimplementation. Relies on x being all-NON-NEGATIVE with at
+    least one positive entry per row (true both for the original
+    row_i=(i+1)*ones(H) tagging and for the current one-hot
+    _build_divergent_x rows -- either way weight=-1000 dot the row is
+    guaranteed very negative).
     """
     orig = moe.shared_expert_gate.weight.data.clone()
     moe.shared_expert_gate.weight.data.fill_(-1000.0)
@@ -84,6 +111,39 @@ def _relative_error(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12) -> flo
     return ((a.float() - b.float()).abs() / (b.float().abs() + eps)).max().item()
 
 
+def _build_divergent_x(n_tokens: int, num_experts: int, top_k: int, seed: int = 20260815):
+    """n_tokens one-hot indicator rows (0/1, exactly top_k ones each) at
+    RANDOMLY CHOSEN coordinates per token. Paired with an identity
+    gate.weight (see build_reference below), this gives genuine per-token
+    routing control through the real, unmodified gate/topk code -- replacing
+    the collinear row_i=(i+1)*ones(H) construction that made every token
+    route to the identical expert set regardless of n_tokens (see this
+    module's docstring). Same technique test_moe_ep_dispatch_edge_cases.py
+    established first, generalized here to random (rather than
+    hand-enumerated) per-token picks.
+
+    Returns (x, picks) -- picks (list[list[int]], sorted expert ids per
+    token) is returned purely for logging/inspection, not consumed
+    downstream.
+    """
+    assert num_experts >= top_k, f"num_experts={num_experts} < top_k={top_k}"
+    rng = random.Random(seed)
+    picks = [sorted(rng.sample(range(num_experts), top_k)) for _ in range(n_tokens)]
+    if n_tokens > 1:
+        distinct = len(set(tuple(p) for p in picks))
+        assert distinct > 1, (
+            f"all {n_tokens} tokens sampled the IDENTICAL top-{top_k} expert set "
+            f"{picks[0]} -- routing is not actually divergent here (this is only "
+            f"possible when num_experts == top_k, which leaves exactly one distinct "
+            f"set); re-check the scale's num_experts/top_k before trusting this run "
+            f"as a divergent-routing measurement"
+        )
+    x = torch.zeros(n_tokens, num_experts)
+    for i, p in enumerate(picks):
+        x[i, p] = 1.0
+    return x, picks
+
+
 def build_reference(scale: MoEScale):
     """Single-process (ep_size=1): build Qwen35MoE, seed deterministic
     weights, compute the dense reference output via the existing, unmodified
@@ -95,6 +155,12 @@ def build_reference(scale: MoEScale):
 
     from nanovllm.models.qwen3_5 import Qwen35MoE
 
+    assert scale.hidden == scale.num_experts, (
+        f"identity-gate routing-control technique (see module docstring) requires "
+        f"hidden_size == num_experts (square gate.weight) -- got hidden={scale.hidden}, "
+        f"num_experts={scale.num_experts}"
+    )
+
     moe_ref = Qwen35MoE(scale.hidden, scale.intermediate, scale.shared_intermediate,
                          scale.num_experts, scale.top_k)
     assert moe_ref.ep_size == 1
@@ -105,13 +171,21 @@ def build_reference(scale: MoEScale):
     for name in sorted(dict(moe_ref.named_parameters()).keys()):
         p = dict(moe_ref.named_parameters())[name]
         p.data.normal_(mean=0.0, std=0.02)
+    # Overwrite the (randomly-initialized) gate with an exact identity --
+    # this is what actually gives per-token routing control (see module
+    # docstring / test_moe_ep_dispatch_edge_cases.py, which established the
+    # technique first). Everything else (experts, shared_expert,
+    # shared_expert_gate) keeps its random init.
+    moe_ref.gate.weight.data.copy_(torch.eye(scale.num_experts))
 
     # Seed in fp32 for RNG quality, then cast the whole module (all real
     # params, no integer buffers) to the target dtype -- weights, inputs,
     # AND the computation itself all run in scale.dtype from here on.
     moe_ref = moe_ref.to(scale.dtype)
-    x = torch.stack([(i + 1) * torch.ones(scale.hidden) for i in range(scale.n_tokens)], dim=0)
+    x, picks = _build_divergent_x(scale.n_tokens, scale.num_experts, scale.top_k)
     x = x.to(scale.dtype)
+    print(f"[main] per-token top-{scale.top_k} picks (genuinely divergent routing -- "
+          f"see module docstring for why this replaces the old collinear rows): {picks}")
 
     call_count = {"n": 0}
     real_ep_method = moe_ref._forward_dispatch_ep

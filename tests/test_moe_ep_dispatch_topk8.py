@@ -1,7 +1,7 @@
 """top_k=8 extension of Q5 / Checkpoint 3: re-run the exact same design
-(tagged tokens, token_id round-trip, dual hidden-state/id checks) at a
-synthetic scale matching the real model's top_k=8 (16 experts, top_k=8,
-tp_size=2 -> 8 local experts/rank). Still CPU-only, no GPU.
+(token_id round-trip, dual hidden-state/id checks) at a synthetic scale
+matching the real model's top_k=8 (16 experts, top_k=8, tp_size=2 -> 8 local
+experts/rank). Still CPU-only, no GPU.
 
 Unlike the top_k=2 checkpoint, bitwise exactness of the routed-expert-only
 hidden-state output is NOT assumed here -- the top_k==2 proof relied on a
@@ -16,6 +16,16 @@ reported as-is; the token_id round-trip is still asserted exact regardless
 (that check has no floating-point content -- it's integer scatter/gather
 correctness, unaffected by top_k).
 
+hidden=16 (== num_experts): required by moe_ep_dispatch_core.py's
+identity-gate routing-control technique (see that module's docstring) --
+each token now picks a genuinely different, randomly-chosen top-8 expert
+subset instead of the old collinear row_i=(i+1)*ones(6) tagging, under which
+every token deterministically routed to the SAME expert set and this file's
+"measured" reassociation number was really just one summation ordering
+replayed at eight magnitudes. hidden was previously 6 (an arbitrary toy
+dimension unrelated to num_experts); raising it to 16 only changes the toy
+MoE's hidden_size, nothing else about what's being tested.
+
 Usage: python tests/test_moe_ep_dispatch_topk8.py
 """
 import os
@@ -25,7 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from moe_ep_dispatch_core import MoEScale, run
 
 SCALE = MoEScale(
-    hidden=6,
+    hidden=16,
     intermediate=4,
     shared_intermediate=6,
     num_experts=16,

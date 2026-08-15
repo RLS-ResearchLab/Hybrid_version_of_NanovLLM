@@ -17,7 +17,17 @@ already-validated tests):
   - Both methods are called DIRECTLY (not through forward()'s cu_seqlens-
     based is_decode routing) -- routing itself isn't under test here, only
     the two methods' numerical agreement.
-  - Hidden-state rows uniquely tagged: row i = (i+1) * ones(H).
+  - Hidden-state rows: one-hot indicator vectors at randomly-chosen top-k
+    coordinates, paired with an identity gate.weight (HIDDEN==NUM_EXPERTS)
+    -- see moe_ep_dispatch_core.py's module docstring. FIXED post-hoc from
+    the original row_i=(i+1)*ones(H) tagging: since this is an INDEPENDENT
+    duplicate of moe_ep_dispatch_core.py (own build_reference/worker, not
+    imported), it had the identical collinear-routing bug -- every token
+    routed to the same top-k expert set regardless of N_TOKENS, so
+    decode-EP's own reassociation number was never actually measured under
+    divergent routing either. _build_divergent_x is imported from
+    moe_ep_dispatch_core.py (not re-derived) to avoid a second copy of the
+    same fix drifting out of sync.
   - Token-id round-trip (_last_ep_token_id_roundtrip) asserted exact,
     always -- integer-only, dtype-independent.
   - Routed-expert-only comparison (shared_expert_gate forced very negative,
@@ -52,9 +62,9 @@ if "nanovllm" not in sys.modules:
     sys.modules["nanovllm"] = _pkg
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from moe_ep_dispatch_core import _relative_error  # noqa: E402
+from moe_ep_dispatch_core import _relative_error, _build_divergent_x  # noqa: E402
 
-HIDDEN = 6
+HIDDEN = 16  # == NUM_EXPERTS, required by the identity-gate technique -- see module docstring
 INTERMEDIATE = 4
 SHARED_INTERMEDIATE = 6
 NUM_EXPERTS = 16
@@ -78,8 +88,12 @@ def build_reference():
     for name in sorted(dict(moe_ref.named_parameters()).keys()):
         p = dict(moe_ref.named_parameters())[name]
         p.data.normal_(mean=0.0, std=0.02)
+    # Overwrite the (randomly-initialized) gate with an exact identity --
+    # this is what gives per-token routing control, see module docstring.
+    moe_ref.gate.weight.data.copy_(torch.eye(NUM_EXPERTS))
 
-    x = torch.stack([(i + 1) * torch.ones(HIDDEN) for i in range(N_TOKENS)], dim=0)
+    x, picks = _build_divergent_x(N_TOKENS, NUM_EXPERTS, TOP_K)
+    print(f"[main] per-token top-{TOP_K} picks (genuinely divergent routing): {picks}")
 
     reference_out = moe_ref._forward_gathered(x)
     print(f"[main] reference (dense, ep_size=1, _forward_gathered) output shape={tuple(reference_out.shape)}")

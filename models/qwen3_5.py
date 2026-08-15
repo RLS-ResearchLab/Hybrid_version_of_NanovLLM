@@ -368,6 +368,20 @@ class Qwen35LinearAttention(nn.Module):
         # ops below don't have -- and decode is the latency-critical path, so
         # we don't want to risk regressing it while only prefill throughput
         # was the target of this optimization.
+        #
+        # ALSO LOAD-BEARING FOR CUDA GRAPH CAPTURE, NOT JUST PERFORMANCE:
+        # engine/model_runner.py's capture_cudagraph() only ever captures the
+        # DECODE step (is_decode_shape=True here, since its cu_seqlens_q is
+        # always arange(0, bs+1)). That is currently safe only because THIS
+        # line guarantees decode never takes the fused branch --
+        # fla.chunk_gated_delta_rule (self._fla_chunk_gated_delta_rule, called
+        # from _fused_gdr_scan below) is NOT capturable inside
+        # torch.cuda.graph(): reproduced directly, with proper warmup before
+        # capture, as cudaErrorStreamCaptureInvalidated. Do not flip decode to
+        # the fused path, and do not extend graph capture to prefill, without
+        # first re-confirming this constraint against whatever fla version is
+        # installed at the time -- it may have been fixed upstream, but it is
+        # not safe to assume so.
         use_fused = self.use_fused_gdr_kernel and not is_decode_shape
 
         y_chunks, new_states, new_conv_states = [], [], []
@@ -595,6 +609,16 @@ class Qwen35LinearAttention(nn.Module):
         # scale=1.0 explicitly -- q already carries the lhd**-0.5 scale from
         # upstream; letting the kernel apply its own default
         # (k.shape[-1]**-0.5) on top would double-scale. See point 1 above.
+        #
+        # NOT SAFE UNDER torch.cuda.graph() CAPTURE -- reproduced directly
+        # (proper warmup, then capture) as cudaErrorStreamCaptureInvalidated.
+        # Currently never an issue: forward()'s `use_fused` gate above
+        # guarantees this call is only reached for prefill, and
+        # engine/model_runner.py's capture_cudagraph() only ever captures
+        # decode. See the comment on `use_fused` above for the full
+        # constraint -- do not graph-capture prefill, or route decode through
+        # this call, without re-verifying this against the installed fla
+        # version first.
         o, final_state = self._fla_chunk_gated_delta_rule(
             q=q, k=k, v=v, g=g, beta=beta,
             scale=1.0,
