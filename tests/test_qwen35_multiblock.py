@@ -16,6 +16,7 @@ Usage:
     python tests/test_qwen35_multiblock.py
 """
 
+import atexit
 import sys
 import os
 import json
@@ -137,6 +138,14 @@ def run_once(fake_dir, prompt, max_tokens, seed):
 
         return tokens, preempt_count[0], crossed_block_boundary, total_len, block_size
     finally:
+        # LLMEngine.__init__ does atexit.register(self.exit) -- that keeps a
+        # permanent strong reference to this instance (model weights,
+        # kv_cache, StateManager buffers) alive for the life of the process
+        # no matter what, so calling engine.exit() alone does NOT free GPU
+        # memory before run_once()'s NEXT call constructs its own engine.
+        # Same fix tests/test_state_slot_reuse.py already documents and
+        # applies for the identical two-engines-in-one-process pattern.
+        atexit.unregister(engine.exit)
         engine.exit()
 
 
