@@ -83,6 +83,17 @@ def _build_pair(config, device, seed=42, init_std=0.02):
         for p in moe_off.parameters():
             p.normal_(0, init_std)
 
+    # Guardrail (additive only -- see tests/test_utils.py): confirms the
+    # explicit re-init above actually reached every parameter. This is the
+    # centralized version of the exact check this file's own docstring
+    # describes hand-diagnosing (all-zero on CPU / NaN on GPU from
+    # unreached torch.empty() tensors) -- see
+    # tests/test_qwen35_standalone.py::test_moe_vs_reference and
+    # tests/test_qwen35_full_model.py for the same root cause recurring
+    # where this fix was NOT applied.
+    from test_utils import assert_all_parameters_initialized
+    assert_all_parameters_initialized(moe_off)
+
     moe_on = Qwen35MoE(
         hidden_size=config.hidden_size,
         intermediate_size=config.moe_intermediate_size,

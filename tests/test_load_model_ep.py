@@ -49,6 +49,9 @@ if "nanovllm" not in sys.modules:
     _pkg.__file__ = os.path.join(ROOT, "__init__.py")
     sys.modules["nanovllm"] = _pkg
 
+sys.path.insert(0, os.path.dirname(__file__))
+from test_utils import known_zero_initialized_param_names, assert_all_parameters_initialized  # noqa: E402
+
 CKPT_DIR = os.path.join(ROOT, "qwen35_checkpoint")
 
 # Test B's small-but-real-expert-count config.
@@ -110,6 +113,10 @@ def test_a(rank: int):
     from nanovllm.models.qwen3_5 import Qwen35ForCausalLM
 
     config = Config(CKPT_DIR)
+    # No guardrail here (rule 4, per task instructions): torch.device("meta")
+    # construction allocates no real tensor storage -- there is nothing for
+    # assert_all_parameters_initialized to check, and calling it would just
+    # error on meta tensors, not catch a real bug.
     with torch.device("meta"):
         model = Qwen35ForCausalLM(config.hf_config)
 
@@ -151,6 +158,13 @@ def test_b_ep(rank: int, ckpt_dir: str, ref_gate_up: torch.Tensor, ref_down: tor
     config = _small_real_expert_count_config()
     model = Qwen35ForCausalLM(config)
     load_model(model, ckpt_dir)
+
+    # Guardrail (additive only -- see tests/test_utils.py): this checkpoint
+    # only contains the layer-0 experts tensors, so anything else load_model()
+    # failed to populate is exactly the class of bug this exists to catch.
+    assert_all_parameters_initialized(
+        model, whitelist_zero=known_zero_initialized_param_names(model)
+    )
 
     loaded_gu = model.model.layers[0].mlp.experts.gate_up_proj.data
     loaded_dn = model.model.layers[0].mlp.experts.down_proj.data
@@ -200,6 +214,11 @@ def test_b_ep1(ckpt_dir: str, ref_gate_up: torch.Tensor, ref_down: torch.Tensor)
     config = _small_real_expert_count_config()
     model = Qwen35ForCausalLM(config)
     load_model(model, ckpt_dir)
+
+    # Guardrail (additive only -- see tests/test_utils.py).
+    assert_all_parameters_initialized(
+        model, whitelist_zero=known_zero_initialized_param_names(model)
+    )
 
     loaded_gu = model.model.layers[0].mlp.experts.gate_up_proj.data
     loaded_dn = model.model.layers[0].mlp.experts.down_proj.data

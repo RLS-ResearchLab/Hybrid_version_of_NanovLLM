@@ -49,6 +49,9 @@ if "nanovllm" not in sys.modules:
     _pkg.__file__ = os.path.join(ROOT, "__init__.py")
     sys.modules["nanovllm"] = _pkg
 
+sys.path.insert(0, os.path.dirname(__file__))
+from test_utils import known_zero_initialized_param_names, assert_all_parameters_initialized  # noqa: E402
+
 HIDDEN = 8
 LKH, LVH, LHD, CK = 2, 4, 2, 4
 TP_SIZE = 2
@@ -153,6 +156,13 @@ def worker(rank: int, ckpt_dir: str, ref: dict):
     config = _small_config()
     model = Qwen35ForCausalLM(config)
     loader_mod.load_model(model, ckpt_dir)
+
+    # Guardrail (additive only -- see tests/test_utils.py): confirms
+    # load_model() actually populated EVERY parameter, not just the ones
+    # this test's DISPATCH/DATA checks below happen to sample.
+    assert_all_parameters_initialized(
+        model, whitelist_zero=known_zero_initialized_param_names(model)
+    )
 
     loader_mod.default_weight_loader = real_default
 

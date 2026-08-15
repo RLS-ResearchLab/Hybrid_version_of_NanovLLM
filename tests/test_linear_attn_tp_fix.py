@@ -63,6 +63,10 @@ def worker(rank: int):
     # affected, but that's a coincidence, not a confirmation the naming is
     # wired correctly -- separate, unfixed issue, flagged not fixed here.
 
+    # No assert_all_parameters_initialized here (see tests/test_utils.py):
+    # torch.device("meta") allocates no real storage -- this test only reads
+    # model.model.layer_types (structural, not numeric), never forward-passes
+    # this model.
     with torch.device("meta"):
         model = Qwen35ForCausalLM(hc)
 

@@ -43,6 +43,7 @@ from safetensors.torch import load_file, save_file
 
 sys.path.insert(0, os.path.dirname(__file__))
 from test_qwen35_standalone import init_dist, make_small_config
+from test_utils import known_zero_initialized_param_names, assert_all_parameters_initialized
 
 FAKE_DIR = os.path.join(os.path.dirname(__file__), "fake_qwen35_small")
 FUSED_DIR = os.path.join(os.path.dirname(__file__), "fake_qwen35_small_fused")
@@ -96,6 +97,12 @@ def main():
     os.makedirs(FUSED_DIR, exist_ok=True)
 
     torch.manual_seed(2024)
+    # No guardrail here (additive-only judgment call, not rule 4's literal
+    # meta-device case but the same spirit): this instance is real (not
+    # meta) but is used ONLY for its parameter NAMES (packed_modules_mapping
+    # lookup below) and is deleted immediately after, never forward-passed
+    # or otherwise relied on for numeric correctness -- there's nothing here
+    # a torch.empty()-garbage check would meaningfully protect.
     ref_model_for_names = Qwen35ForCausalLM(config).to("cuda").to(torch.bfloat16)
 
     sharded_tensors = load_file(SHARDED_PATH, device="cuda")
@@ -123,6 +130,13 @@ def main():
     load_model(model_sharded, FAKE_DIR)
     print("  load_model() completed without error")
 
+    # Guardrail (additive only -- see tests/test_utils.py): confirms
+    # load_model() actually populated every parameter from the real fake
+    # checkpoint, not just enough to avoid crashing.
+    assert_all_parameters_initialized(
+        model_sharded, whitelist_zero=known_zero_initialized_param_names(model_sharded)
+    )
+
     print("\n" + "=" * 70)
     print("Loading FUSED checkpoint (control -- direct copy_, bypassing load_model())")
     print("=" * 70)
@@ -141,6 +155,21 @@ def main():
             param.data.copy_(fused_on_disk[name])
     print(f"  copied {len(fused_on_disk)} tensors directly (weight_loader bypassed by design)")
 
+    # Guardrail (additive only -- see tests/test_utils.py): the manual copy
+    # loop above targets every named_parameter by name, so this should
+    # trivially pass -- confirms the "bypass" path didn't silently miss
+    # anything either.
+    assert_all_parameters_initialized(
+        model_fused, whitelist_zero=known_zero_initialized_param_names(model_fused)
+    )
+
+    # No guardrail on the model constructed just below: it's passed straight
+    # into a load_model() call that's EXPECTED to raise TypeError (a real,
+    # documented loader gap with fused-name checkpoints, out of scope here)
+    # before any parameter would be populated -- wiring a check here would
+    # either never run (exception fires first) or, if moved before the call,
+    # trivially fail on an untouched model and add nothing to what's already
+    # being tested. See the try/except immediately below.
     try:
         load_model(Qwen35ForCausalLM(config).to("cuda").to(torch.bfloat16), FUSED_DIR)
         print("  [UNEXPECTED] load_model() accepted the fused-name checkpoint without error")

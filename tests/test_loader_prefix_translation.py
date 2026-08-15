@@ -72,6 +72,12 @@ def main():
     all_keys = list(weight_map.keys())
     print(f"checkpoint has {len(all_keys)} total keys")
 
+    # No assert_all_parameters_initialized here (see tests/test_utils.py):
+    # torch.device("meta") allocates no real storage, only names/shapes --
+    # there is nothing for that guardrail to check, and calling it would
+    # just error on meta tensors rather than catch a real bug. This test
+    # only ever reads model.named_parameters() for NAMES, never numeric
+    # values.
     with torch.device("meta"):
         model = Qwen35ForCausalLM(config.hf_config)
     param_names = set(name for name, _ in model.named_parameters())

@@ -14,6 +14,11 @@ class Config:
     enforce_eager: bool = False
     use_fused_gdr_kernel: bool = False
     use_vectorized_moe: bool = False
+    # Debug-only: prints argmax vs sampled token for every prefilled seq on
+    # every prefill call. Forces an extra argmax() + host-sync .tolist() in
+    # the hot path even when nobody reads the output -- default off so
+    # normal runs (including anything being benchmarked) don't pay for it.
+    debug_print_prefill_samples: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256

@@ -19,24 +19,26 @@ from test_qwen35_standalone import init_dist, make_small_config   # ← MUST run
 from nanovllm.engine.state_manager import StateManager             # ← these only work AFTER the line above
 from nanovllm.models.qwen3_5 import Qwen35ForCausalLM
 from nanovllm.utils.context import set_context, reset_context
-from nanovllm.layers.layernorm import Qwen35RMSNorm, Qwen35RMSNormGated
+from test_utils import (
+    init_model_weights_with_norms_,
+    known_zero_initialized_param_names,
+    assert_all_parameters_initialized,
+)
 
 def build_model_and_state(config, device, max_num_seqs, dtype=torch.bfloat16):
     torch.manual_seed(2024)
     model = Qwen35ForCausalLM(config).to(device).to(dtype)
-    with torch.no_grad():
-        for module in model.modules():
-            if isinstance(module, Qwen35RMSNormGated):
-                torch.nn.init.ones_(module.weight)     # gain, ref inits to ones
-            elif isinstance(module, Qwen35RMSNorm):
-                torch.nn.init.zeros_(module.weight)    # (1+w) variant, ref inits to zeros
-
-        for name, param in model.named_parameters():
-            if param.dim() >= 2:
-                torch.nn.init.normal_(param, mean=0.0, std=0.02)
-            elif "A_log" in name or "dt_bias" in name:
-                torch.nn.init.zeros_(param)   
-                
+    # Centralized module-type-aware init (test_utils.init_model_weights_with_norms_)
+    # -- this used to be inlined here as an isinstance() block; that block is
+    # what fixed the Phase 2 all-RMSNormGated-weights-zeroed incident, and it
+    # was getting re-derived by every new harness that needed a real model.
+    # Moved to test_utils.py so there's exactly one copy.
+    init_model_weights_with_norms_(model, seed=2024)
+    # Guardrail: every param/buffer must be really initialized, not
+    # torch.empty() garbage, before any test built on this harness runs.
+    assert_all_parameters_initialized(
+        model, whitelist_zero=known_zero_initialized_param_names(model)
+    )
 
     num_linear = len(model.model.linear_layer_indices)
     sm = StateManager(

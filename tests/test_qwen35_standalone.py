@@ -442,6 +442,34 @@ def test_moe_vs_reference(device):
         if nv_name in ref_sd and nv_param.shape == ref_sd[nv_name].shape:
             nv_param.data.copy_(ref_sd[nv_name].data)
 
+    # Guardrail (additive only -- see tests/test_utils.py): this copy loop
+    # is a per-name/per-shape match with no "missed" tracking at all (unlike
+    # test_qwen35_full_model.py's copy_weights_to_port) -- any nv_moe
+    # parameter that doesn't find a matching ref_sd entry is silently left
+    # as torch.empty() garbage and the forward pass below would run on it
+    # without any signal. Catches exactly that gap.
+    #
+    # KNOWN FAILURE, NOT WORKED AROUND (per task instructions -- report, don't
+    # silently fix): this currently DOES fail, on experts.gate_up_proj /
+    # experts.down_proj being all-zero. Root cause is NOT this copy loop --
+    # it's upstream in src/model_small_qwen3.5.py's own Experts class
+    # (line ~252-253: `nn.Parameter(torch.empty(NE, 2*MI, H))`, never
+    # explicitly initialized anywhere in the reference), which this port's
+    # own Experts class mirrors exactly. ref_moe.experts.gate_up_proj is
+    # ALREADY all-zero (confirmed directly) before this loop ever runs, so
+    # the loop faithfully copies zero into nv_moe -- both sides silently
+    # agree at zero. This test's cosine>0.99 pass has therefore only ever
+    # validated the shared_expert + gating/dispatch-bookkeeping path, NOT
+    # the actual per-expert gate_up_proj/down_proj matmul -- the part that
+    # is architecturally the core of what a MoE layer computes. Left
+    # un-fixed here deliberately: src/model_small_qwen3.5.py is the
+    # reference and out of scope to modify, and this task's instructions are
+    # to surface this, not patch around it.
+    from test_utils import known_zero_initialized_param_names, assert_all_parameters_initialized
+    assert_all_parameters_initialized(
+        nv_moe, whitelist_zero=known_zero_initialized_param_names(nv_moe)
+    )
+
     torch.manual_seed(99)
     B, T, H = 1, 6, config.hidden_size
     x = torch.randn(B, T, H, device=device, dtype=torch.bfloat16)

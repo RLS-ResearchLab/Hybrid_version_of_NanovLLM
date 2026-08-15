@@ -21,6 +21,7 @@ from test_qwen35_standalone import (
     load_reference_module,
     make_small_config,
 )
+from test_utils import known_zero_initialized_param_names, assert_all_parameters_initialized
 
 
 def copy_weights_to_port(port_model, ref_model):
@@ -81,6 +82,33 @@ def test_full_model_single_shot(device):
         for name, ref_name, port_shape, ref_shape in missed[:10]:
             print(f"    MISSED: {name} (ref={ref_name}) port={port_shape} ref={ref_shape}")
     assert not missed, f"{len(missed)} parameters failed to copy — see above"
+
+    # Guardrail (additive only -- see tests/test_utils.py): "not missed"
+    # above only proves every port parameter NAME/SHAPE matched something in
+    # copy_weights_to_port's "copied" list -- it doesn't independently prove
+    # the copied values themselves are real, finite, non-degenerate numbers.
+    #
+    # CONFIRMED FAILURE, NOT WORKED AROUND (per task instructions -- report,
+    # don't silently fix): this DOES fail here, on every layer's
+    # mlp.experts.gate_up_proj / experts.down_proj being all-zero. Root
+    # cause: src/model_small_qwen3.5.py's Experts class constructs those as
+    # `nn.Parameter(torch.empty(...))` with no explicit init anywhere in the
+    # reference, and ref_model.layers.*.mlp.experts.gate_up_proj/down_proj
+    # are ALREADY all-zero (confirmed directly) before copy_weights_to_port
+    # ever runs -- the copy faithfully carries zero into port_model, "not
+    # missed" included, since name/shape matching succeeds regardless of the
+    # VALUE being copied. This test's headline cosine number (0.999967, per
+    # make_fake_checkpoint.py's docstring) has therefore only ever validated
+    # attention/norm/shared-expert/gating agreement, never the actual
+    # per-expert gate_up_proj/down_proj matmul -- the core MoE computation.
+    # Same root cause as tests/test_qwen35_standalone.py::test_moe_vs_reference
+    # and it also poisons tests/fake_qwen35_small/model.safetensors (see
+    # make_fake_checkpoint.py), since that fixture is built by this same
+    # copy_weights_to_port off the same reference class. Not fixed here:
+    # src/model_small_qwen3.5.py is the reference and out of scope to modify.
+    assert_all_parameters_initialized(
+        port_model, whitelist_zero=known_zero_initialized_param_names(port_model)
+    )
 
     torch.manual_seed(321)
     T = 12

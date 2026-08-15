@@ -105,6 +105,19 @@ def main():
     with torch.no_grad():
         moe.gate.weight.normal_(mean=0.0, std=0.02)
 
+    # Guardrail (additive only -- see tests/test_utils.py), scoped to
+    # moe.gate specifically rather than the whole moe module: this script
+    # only ever forward-passes moe.gate(x) below (never moe(x) / the
+    # experts or shared_expert submodules), so those remain deliberately
+    # unpopulated torch.empty() and would be a false alarm here, not a real
+    # bug for what this script measures. This is exactly the precondition
+    # check that would have caught the original ~247/256-zero-tokens
+    # incident this file's own comment above documents, applied at the
+    # scope this script actually depends on.
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test_utils import assert_all_parameters_initialized
+    assert_all_parameters_initialized(moe.gate)
+
     x = torch.randn(args.n_tokens, args.hidden_size)
     with torch.no_grad():
         logits = moe.gate(x)

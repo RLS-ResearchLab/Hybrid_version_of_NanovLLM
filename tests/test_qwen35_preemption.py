@@ -39,7 +39,12 @@ loader_mod.load_model = lambda model, path: None
 
 import nanovllm.config as config_mod
 sys.path.insert(0, os.path.dirname(__file__))
-from test_utils import init_model_weights_, assert_not_degenerate
+from test_utils import (
+    init_model_weights_,
+    assert_not_degenerate,
+    known_zero_initialized_param_names,
+    assert_all_parameters_initialized,
+)
 
 class AttrDict(dict):
     def __getattr__(self, k):
@@ -94,6 +99,23 @@ def _build_engine_pieces(gpu_memory_utilization, max_num_seqs=4):
     runner = ModelRunner(config, rank=0, event=[])
 
     init_model_weights_(runner.model, seed=2024)
+    # Guardrail (additive only -- see tests/test_utils.py). NOTE: this call
+    # uses the plain shape-based init_model_weights_, not
+    # init_model_weights_with_norms_, exactly as this harness already did
+    # before this guardrail was added -- left unchanged deliberately, not
+    # upgraded, per the "don't fix what the guardrail finds, report it"
+    # instruction. known_zero_initialized_param_names() does NOT whitelist
+    # Qwen35RMSNormGated.weight (only plain Qwen35RMSNorm + A_log/dt_bias),
+    # so if this model contains any Qwen35RMSNormGated instances -- which,
+    # per fake_qwen35_small/config.json's full_attention_interval=4, it does
+    # (6 of 8 layers are linear_attention, each with a gated norm) -- this
+    # assertion is expected to FAIL here. That failure is not a false
+    # positive: confirmed by direct isolated test that shape-based-only init
+    # zeros every Qwen35RMSNormGated.weight, which makes every
+    # linear-attention layer's output identically zero (abs-sum == 0.0).
+    assert_all_parameters_initialized(
+        runner.model, whitelist_zero=known_zero_initialized_param_names(runner.model)
+    )
 
     scheduler = Scheduler(config)
     scheduler.state_manager = runner.state_manager

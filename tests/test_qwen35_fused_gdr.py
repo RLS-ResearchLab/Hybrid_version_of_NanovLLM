@@ -118,6 +118,18 @@ def _build_pair(config, device, seed=42):
             param.data.copy_(ref_sd[name].data)
     la_on.load_state_dict(la_off.state_dict())
 
+    # Guardrail (additive only -- see tests/test_utils.py): la_off is never
+    # explicitly initialized before this copy loop -- any parameter that
+    # doesn't find a name/shape match in ref_sd (or whose ref_sd source is
+    # itself uninitialized, the same class of bug confirmed elsewhere in
+    # this pass -- see test_qwen35_standalone.py::test_moe_vs_reference)
+    # would silently stay torch.empty() garbage through both la_off and,
+    # via load_state_dict, la_on too.
+    from test_utils import known_zero_initialized_param_names, assert_all_parameters_initialized
+    assert_all_parameters_initialized(
+        la_off, whitelist_zero=known_zero_initialized_param_names(la_off)
+    )
+
     return la_off, la_on, ref_la
 
 
