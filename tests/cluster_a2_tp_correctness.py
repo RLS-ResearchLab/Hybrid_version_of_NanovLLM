@@ -124,6 +124,35 @@ def _maybe_install_fake_config_loader(args):
         config_mod.AutoConfig.from_pretrained = staticmethod(_fake_from_pretrained)
         print("--fake-config-loader: AutoConfig.from_pretrained monkeypatched to read "
               "config.json as a flat dict (see _AttrDict's docstring)")
+
+
+def _free_diagnostic_seq(llm, seq) -> None:
+    """Frees the KV block(s) and (if active) StateManager slot a manually-
+    constructed diagnostic Sequence grabbed for a get_prefill_logits() call
+    -- mirrors Scheduler.preempt()'s cleanup pairing exactly
+    (block_manager.deallocate + free_state_slot), just called directly
+    since these diagnostic sequences never go through Scheduler.schedule()/
+    postprocess() at all.
+
+    REAL BUG THIS FIXES, found on the first actual GPU run of A2 (not
+    theoretical): reference_check_phase6.py / gsm8k_prefill_logits_check.py
+    established the pattern this borrows (manual Sequence,
+    block_manager.allocate + allocate_state_slot, get_prefill_logits) but
+    NEVER free it afterward -- harmless there because those scripts only
+    ever call get_prefill_logits once per prompt, so total demand never
+    exceeds max_num_seqs=len(PROMPTS). A2 (decode coverage, per the task's
+    requirement) and A3's histogram phase (up to 64 prompts against
+    max_num_seqs=8) both ALSO need a state slot for a SECOND, separate
+    Sequence per prompt afterward (llm.generate()'s own internal one, or
+    the next diagnostic seq in a >max_num_seqs loop) -- without freeing the
+    first one, StateManager.free_slot_ids empties out and
+    StateManager.allocate() raises `IndexError: pop from an empty deque`,
+    exactly as reproduced on real hardware, tensor_parallel_size=1, prompt
+    5 of 5.
+    """
+    llm.scheduler.block_manager.deallocate(seq)
+    if llm.model_runner.state_manager is not None:
+        llm.model_runner.call("free_state_slot", seq)
 DECODE_MAX_TOKENS = 10  # short on purpose -- isolating math agreement, not a real eval
 
 # Same set as reference_check_phase6.py -- varied length/content, kept
@@ -252,6 +281,10 @@ def phase_engine(args):
 
         prefill_logits = llm.model_runner.call("get_prefill_logits", [seq])
         assert prefill_logits is not None, "expected rank0 to return gathered logits"
+        # MUST free before generate() below allocates its OWN separate
+        # Sequence for the same prompt -- see _free_diagnostic_seq's
+        # docstring for the real crash this prevents.
+        _free_diagnostic_seq(llm, seq)
 
         sp = SamplingParams(temperature=0, max_tokens=DECODE_MAX_TOKENS)
         decode_out = llm.generate([prompt], sp, use_tqdm=False)

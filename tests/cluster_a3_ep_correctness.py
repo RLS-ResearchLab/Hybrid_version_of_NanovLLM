@@ -77,7 +77,7 @@ if "nanovllm" not in sys.modules:
 sys.path.insert(0, os.path.dirname(__file__))
 from gsm8k_prompt import build_prompt  # noqa: E402
 from cluster_a2_tp_correctness import (  # noqa: E402
-    REFERENCE_PATH, PROMPTS, _maybe_install_fake_config_loader,
+    REFERENCE_PATH, PROMPTS, _maybe_install_fake_config_loader, _free_diagnostic_seq,
 )
 
 DEFAULT_CKPT = os.path.join(ROOT, "qwen35_checkpoint")
@@ -148,6 +148,10 @@ def phase_engine(args):
                 llm.model_runner.call("allocate_state_slot", seq)
             routed_only_logits = llm.model_runner.call("get_prefill_logits", [seq])
             assert routed_only_logits is not None
+            # See cluster_a2_tp_correctness.py's _free_diagnostic_seq
+            # docstring for the real crash this prevents once a loop admits
+            # more diagnostic sequences than max_num_seqs.
+            _free_diagnostic_seq(llm, seq)
             print(f"  [engine ep_tp={args.tp}] {prompt!r} -> prompt_tokens={len(prompt_ids)}")
             results.append({
                 "prompt": prompt, "prompt_ids": prompt_ids,
@@ -274,6 +278,13 @@ def phase_histogram(args):
                 if llm.model_runner.state_manager is not None:
                     llm.model_runner.call("allocate_state_slot", seq)
                 llm.model_runner.call("get_prefill_logits", [seq])
+                # MUST free -- this loop runs up to HISTOGRAM_NUM_PROMPTS (64
+                # by default) diagnostic sequences against a max_num_seqs=8
+                # StateManager; see cluster_a2_tp_correctness.py's
+                # _free_diagnostic_seq docstring for the real crash this
+                # prevents (confirmed pattern, reproduced elsewhere in this
+                # same file's phase_engine on real hardware).
+                _free_diagnostic_seq(llm, seq)
             print(f"  routed {min(b + 8, len(prompts))}/{len(prompts)} prompts through real gates ...")
     finally:
         for h in handles:
