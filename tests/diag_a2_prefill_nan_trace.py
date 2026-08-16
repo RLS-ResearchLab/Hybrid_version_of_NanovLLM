@@ -103,6 +103,34 @@ def main():
     prompt_ids = llm.tokenizer.encode(PROMPT)
     print(f"prompt: {PROMPT!r} -> token ids: {prompt_ids}\n")
 
+    # Direct weight-table inspection, bypassing the whole forward pass --
+    # embedding OUTPUT being exactly 0.0 (not just small) for 5 real,
+    # distinct token ids across 512 dims each is not plausible from a
+    # continuous random init (nn.Embedding's default normal_ init has
+    # ~zero probability of landing an entire row on exact 0.0 by chance);
+    # this checks whether the WEIGHT TABLE itself has zero rows at these
+    # exact indices (a weight-population bug) before assuming anything
+    # about the forward-pass math.
+    embed_weight = llm.model_runner.model.model.embed_tokens.weight
+    print(f"embed_tokens.weight: shape={tuple(embed_weight.shape)} dtype={embed_weight.dtype}")
+    print(f"  whole-tensor: nonzero_count={torch.count_nonzero(embed_weight).item()} / "
+          f"{embed_weight.numel()}  abs_max={embed_weight.float().abs().max().item():.4g}")
+    for tid in prompt_ids:
+        row = embed_weight[tid]
+        print(f"  row[{tid}]: nonzero_count={torch.count_nonzero(row).item()}/{row.numel()}  "
+              f"abs_max={row.float().abs().max().item():.4g}  first 5 values={row[:5].float().tolist()}")
+    # A handful of RANDOM (non-prompt) token ids as a control -- are ALL
+    # rows zero (whole-table problem) or just these 5 (something specific
+    # to these indices)?
+    import random as _random
+    control_ids = _random.Random(0).sample(range(embed_weight.shape[0]), 5)
+    print(f"  control rows (random token ids {control_ids}, NOT in this prompt):")
+    for tid in control_ids:
+        row = embed_weight[tid]
+        print(f"    row[{tid}]: nonzero_count={torch.count_nonzero(row).item()}/{row.numel()}  "
+              f"abs_max={row.float().abs().max().item():.4g}")
+    print()
+
     seq = Sequence(prompt_ids)
     seq.num_scheduled_tokens = len(prompt_ids)
     llm.scheduler.block_manager.allocate(seq, 0)
