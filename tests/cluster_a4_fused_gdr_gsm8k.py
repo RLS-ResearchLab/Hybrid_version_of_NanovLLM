@@ -41,9 +41,17 @@ checkpoint at the SAME tensor_parallel_size and there's no reason to pay the
     python tests/cluster_a4_fused_gdr_gsm8k.py --tp 2 --num-examples 40
 
 Dry run (small model, single GPU -- meaningless for accuracy, since
-fake_qwen35_small has random untrained weights, but DOES validate that
+fake_qwen35_small was never trained on GSM8K, but DOES validate that
 flag-on/flag-off produce equal-length, non-crashing, well-formed output
-through the real multi-step decode path):
+through the real multi-step decode path). PREREQUISITE, run once (needs
+CUDA) before the first dry run -- see cluster_a2_tp_correctness.py's
+module docstring for the full writeup:
+    python tests/make_fake_hf_config.py     # already done if config.json exists
+    python tests/make_fake_checkpoint.py    # writes model.safetensors -- REQUIRED
+    python tests/make_fake_tokenizer.py     # already done if tokenizer.json exists
+Without it every parameter is torch.empty() garbage rather than merely
+untrained, and outputs can be non-finite, not just architecturally
+meaningless.
 
     python tests/cluster_a4_fused_gdr_gsm8k.py --checkpoint tests/fake_qwen35_small \\
         --tp 1 --num-examples 8 --dry-run --fake-config-loader

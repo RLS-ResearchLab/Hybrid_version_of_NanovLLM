@@ -36,7 +36,23 @@ Usage (defaults: try tp=4 first, degrade to tp=2; ~15min timeout per attempt):
     # Only the configs actually available that day:
     python tests/cluster_a1_memory_probe.py --checkpoint /path/to/real/checkpoint --tp-sizes 2
 
-Dry run (small model, single GPU -- see this task's cluster-day prep):
+Dry run (small model, single GPU -- see this task's cluster-day prep).
+PREREQUISITE, run once (needs CUDA): tests/fake_qwen35_small ships with no
+model.safetensors on purpose (see tests/make_fake_hf_config.py's own note)
+-- without this, load_model() finds zero weight files, EVERY parameter
+stays torch.empty() garbage, and downstream scripts that check output
+finiteness (e.g. cluster_a2_tp_correctness.py --phase compare) will fail
+with non-finite logits, not because of a real bug:
+    python tests/make_fake_hf_config.py     # already done if config.json exists
+    python tests/make_fake_checkpoint.py    # writes model.safetensors -- REQUIRED
+    python tests/make_fake_tokenizer.py     # already done if tokenizer.json exists
+Known, pre-existing, documented limitation of that checkpoint (see
+make_fake_checkpoint.py's own comment, NOT fixed here -- its root cause is
+in src/model_small_qwen3.5.py, out of scope to modify): the MoE Experts'
+gate_up_proj/down_proj bake in as all-ZERO (finite, not NaN/Inf -- the
+routed-expert MoE contribution is just always exactly zero; the routing
+GATE itself and every other layer type are real, finite, non-degenerate).
+
     python tests/cluster_a1_memory_probe.py --checkpoint tests/fake_qwen35_small --tp-sizes 1 \\
         --out tests/_cluster_day_cache/a1_dry_run.jsonl --timeout-s 300 --fake-config-loader
 """

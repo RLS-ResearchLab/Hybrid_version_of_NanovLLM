@@ -45,7 +45,17 @@ Usage:
     python tests/cluster_a5_concurrency_sweep.py --checkpoint /path/to/real/checkpoint --tp 4
     python tests/cluster_a5_concurrency_sweep.py --checkpoint /path/to/real/checkpoint --tp 2
 
-Dry run (small model, single GPU):
+Dry run (small model, single GPU). PREREQUISITE, run once (needs CUDA)
+before the first dry run -- see cluster_a2_tp_correctness.py's module
+docstring for the full writeup:
+    python tests/make_fake_hf_config.py     # already done if config.json exists
+    python tests/make_fake_checkpoint.py    # writes model.safetensors -- REQUIRED
+    python tests/make_fake_tokenizer.py     # already done if tokenizer.json exists
+Without it every parameter is torch.empty() garbage rather than merely
+untrained -- bench_throughput.py's own build_engine() has no finiteness
+check either, so a missing checkpoint here would silently "pass" on
+meaningless numbers instead of failing loudly.
+
     python tests/cluster_a5_concurrency_sweep.py --checkpoint tests/fake_qwen35_small --tp 1 \\
         --levels 1 2 4 --prompt-len 32 --output-len 64 --gpu-memory-utilization 0.2
 """

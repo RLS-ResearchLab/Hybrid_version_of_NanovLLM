@@ -51,7 +51,15 @@ HF reference cannot coexist):
 Dry run (small model, single GPU, tp=1 -- EP branch requires ep_size>1
 though, so a true tp=1 dry run cannot exercise _forward_dispatch_ep/
 _forward_gathered_ep at all; --dry-run-no-hf-reference below only confirms
-the histogram phase's real-weight routing plumbing works end-to-end):
+the histogram phase's real-weight routing plumbing works end-to-end).
+PREREQUISITE, run once (needs CUDA) before the first dry run -- see
+cluster_a2_tp_correctness.py's module docstring for the full writeup:
+    python tests/make_fake_hf_config.py     # already done if config.json exists
+    python tests/make_fake_checkpoint.py    # writes model.safetensors -- REQUIRED
+    python tests/make_fake_tokenizer.py     # already done if tokenizer.json exists
+Without it every parameter is torch.empty() garbage and the histogram's
+hidden states (hence its routing decisions) would be meaningless, not
+because of a real bug here.
 
     python tests/cluster_a3_ep_correctness.py --phase histogram \\
         --checkpoint tests/fake_qwen35_small --tp 1 --dry-run-no-hf-reference --fake-config-loader

@@ -47,7 +47,20 @@ engine cannot coexist in GPU memory):
     python tests/cluster_a2_tp_correctness.py --phase compare --tp 2
 
 Dry run (small model, single GPU, tp=1 -- see this task's cluster-day prep;
---phase reference is SKIPPED for the dry run, see --dry-run-no-hf-reference):
+--phase reference is SKIPPED for the dry run, see --dry-run-no-hf-reference).
+PREREQUISITE, run once (needs CUDA) before the first dry run --
+tests/fake_qwen35_small ships with no model.safetensors on purpose; without
+it every parameter is torch.empty() garbage and --phase compare's finite
+check will fail with non-finite logits, not because of a real bug in this
+script:
+    python tests/make_fake_hf_config.py     # already done if config.json exists
+    python tests/make_fake_checkpoint.py    # writes model.safetensors -- REQUIRED
+    python tests/make_fake_tokenizer.py     # already done if tokenizer.json exists
+Known, pre-existing, documented limitation (make_fake_checkpoint.py's own
+comment; root cause is in src/model_small_qwen3.5.py, out of scope here):
+the MoE Experts' gate_up_proj/down_proj bake in as all-ZERO (finite, not
+NaN -- routed-expert MoE contribution is always exactly zero; every other
+layer type, and the routing gate itself, are real and non-degenerate).
 
     python tests/cluster_a2_tp_correctness.py --phase engine --tp 1 \\
         --checkpoint tests/fake_qwen35_small --dry-run-no-hf-reference --fake-config-loader
