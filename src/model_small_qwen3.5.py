@@ -251,13 +251,6 @@ class Experts(nn.Module):
         super().__init__()
         self.gate_up_proj = nn.Parameter(torch.empty(NE, 2*MI, H))
         self.down_proj    = nn.Parameter(torch.empty(NE, H, MI))
-        # nn.Linear siblings (gate/shared_expert) get PyTorch's default init
-        # via their own reset_parameters(); these raw Parameters need the
-        # same treatment explicitly, or they stay uninitialized torch.empty()
-        # garbage (observed reading back as all-zero) -- contradicting this
-        # file's own "Initializes with random weights" contract above.
-        nn.init.kaiming_uniform_(self.gate_up_proj, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.down_proj, a=math.sqrt(5))
 
 
 class MoEFFN(nn.Module):
