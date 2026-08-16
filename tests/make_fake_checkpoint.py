@@ -5,9 +5,13 @@ memory (LinearBase, Experts, VocabParallelEmbedding/ParallelLMHead all skip
 default init).
 
 Reuses test_qwen35_full_model.py's copy_weights_to_port(port_model, ref_model)
--- validated at cosine 0.999967 against the reference implementation -- to
-populate a Qwen35ForCausalLM from the reference Qwen35MoESmall (plain
-nn.Linear, so it initializes correctly with finite values).
+-- validated against the reference implementation, see that test's own
+printed cosine for the current number (the 0.999967 figure once quoted here
+was measured before Experts.gate_up_proj/down_proj were initialized -- see
+init_reference_moe_experts_ below -- and is stale; do not re-quote it
+without re-running the test) -- to populate a Qwen35ForCausalLM from the
+reference Qwen35MoESmall (plain nn.Linear, so it initializes correctly with
+finite values).
 
 The saved tensor names must match what nanovllm.utils.loader.load_model()
 expects: every port parameter name, PREFIX-TRANSLATED to the real
@@ -36,7 +40,11 @@ from safetensors.torch import save_file
 sys.path.insert(0, os.path.dirname(__file__))
 from test_qwen35_standalone import init_dist, load_reference_module, make_small_config
 from test_qwen35_full_model import copy_weights_to_port
-from test_utils import known_zero_initialized_param_names, assert_all_parameters_initialized
+from test_utils import (
+    known_zero_initialized_param_names,
+    assert_all_parameters_initialized,
+    init_reference_moe_experts_,
+)
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "fake_qwen35_small")
 OUT_PATH = os.path.join(OUT_DIR, "model.safetensors")
@@ -114,6 +122,45 @@ def main():
     torch.manual_seed(2024)
     ref_mod = load_reference_module()
     ref_model = ref_mod.Qwen35MoESmall().to("cuda").to(torch.bfloat16)
+
+    # FIXED (was: CONFIRMED FAILURE below) -- ref_model's Experts class
+    # (src/model_small_qwen3.5.py) never initializes gate_up_proj/down_proj,
+    # they read back all-zero straight out of construction, and
+    # copy_weights_to_port would otherwise faithfully carry that zero into
+    # port_model -- which is the direct source of
+    # tests/fake_qwen35_small/model.safetensors, so that fixture file had
+    # all-zero expert weights baked into it on disk. src/model_small_qwen3.5.py
+    # is the reference and out of scope to modify, so this initializes the
+    # constructed ref_model instance instead -- see
+    # init_reference_moe_experts_'s docstring in test_utils.py (shared with
+    # test_qwen35_full_model.py and test_qwen35_standalone.py, which hit the
+    # identical issue) for why this is the targeted `.normal_(0, 0.02)` fix
+    # test_qwen35_vectorized_moe.py already validated locally, not the
+    # blanket init_model_weights_with_norms_ (which would incorrectly zero
+    # this reference module's RMSNormGated.weight instead, since its
+    # isinstance-based norm override only matches nanovllm's own layernorm
+    # classes, not the reference's).
+    #
+    # 17 files under tests/ reference "fake_qwen35_small" (grep-confirmed):
+    # this file and test_qwen35_full_model.py (the ones that construct this
+    # checkpoint), plus test_loader_shard_merge.py, test_qwen35_preemption.py,
+    # test_qwen35_preemption_state.py, test_state_slot_reuse.py,
+    # test_qwen35_multiblock.py, cuda_graph_consistency_test.py,
+    # run_small_model_smoke_test.py, decode_stagger_contamination_check.py,
+    # gsm8k_fused_gdr_check.py, debug_warmup_state.py, debug_kvcache.py,
+    # test_qwen34_model_runner.py, plus the fixture-generation scripts
+    # (make_fake_hf_config.py, make_fake_tokenizer.py,
+    # add_fake_chat_template.py). Per-file check now done (see the intervention
+    # that added this fix): most of the ModelRunner/LLMEngine-based ones
+    # monkeypatch load_model() to a no-op and initialize their own weights
+    # directly, so they never actually read this fixture's .safetensors
+    # content and were unaffected by the zero-Experts bug either way.
+    # test_state_slot_reuse.py, run_small_model_smoke_test.py, and
+    # gsm8k_fused_gdr_check.py DO load this fixture for real (no override)
+    # and route tokens through MoE with it -- those three are the genuine
+    # dependents of this fix and were re-run against the regenerated fixture.
+    init_reference_moe_experts_(ref_model, seed=42)
+
     port_model = Qwen35ForCausalLM(config).to("cuda").to(torch.bfloat16)
 
     copied, missed = copy_weights_to_port(port_model, ref_model)
@@ -127,32 +174,9 @@ def main():
     # only proves every port parameter NAME/SHAPE matched something in
     # copy_weights_to_port's "copied" list, same caveat as
     # test_qwen35_full_model.py -- doesn't independently prove the copied
-    # values themselves are real, finite, non-degenerate numbers.
-    #
-    # CONFIRMED FAILURE, NOT WORKED AROUND (per task instructions -- report,
-    # don't silently fix): this DOES fail here, same root cause as
-    # test_qwen35_full_model.py -- ref_model's Experts class
-    # (src/model_small_qwen3.5.py) never initializes gate_up_proj/down_proj,
-    # they read back all-zero, and copy_weights_to_port faithfully carries
-    # that zero into port_model. This model is the direct source of
-    # tests/fake_qwen35_small/model.safetensors, so that FIXTURE FILE has
-    # all-zero expert weights baked into it on disk. 17 files under tests/
-    # reference "fake_qwen35_small" (grep-confirmed): this file and
-    # test_qwen35_full_model.py (the ones directly implicated above), plus
-    # test_loader_shard_merge.py, test_qwen35_preemption.py,
-    # test_qwen35_preemption_state.py, test_state_slot_reuse.py,
-    # test_qwen35_multiblock.py, cuda_graph_consistency_test.py,
-    # run_small_model_smoke_test.py, decode_stagger_contamination_check.py,
-    # gsm8k_fused_gdr_check.py, debug_warmup_state.py, debug_kvcache.py,
-    # test_qwen34_model_runner.py, plus the fixture-generation scripts
-    # (make_fake_hf_config.py, make_fake_tokenizer.py,
-    # add_fake_chat_template.py). NOT all of those necessarily exercise the
-    # MoE expert forward path (some only touch KV-cache/scheduler mechanics)
-    # -- that would need a per-file check this pass didn't do -- but any of
-    # them that construct a model from this checkpoint and route tokens
-    # through MoE are getting zero-valued expert weights, silently. Not
-    # fixed here: src/model_small_qwen3.5.py is the reference and out of
-    # scope to modify.
+    # values themselves are real, finite, non-degenerate numbers. Now passes
+    # for real (init_reference_moe_experts_ above), not degenerately on
+    # zero == zero.
     assert_all_parameters_initialized(
         port_model, whitelist_zero=known_zero_initialized_param_names(port_model)
     )

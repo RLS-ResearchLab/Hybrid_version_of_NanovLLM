@@ -23,6 +23,7 @@ Usage:
     from test_utils import (
         init_model_weights_,              # shape-based only (dim>=2 -> normal, else zero)
         init_model_weights_with_norms_,    # + correct-by-type norm-weight override (preferred default)
+        init_reference_moe_experts_,       # src/model_small_qwen3.5.py-only: fixes Experts, leaves the rest
         known_zero_initialized_param_names,
         assert_all_parameters_initialized,
     )
@@ -92,6 +93,53 @@ def init_model_weights_with_norms_(model: torch.nn.Module, seed: int = 42) -> No
                 torch.nn.init.ones_(module.weight)     # gain, ref inits to ones
             elif isinstance(module, Qwen35RMSNorm):
                 torch.nn.init.zeros_(module.weight)    # (1+w) variant, ref inits to zeros
+
+
+def init_reference_moe_experts_(model: torch.nn.Module, seed: int = 42, std: float = 0.02) -> None:
+    """Initializes src/model_small_qwen3.5.py's Experts.gate_up_proj /
+    down_proj -- the ONE thing that module tree does not self-initialize
+    (RMSNorm/RMSNormGated construct with torch.zeros/torch.ones, nn.Linear
+    self-inits by default; Experts alone uses raw
+    nn.Parameter(torch.empty(...)) with no init call, see that class's
+    docstring). src/model_small_qwen3.5.py itself is the project's numerical
+    ground truth and is off-limits to edit, so this has to happen in the
+    caller after construction, not in the class.
+
+    This is a generalization of the fix tests/test_qwen35_vectorized_moe.py
+    already found and applied locally (its test_vs_reference does
+    `ref_moe.experts.gate_up_proj.normal_(0, 0.02)` /
+    `.down_proj.normal_(0, 0.02)` by hand) -- pulled out here so
+    tests/test_qwen35_full_model.py, tests/test_qwen35_standalone.py, and
+    tests/make_fake_checkpoint.py can all call the same fix instead of each
+    re-deriving it. Deliberately NOT init_model_weights_with_norms_: that
+    function's norm-weight override isinstance-checks against
+    nanovllm.layers.layernorm's classes, which src/model_small_qwen3.5.py's
+    own RMSNorm/RMSNormGated are NOT instances of (separate module, loaded
+    via importlib) -- calling it on a reference-module instance would fall
+    through to the shape-based rule for every param, zeroing
+    RMSNormGated.weight (1D) instead of leaving it at the reference's own
+    correct ones-init. That is exactly the Phase 2 incident this project
+    already had once; this function only touches the two tensors that are
+    actually broken; everything else in the reference model is left as the
+    reference constructed it.
+
+    Duck-typed rather than isinstance-checked against Experts: the
+    reference module is loaded per-call via importlib under a synthetic
+    module name (test_qwen35_standalone.load_reference_module()), so two
+    calls in the same process produce two distinct, non-identical Experts
+    classes -- isinstance would silently fail to match a model built from a
+    different load_reference_module() call. Matching on "this module owns
+    parameters literally named gate_up_proj and down_proj" is exactly
+    Experts' shape, and nothing else in this file has both.
+    """
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    with torch.no_grad():
+        for module in model.modules():
+            own = dict(module.named_parameters(recurse=False))
+            if "gate_up_proj" in own and "down_proj" in own:
+                own["gate_up_proj"].normal_(0, std)
+                own["down_proj"].normal_(0, std)
 
 
 def known_zero_initialized_param_names(model: torch.nn.Module) -> set[str]:

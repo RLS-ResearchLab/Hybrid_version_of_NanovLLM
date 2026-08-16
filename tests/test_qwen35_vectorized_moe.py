@@ -207,6 +207,49 @@ def test_expert_distribution_sensitivity(device, config=None):
     print("  [PASS]")
 
 
+def make_topk8_config():
+    """Same small-model dims as make_small_config() (32 experts -- ample
+    headroom for top_k=8, since only num_experts >= num_experts_per_tok is
+    required), except num_experts_per_tok=8 to match PRODUCTION's actual
+    top-k. Every other test in this file runs at the small config's default
+    top_k=4, which is neither top_k=2 (already shown elsewhere in this
+    project NOT to predict top_k=8 -- 2-term float addition is
+    order-independent, 8-term is not) nor top_k=8 itself -- a third,
+    previously untested regime that inherits neither guarantee."""
+    config = make_small_config()
+    config.num_experts_per_tok = 8
+    return config
+
+
+def test_topk8_regime(device):
+    """Does test_vs_sequential's bitwise-exactness result at top_k=4
+    generalize to top_k=8, or is it specific to the small config's regime?
+    The mechanism this file's module docstring argues for (grouped-GEMM
+    dispatch batches kernel launches without reordering any single token's
+    K-dimension reduction) does not obviously depend on top_k at all -- if
+    that argument is right, exactness (or its absence, already measured on
+    CUDA at top_k=4/T>=37 -- see module docstring) should look the same at
+    top_k=8. If it does NOT, that contradicts the stated mechanism and is a
+    real finding, not something to fold into a wider tolerance.
+
+    Reuses test_vs_sequential / test_expert_distribution_sensitivity
+    verbatim (both already take a config parameter) rather than duplicating
+    their bodies -- only num_experts_per_tok changes.
+    """
+    print("\n" + "=" * 70)
+    print("TOP_K=8 REGIME -- production's actual top-k, not the small")
+    print("config's default top_k=4")
+    print("=" * 70)
+    config = make_topk8_config()
+    for T in [1, 6, 37, 129]:
+        test_vs_sequential(device, T, config=config)
+    test_expert_distribution_sensitivity(device, config=config)
+    print("\n  [DONE] top_k=8 regime checked -- see per-T bitwise_exact/cosine "
+          "above. Compare against this file's top_k=4 results printed earlier "
+          "in this run for whether top_k=8 matches or contradicts the "
+          "no-reassociation mechanism claimed in the module docstring.")
+
+
 def main():
     init_dist()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -217,6 +260,7 @@ def main():
         test_vs_sequential(device, T, config=config)
     test_vs_reference(device, T=8, config=config)
     test_expert_distribution_sensitivity(device, config=config)
+    test_topk8_regime(device)
     print("\nAll vectorized-MoE correctness tests passed.")
 
 

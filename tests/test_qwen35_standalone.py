@@ -421,6 +421,24 @@ def test_moe_vs_reference(device):
     torch.manual_seed(42)
     ref_moe = ref_mod.MoEFFN().to(device).to(torch.bfloat16)
 
+    # FIXED (was: KNOWN FAILURE below) -- see init_reference_moe_experts_'s
+    # docstring in test_utils.py (also reused by test_qwen35_full_model.py
+    # and make_fake_checkpoint.py, all three hitting this exact issue):
+    # src/model_small_qwen3.5.py's Experts never initializes
+    # gate_up_proj/down_proj, so ref_moe.experts.{gate_up_proj,down_proj}
+    # were reading back all-zero straight out of construction, and the copy
+    # loop below faithfully carried that zero into nv_moe. Fixed here on the
+    # constructed instance (src/model_small_qwen3.5.py stays untouched, per
+    # project rules) rather than via the centralized
+    # init_model_weights_with_norms_, which isinstance-checks against
+    # nanovllm's own layernorm classes and would silently zero this
+    # reference module's RMSNormGated.weight instead (not applicable here:
+    # MoEFFN has no norms of its own, but init_reference_moe_experts_ is
+    # shared across all three call sites, so it stays the uniformly-safe
+    # choice).
+    from test_utils import init_reference_moe_experts_
+    init_reference_moe_experts_(ref_moe, seed=42)
+
     from nanovllm.models.qwen3_5 import Qwen35MoE
     nv_moe = Qwen35MoE(
         hidden_size=config.hidden_size,
@@ -449,22 +467,16 @@ def test_moe_vs_reference(device):
     # as torch.empty() garbage and the forward pass below would run on it
     # without any signal. Catches exactly that gap.
     #
-    # KNOWN FAILURE, NOT WORKED AROUND (per task instructions -- report, don't
-    # silently fix): this currently DOES fail, on experts.gate_up_proj /
-    # experts.down_proj being all-zero. Root cause is NOT this copy loop --
-    # it's upstream in src/model_small_qwen3.5.py's own Experts class
-    # (line ~252-253: `nn.Parameter(torch.empty(NE, 2*MI, H))`, never
+    # FIXED (was: KNOWN FAILURE) -- root cause was NOT this copy loop, it
+    # was upstream in src/model_small_qwen3.5.py's own Experts class (never
     # explicitly initialized anywhere in the reference), which this port's
-    # own Experts class mirrors exactly. ref_moe.experts.gate_up_proj is
-    # ALREADY all-zero (confirmed directly) before this loop ever runs, so
-    # the loop faithfully copies zero into nv_moe -- both sides silently
-    # agree at zero. This test's cosine>0.99 pass has therefore only ever
-    # validated the shared_expert + gating/dispatch-bookkeeping path, NOT
-    # the actual per-expert gate_up_proj/down_proj matmul -- the part that
-    # is architecturally the core of what a MoE layer computes. Left
-    # un-fixed here deliberately: src/model_small_qwen3.5.py is the
-    # reference and out of scope to modify, and this task's instructions are
-    # to surface this, not patch around it.
+    # own Experts class mirrors exactly. Fixed above via
+    # init_reference_moe_experts_(ref_moe) before this copy loop runs, so
+    # nv_moe now receives real values instead of faithfully-copied zero.
+    # This test's cosine now reflects the actual per-expert
+    # gate_up_proj/down_proj matmul agreement, not just the shared_expert +
+    # gating/dispatch-bookkeeping path (see printed result below for the
+    # current number vs. the pre-fix degenerate-zero pass).
     from test_utils import known_zero_initialized_param_names, assert_all_parameters_initialized
     assert_all_parameters_initialized(
         nv_moe, whitelist_zero=known_zero_initialized_param_names(nv_moe)

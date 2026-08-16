@@ -21,7 +21,11 @@ from test_qwen35_standalone import (
     load_reference_module,
     make_small_config,
 )
-from test_utils import known_zero_initialized_param_names, assert_all_parameters_initialized
+from test_utils import (
+    known_zero_initialized_param_names,
+    assert_all_parameters_initialized,
+    init_reference_moe_experts_,
+)
 
 
 def copy_weights_to_port(port_model, ref_model):
@@ -74,6 +78,28 @@ def test_full_model_single_shot(device):
     torch.manual_seed(2024)
     ref_model = ref_mod.Qwen35MoESmall().to(device).to(torch.bfloat16)
 
+    # FIXED (was: CONFIRMED FAILURE below) -- src/model_small_qwen3.5.py's
+    # Experts class constructs gate_up_proj/down_proj as
+    # `nn.Parameter(torch.empty(...))` with no explicit init anywhere in the
+    # reference, so ref_model.layers.*.mlp.experts.gate_up_proj/down_proj
+    # read back all-zero straight out of construction -- confirmed directly.
+    # copy_weights_to_port below then faithfully carries that zero into
+    # port_model regardless of "missed" tracking, since name/shape matching
+    # succeeds independent of the VALUE being copied. This test's headline
+    # cosine number (previously 0.999967, see this function's own result
+    # printed below for the current value) therefore only ever validated
+    # attention/norm/shared-expert/gating agreement, never the actual
+    # per-expert gate_up_proj/down_proj matmul -- the core MoE computation.
+    # src/model_small_qwen3.5.py itself is the reference and out of scope to
+    # modify, so the fix has to happen here, on the constructed instance --
+    # see init_reference_moe_experts_'s docstring for why this reuses
+    # tests/test_qwen35_vectorized_moe.py's already-validated fix (a
+    # `.normal_(0, 0.02)` on just the two broken tensors) rather than the
+    # centralized init_model_weights_with_norms_, which would incorrectly
+    # zero this reference module's RMSNormGated.weight (isinstance check
+    # only matches nanovllm's own layernorm classes, not the reference's).
+    init_reference_moe_experts_(ref_model, seed=42)
+
     port_model = Qwen35ForCausalLM(config).to(device).to(torch.bfloat16)
 
     copied, missed = copy_weights_to_port(port_model, ref_model)
@@ -87,25 +113,8 @@ def test_full_model_single_shot(device):
     # above only proves every port parameter NAME/SHAPE matched something in
     # copy_weights_to_port's "copied" list -- it doesn't independently prove
     # the copied values themselves are real, finite, non-degenerate numbers.
-    #
-    # CONFIRMED FAILURE, NOT WORKED AROUND (per task instructions -- report,
-    # don't silently fix): this DOES fail here, on every layer's
-    # mlp.experts.gate_up_proj / experts.down_proj being all-zero. Root
-    # cause: src/model_small_qwen3.5.py's Experts class constructs those as
-    # `nn.Parameter(torch.empty(...))` with no explicit init anywhere in the
-    # reference, and ref_model.layers.*.mlp.experts.gate_up_proj/down_proj
-    # are ALREADY all-zero (confirmed directly) before copy_weights_to_port
-    # ever runs -- the copy faithfully carries zero into port_model, "not
-    # missed" included, since name/shape matching succeeds regardless of the
-    # VALUE being copied. This test's headline cosine number (0.999967, per
-    # make_fake_checkpoint.py's docstring) has therefore only ever validated
-    # attention/norm/shared-expert/gating agreement, never the actual
-    # per-expert gate_up_proj/down_proj matmul -- the core MoE computation.
-    # Same root cause as tests/test_qwen35_standalone.py::test_moe_vs_reference
-    # and it also poisons tests/fake_qwen35_small/model.safetensors (see
-    # make_fake_checkpoint.py), since that fixture is built by this same
-    # copy_weights_to_port off the same reference class. Not fixed here:
-    # src/model_small_qwen3.5.py is the reference and out of scope to modify.
+    # With init_reference_moe_experts_ above, this now passes for real
+    # rather than passing degenerately on zero == zero.
     assert_all_parameters_initialized(
         port_model, whitelist_zero=known_zero_initialized_param_names(port_model)
     )
