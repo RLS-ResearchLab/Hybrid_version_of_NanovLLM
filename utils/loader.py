@@ -24,6 +24,19 @@ def translate_weight_name(weight_name: str) -> str | None:
 
     Returns None if weight_name isn't under one of the text-model prefixes
     (e.g. a vision-tower or MTP-head key from a VLM checkpoint).
+
+    NOTE (found during pre-cluster-day dry-run prep): this ONLY recognizes
+    the two prefixes below -- a checkpoint whose keys are ALREADY in this
+    module's internal namespace (bare "model." without ".language_model.",
+    e.g. a locally-authored fixture built directly from named_parameters())
+    is NOT recognized either and gets silently dropped key-by-key here,
+    same as a genuine vision/MTP key. tests/make_fake_checkpoint.py hit
+    this exact gap and now renames its saved keys to match
+    _CHECKPOINT_LM_PREFIX instead (see that file's _to_checkpoint_name) --
+    intentionally NOT fixed here, since any change to this function's
+    matching logic is a change to how the REAL checkpoint loads on cluster
+    day, and this file has no way to safely test that against real weights
+    outside the cluster window itself.
     """
     if weight_name.startswith(_CHECKPOINT_LM_PREFIX):
         return _INTERNAL_LM_PREFIX + weight_name[len(_CHECKPOINT_LM_PREFIX):]

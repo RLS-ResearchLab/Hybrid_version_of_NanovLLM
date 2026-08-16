@@ -10,11 +10,16 @@ populate a Qwen35ForCausalLM from the reference Qwen35MoESmall (plain
 nn.Linear, so it initializes correctly with finite values).
 
 The saved tensor names must match what nanovllm.utils.loader.load_model()
-expects: every port parameter name as-is, EXCEPT the shared-expert gate/up
-projection, which the port model fuses into a single gate_up_proj but
-load_model's packed_modules_mapping only fires on the split HF-style names
-("shared_expert.gate_proj" / "shared_expert.up_proj"). Saving the fused name
-directly would skip the packed-mapping branch and call
+expects: every port parameter name, PREFIX-TRANSLATED to the real
+checkpoint's "model.language_model." convention (see
+_to_checkpoint_name's docstring below -- load_model()'s
+translate_weight_name silently drops any key that isn't under that prefix
+or "lm_head.", a real bug this script used to trip over silently, found
+and fixed during pre-cluster-day dry-run prep), EXCEPT the shared-expert
+gate/up projection, which the port model fuses into a single gate_up_proj
+but load_model's packed_modules_mapping only fires on the split HF-style
+names ("shared_expert.gate_proj" / "shared_expert.up_proj"). Saving the
+fused name directly would skip the packed-mapping branch and call
 MergedColumnParallelLinear.weight_loader with a missing loaded_shard_id
 argument. So gate_up_proj is split back into two chunks before saving.
 
@@ -37,9 +42,47 @@ OUT_DIR = os.path.join(os.path.dirname(__file__), "fake_qwen35_small")
 OUT_PATH = os.path.join(OUT_DIR, "model.safetensors")
 
 
+def _to_checkpoint_name(internal_name: str) -> str:
+    """Inverse of nanovllm.utils.loader.translate_weight_name: internal
+    parameter names (e.g. "model.embed_tokens.weight") -> the real-
+    checkpoint-style key load_model() actually recognizes
+    ("model.language_model.embed_tokens.weight"). "lm_head.*" is already
+    the real checkpoint's own convention (see translate_weight_name),
+    unchanged.
+
+    BUG THIS WORKS AROUND, found during pre-cluster-day dry-run prep
+    (cluster_a2_tp_correctness.py's --phase compare failing with
+    non-finite prefill logits, traced with tests/diag_a2_prefill_nan_trace.py):
+    this function used to save keys AS-IS (bare "model." prefix, matching
+    named_parameters()'s own internal naming) -- but load_model()'s
+    translate_weight_name only recognizes "model.language_model." (real
+    HF-VLM-style checkpoints) or "lm_head." keys, silently DROPPING every
+    other key (`if param_name is None: continue`, utils/loader.py). The
+    saved checkpoint itself was never the problem (this script's own
+    finiteness check already passed on every saved tensor) -- load_model()
+    simply never loaded ANY of it back in when the engine was later
+    constructed, leaving every parameter at whatever the fresh CUDA
+    allocation happened to contain. Confirmed directly, not guessed:
+    embed_tokens.weight read back as bitwise all-zero (0/127139840
+    nonzero) after a full engine construction against the OLD, bare-
+    "model."-prefixed checkpoint this function used to produce.
+
+    Isolated to this local fixture path -- the REAL checkpoint's own keys
+    already use "model.language_model." (confirmed by reading
+    qwen35_checkpoint/model.safetensors.index.json directly), so this
+    never affected, and does not change, real-checkpoint loading.
+    """
+    if internal_name.startswith("lm_head."):
+        return internal_name
+    assert internal_name.startswith("model."), f"unexpected top-level param name: {internal_name!r}"
+    return "model.language_model." + internal_name[len("model."):]
+
+
 def build_save_dict(model):
     """Return {name: cpu_tensor} for safetensors, splitting any fused
-    packed_modules_mapping targets back into their HF-style split names."""
+    packed_modules_mapping targets back into their HF-style split names,
+    and renaming every key to the real-checkpoint-style prefix load_model()
+    actually recognizes (see _to_checkpoint_name)."""
     packed = model.packed_modules_mapping  # split_key -> (fused_suffix, shard_id)
     fused_suffixes = {}
     for split_key, (fused_suffix, shard_id) in packed.items():
@@ -53,9 +96,9 @@ def build_save_dict(model):
             chunks = param.data.chunk(len(shard_map), dim=0)
             for shard_id, split_key in shard_map.items():
                 split_name = name.replace(matched_fused, split_key)
-                save_dict[split_name] = chunks[shard_id].detach().clone().contiguous().cpu()
+                save_dict[_to_checkpoint_name(split_name)] = chunks[shard_id].detach().clone().contiguous().cpu()
         else:
-            save_dict[name] = param.detach().clone().contiguous().cpu()
+            save_dict[_to_checkpoint_name(name)] = param.detach().clone().contiguous().cpu()
     return save_dict
 
 
