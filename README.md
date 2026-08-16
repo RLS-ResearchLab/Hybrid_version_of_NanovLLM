@@ -81,9 +81,9 @@ un-batched run of the same sequence, as noted.
 
 | Check | Result | Scope |
 |---|---|---|
-| Full hybrid model vs. reference, single sequence | cosine 0.999967, top-1 exact | small model |
+| Full hybrid model vs. reference, single sequence | cosine 0.999970, top-1 exact | small model |
 | GDR linear attention vs. reference | cosine 1.000001 | small model |
-| MoE FFN vs. reference | cosine 1.000001 | small model |
+| MoE FFN vs. reference | cosine 1.000000 | small model |
 | Eager vs. CUDA-graph decode, batch sizes 1/4/8 | cosine 1.000000, top-1 exact | small model |
 | KV-cache memory shrinkage from full-attention-only sizing | 4.00× | measured, matches `full_attention_interval=4` exactly |
 | Real-checkpoint single-forward-pass vs. HF, 5 varied prompts | cosine 0.9982–0.9997, 5/5 argmax match | **real 35B checkpoint** |
