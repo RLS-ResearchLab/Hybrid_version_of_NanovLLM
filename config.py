@@ -43,9 +43,23 @@ class Config:
         # `architectures=None`, `model_type="qwen3_5_moe_text"`), and a
         # blind overwrite clobbers meaningful top-level fields like
         # `architectures` with those meaningless nested defaults.
+        # layer_types is derived (Qwen3_5MoeConfig.__post_init__ computes it
+        # from num_hidden_layers + full_attention_interval), not a plain
+        # config value. text_config is a full PretrainedConfig even when the
+        # checkpoint's config.json is flat with no "text_config" section --
+        # it auto-materializes with base-class defaults (num_hidden_layers=40),
+        # so its layer_types is derived from THAT default count, not the
+        # top-level checkpoint's real num_hidden_layers. Copying it over
+        # would silently mismatch _get_layer_types()'s
+        # `len(layer_types) == num_layers` assert (or worse, if lengths ever
+        # coincided, apply the wrong attention pattern). Skip it here and let
+        # _get_layer_types()'s own full_attention_interval fallback
+        # recompute it against the resolved top-level num_hidden_layers.
         text_config = getattr(hf_config, "text_config", None)
         if text_config is not None:
             for key, value in vars(text_config).items():
+                if key == "layer_types":
+                    continue
                 if getattr(hf_config, key, None) is None:
                     setattr(hf_config, key, value)
         rope_parameters = getattr(hf_config, "rope_parameters", None)

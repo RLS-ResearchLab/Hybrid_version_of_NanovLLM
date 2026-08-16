@@ -22,7 +22,7 @@ from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.config import Config
 
 cfg = Config(
-    model="fake_qwen35_small",   # adjust path as needed
+    model=os.path.join(ROOT, "tests", "fake_qwen35_small"),
     tensor_parallel_size=1,
     enforce_eager=True,
     max_num_seqs=4,

@@ -134,7 +134,7 @@ def test_full_model_single_shot(device):
         # tensors since we never went through ModelRunner.allocate_kv_cache)
         cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device=device)
         set_context(True, cu_seqlens, cu_seqlens, T, T, None, None, None)
-        hidden, _, _ = port_model(flat_ids, positions)
+        hidden, _, _ = port_model(flat_ids, positions, cu_seqlens)
         logits_port = port_model.compute_logits(hidden)  # (1, VOCAB) — ParallelLMHead
         reset_context()                                   # already extracted last token
         logits_port_last = logits_port[0, :].float()

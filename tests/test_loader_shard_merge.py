@@ -44,6 +44,7 @@ from safetensors.torch import load_file, save_file
 sys.path.insert(0, os.path.dirname(__file__))
 from test_qwen35_standalone import init_dist, make_small_config
 from test_utils import known_zero_initialized_param_names, assert_all_parameters_initialized
+from make_fake_checkpoint import _to_checkpoint_name
 
 FAKE_DIR = os.path.join(os.path.dirname(__file__), "fake_qwen35_small")
 FUSED_DIR = os.path.join(os.path.dirname(__file__), "fake_qwen35_small_fused")
@@ -56,7 +57,14 @@ def build_fused_tensors(model, sharded_tensors: dict) -> dict:
     each of the model's own (fused-name) parameters from the on-disk,
     HF-style split shard tensors, by concatenating shards in packed_modules_mapping's
     shard_id order along dim 0 -- the same dim MergedColumnParallelLinear's
-    weight_loader slices along."""
+    weight_loader slices along.
+
+    sharded_tensors is keyed by the real-checkpoint-style names
+    (make_fake_checkpoint.py's _to_checkpoint_name, "model.language_model."
+    prefix) that load_model()'s translate_weight_name expects on disk -- not
+    by the model's own internal parameter names. Every lookup below must
+    translate through _to_checkpoint_name first, same as build_save_dict()
+    did when it wrote the file."""
     packed = model.packed_modules_mapping  # split_key -> (fused_suffix, shard_id)
     fused_suffixes = {}
     for split_key, (fused_suffix, shard_id) in packed.items():
@@ -70,15 +78,19 @@ def build_fused_tensors(model, sharded_tensors: dict) -> dict:
             pieces = []
             for shard_id in sorted(shard_map.keys()):
                 split_name = name.replace(matched_fused, shard_map[shard_id])
-                assert split_name in sharded_tensors, (
-                    f"expected shard tensor {split_name!r} (for fused param {name!r}) "
+                checkpoint_name = _to_checkpoint_name(split_name)
+                assert checkpoint_name in sharded_tensors, (
+                    f"expected shard tensor {checkpoint_name!r} (for fused param {name!r}) "
                     f"not found in {SHARDED_PATH}"
                 )
-                pieces.append(sharded_tensors[split_name])
+                pieces.append(sharded_tensors[checkpoint_name])
             fused_tensors[name] = torch.cat(pieces, dim=0)
         else:
-            assert name in sharded_tensors, f"expected tensor {name!r} not found in {SHARDED_PATH}"
-            fused_tensors[name] = sharded_tensors[name]
+            checkpoint_name = _to_checkpoint_name(name)
+            assert checkpoint_name in sharded_tensors, (
+                f"expected tensor {checkpoint_name!r} (for param {name!r}) not found in {SHARDED_PATH}"
+            )
+            fused_tensors[name] = sharded_tensors[checkpoint_name]
     return fused_tensors
 
 

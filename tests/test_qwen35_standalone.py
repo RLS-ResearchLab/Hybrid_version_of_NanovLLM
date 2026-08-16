@@ -330,10 +330,12 @@ def test_linear_attention_vs_reference(device):
     torch.manual_seed(99)
     B, T, H = 1, 8, config.hidden_size
     x = torch.randn(B, T, H, device=device, dtype=torch.bfloat16)
+    x_packed = x[0]  # nv_la expects packed (N, H), not (B, T, H)
+    cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device=device)
 
     with torch.no_grad():
         y_ref, state_ref, conv_ref = ref_la(x)
-        y_nv, state_nv, conv_nv = nv_la(x)
+        y_nv, state_nv, conv_nv = nv_la(x_packed, cu_seqlens)
 
     cos_y = cosine_sim(y_ref, y_nv)
     cos_state = cosine_sim(state_ref, state_nv)
@@ -379,21 +381,24 @@ def test_linear_attention_incremental(device):
     torch.manual_seed(456)
     B, T, H = 1, 10, config.hidden_size
     x = torch.randn(B, T, H, device=device, dtype=torch.bfloat16)
+    x_packed = x[0]  # la expects packed (N, H), not (B, T, H)
+    cu_full = torch.tensor([0, T], dtype=torch.int32, device=device)
+    cu_step = torch.tensor([0, 1], dtype=torch.int32, device=device)
 
     with torch.no_grad():
-        y_full, state_full, conv_full = la(x)
+        y_full, state_full, conv_full = la(x_packed, cu_full)
 
         state, conv_st = None, None
         ys = []
         for t in range(T):
-            y_t, state, conv_st = la(x[:, t:t+1, :], state=state, conv_state=conv_st)
+            y_t, state, conv_st = la(x_packed[t:t+1], cu_step, states=state, conv_states=conv_st)
             ys.append(y_t)
-        y_inc = torch.cat(ys, dim=1)
+        y_inc = torch.cat(ys, dim=0)
 
     cos_all = cosine_sim(y_full, y_inc)
-    cos_last = cosine_sim(y_full[0, -1, :], y_inc[0, -1, :])
+    cos_last = cosine_sim(y_full[-1, :], y_inc[-1, :])
     cos_state = cosine_sim(state_full, state)
-    top1 = y_full[0, -1, :].float().argmax().item() == y_inc[0, -1, :].float().argmax().item()
+    top1 = y_full[-1, :].float().argmax().item() == y_inc[-1, :].float().argmax().item()
 
     print(f"  All tokens cosine: {cos_all:.6f}")
     print(f"  Last token cosine: {cos_last:.6f}")

@@ -17,6 +17,7 @@ Usage:
 """
 
 import atexit
+import gc
 import sys
 import os
 import json
@@ -173,6 +174,14 @@ def main():
     )
     assert preempt_1 == 0, f"Unexpected preemption in a generous-memory run: {preempt_1}"
 
+    # gc.collect() before empty_cache(): run_once()'s engine (model weights +
+    # ~21GB kv_cache) is only reclaimed once refcounts hit zero, but a
+    # reference cycle in the engine/model_runner object graph means plain
+    # refcounting doesn't drop it -- without a cycle-breaking collect(),
+    # empty_cache() has nothing to reclaim and RUN 2 constructs its engine
+    # while RUN 1's memory is still resident. Same fix
+    # tests/test_state_slot_reuse.py already documents and applies.
+    gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 

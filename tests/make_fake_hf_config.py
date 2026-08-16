@@ -25,10 +25,19 @@ config = {
     "vocab_size": 248320,
     "rms_norm_eps": 1e-6,
     "full_attention_interval": 4,
-    "linear_attn_kq_heads": 8,
-    "linear_attn_v_heads": 16,
-    "linear_attn_head_dim": 64,
-    "conv_kernel_size": 4,
+    # Real checkpoint field names (see models/qwen3_5.py's getattr chains in
+    # Qwen35DecoderLayer.__init__ -- these are tried first, the old
+    # linear_attn_*/conv_kernel_size names are a fallback kept only for
+    # configs that bypass AutoConfig entirely, e.g. tests' make_small_config()
+    # SimpleNamespace). Going through real AutoConfig.from_pretrained (as
+    # ModelRunner does), the real names below are what actually gets read --
+    # they must be present or Qwen3_5MoeConfig's own class defaults
+    # (16/32/128/4) silently win instead of these values.
+    "linear_num_key_heads": 8,
+    "linear_num_value_heads": 16,
+    "linear_key_head_dim": 64,
+    "linear_value_head_dim": 64,
+    "linear_conv_kernel_dim": 4,
     "intermediate_size": 256,
     "moe_intermediate_size": 256,
     "shared_expert_intermediate_size": 256,

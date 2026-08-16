@@ -1,0 +1,6 @@
+timestamp,model,enforce_eager,use_fused_gdr_kernel,tensor_parallel_size,gpu_memory_utilization,max_model_len,prompt_len,output_len,concurrency,trial_index,batch_composition_json,total_output_tokens,wall_s,tok_s
+2026-08-13T22:18:42,tests/fake_qwen35_small,True,True,1,0.6,2048,1024,1,1,0,[1],1,0.05043118610046804,19.829000214427225
+2026-08-13T22:18:42,tests/fake_qwen35_small,True,True,1,0.6,2048,1024,1,1,1,[1],1,0.05038949497975409,19.84540627767332
+2026-08-13T22:18:42,tests/fake_qwen35_small,True,True,1,0.6,2048,1024,1,1,2,[1],1,0.05067214812152088,19.734707074225888
+2026-08-13T22:18:42,tests/fake_qwen35_small,True,True,1,0.6,2048,1024,1,1,3,[1],1,0.05017299111932516,19.931042134237625
+2026-08-13T22:18:42,tests/fake_qwen35_small,True,True,1,0.6,2048,1024,1,1,4,[1],1,0.05025801504962146,19.897323820144223
