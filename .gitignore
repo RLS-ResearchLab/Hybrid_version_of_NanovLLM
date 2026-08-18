@@ -7,3 +7,4 @@ tests/_gsm8k_cache/
 tests/fake_qwen35_small/
 tests/fake_qwen35_small_fused/
 tests/profiling_output/
+qwen35_checkpoint/*.safetensors" 
