@@ -308,7 +308,9 @@ def cleanup_running(scheduler, seqs):
             scheduler.running.remove(s)
         scheduler.block_manager.deallocate(s)
         if scheduler.state_manager is not None:
-            scheduler.state_manager.free(s)
+            # Must go through Scheduler._free_state so tp>1 frees this slot on
+            # every rank's StateManager (via model_runner.call), not just rank0.
+            scheduler._free_state(s)
 
 
 # ─── profiling-region instrumentation (additive, fully restored after) ────
