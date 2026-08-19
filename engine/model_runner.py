@@ -24,6 +24,7 @@ from nanovllm.utils.loader import load_model
 from nanovllm.models.qwen3_5 import Qwen35ForCausalLM
 from nanovllm.engine.state_manager import StateManager
 from nanovllm.models.qwen3_5 import Qwen35LinearAttention
+from nanovllm.layers.linear import local_num_kv_heads
 
 
 ARCH_DISPATCH = {
@@ -275,7 +276,19 @@ class ModelRunner:
         # Calculate StateManager footprint
         state_bytes = self.state_manager.memory_bytes() if self.state_manager is not None else 0
 
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        # local_num_kv_heads (nanovllm.layers.linear) is the single source of
+        # truth for this computation, shared with Qwen35FullAttention's own
+        # per-rank kv-head sizing (models/qwen3_5.py) -- computing it
+        # independently here used to be `num_key_value_heads // world_size`,
+        # which silently returns 0 (a zero-sized KV-cache dimension, no
+        # assert to catch it) whenever world_size > num_key_value_heads. The
+        # dense model path (models/qwen3.py) has its own separate, unmodified
+        # `assert total_num_kv_heads % tp_size == 0` in Qwen3Attention.__init__
+        # -- which runs before this method, during self.model = model_cls(...)
+        # -- so an impossible dense-model tp_size still fails loudly there,
+        # before this formula is ever reached; only the hybrid model's
+        # previously-unreachable-without-a-crash replication case changes here.
+        num_kv_heads = local_num_kv_heads(hf_config.num_key_value_heads, self.world_size)
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         if self._is_hybrid_model:
             num_kv_layers = sum(1 for t in self.model.model.layer_types if t == "full_attention")

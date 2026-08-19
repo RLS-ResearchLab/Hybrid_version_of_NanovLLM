@@ -21,6 +21,8 @@ from nanovllm.layers.linear import (
     RowParallelLinear,
     ReplicatedLinear,
     MergedColumnParallelLinear,
+    local_num_kv_heads,
+    kv_head_replica_source,
 )
 from nanovllm.layers.rotary_embedding import get_partial_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
@@ -81,24 +83,59 @@ class Qwen35FullAttention(nn.Module):
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
+        tp_rank = dist.get_rank()
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
         self.total_num_heads = num_heads
         assert num_heads % tp_size == 0
         self.num_heads = num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        assert num_kv_heads % tp_size == 0
-        self.num_kv_heads = num_kv_heads // tp_size
+        self.num_kv_heads = local_num_kv_heads(num_kv_heads, tp_size)
         self.head_dim = head_dim
 
         # q_proj outputs 2 * NQ * DH: query + gate interleaved per head
         self.q_proj = ColumnParallelLinear(
             hidden_size, 2 * num_heads * head_dim, bias=False
         )
-        self.k_proj = ColumnParallelLinear(
-            hidden_size, num_kv_heads * head_dim, bias=False
-        )
-        self.v_proj = ColumnParallelLinear(
-            hidden_size, num_kv_heads * head_dim, bias=False
-        )
+        if num_kv_heads >= tp_size:
+            # Unchanged from before local_num_kv_heads existed -- byte-for-byte
+            # identical construction and weight-loading path whenever there are
+            # enough physical kv heads to shard normally (every tp=1/tp=2 case
+            # against the real checkpoint's num_key_value_heads=2 lands here).
+            self.k_proj = ColumnParallelLinear(
+                hidden_size, num_kv_heads * head_dim, bias=False
+            )
+            self.v_proj = ColumnParallelLinear(
+                hidden_size, num_kv_heads * head_dim, bias=False
+            )
+        else:
+            # GQA kv-head replication: too few physical kv heads to give every
+            # rank a whole one (e.g. num_key_value_heads=2 over tp_size=4) --
+            # replicate a full kv head onto each rank that needs it instead of
+            # splitting one across them, same technique vLLM and other engines
+            # use for this exact num_kv_heads < tp_size case.
+            #
+            # ReplicatedLinear, not ColumnParallelLinear: ColumnParallelLinear's
+            # constructor divides output_size by tp_size internally, assuming
+            # sharding. self.num_kv_heads * head_dim here is already the correct
+            # LOCAL (per-rank, single replicated head) size -- passing it through
+            # ColumnParallelLinear would divide it AGAIN, the exact double-
+            # division bug this file already hit once for Qwen35LinearAttention's
+            # in_proj_qkv (see that class's __init__ comment). ReplicatedLinear's
+            # constructor does not divide at all, which is what's needed here.
+            #
+            # weight_loader is overridden afterward because ReplicatedLinear's
+            # default (a straight, unsliced copy) would try to copy the FULL
+            # multi-head checkpoint tensor into a single-head-sized local
+            # parameter -- see _kv_replicate_weight_loader below.
+            self.k_proj = ReplicatedLinear(
+                hidden_size, self.num_kv_heads * head_dim, bias=False
+            )
+            self.v_proj = ReplicatedLinear(
+                hidden_size, self.num_kv_heads * head_dim, bias=False
+            )
+            self.k_proj.weight.weight_loader = self._kv_replicate_weight_loader
+            self.v_proj.weight.weight_loader = self._kv_replicate_weight_loader
         self.o_proj = RowParallelLinear(
             num_heads * head_dim, hidden_size, bias=False
         )
@@ -118,6 +155,19 @@ class Qwen35FullAttention(nn.Module):
         self.attn = Attention(
             self.num_heads, head_dim, self.scaling, self.num_kv_heads
         )
+
+    def _kv_replicate_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """Bound to k_proj.weight/v_proj.weight only when total_num_kv_heads
+        < tp_size (see __init__). loaded_weight is the checkpoint's FULL
+        (total_num_kv_heads * head_dim, hidden_size) tensor; this rank
+        replicates exactly ONE whole physical kv head (kv_head_replica_source
+        picks which one) rather than narrowing a fraction of one -- narrowing
+        here would reproduce the "half a head" bug the old
+        `assert num_kv_heads % tp_size == 0` used to guard against."""
+        head_dim = self.head_dim
+        source_head = kv_head_replica_source(self.total_num_kv_heads, self.tp_size, self.tp_rank)
+        start = source_head * head_dim
+        param.data.copy_(loaded_weight.narrow(0, start, head_dim))
 
     def forward(
         self,
