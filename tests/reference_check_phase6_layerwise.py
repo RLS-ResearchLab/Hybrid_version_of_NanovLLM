@@ -206,7 +206,7 @@ def phase_hf():
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
-    return torch.nn.functional.cosine_similarity(a.float().unsqueeze(0), b.float().unsqueeze(0)).item()
+    return torch.nn.functional.cosine_similarity(a.float().unsqueeze(0), b.float().unsqueeze(0), dim=-1).item()
 
 
 def _last_row(t: torch.Tensor) -> torch.Tensor:

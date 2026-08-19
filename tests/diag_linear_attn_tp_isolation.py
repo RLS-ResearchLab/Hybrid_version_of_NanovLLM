@@ -201,7 +201,7 @@ def run_tp2(real_tensors: dict, hf_input: torch.Tensor):
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
-    return torch.nn.functional.cosine_similarity(a.reshape(-1).float().unsqueeze(0), b.reshape(-1).float().unsqueeze(0)).item()
+    return torch.nn.functional.cosine_similarity(a.reshape(-1).float().unsqueeze(0), b.reshape(-1).float().unsqueeze(0), dim=-1).item()
 
 
 def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
