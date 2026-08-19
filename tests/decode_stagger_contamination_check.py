@@ -446,7 +446,7 @@ def main():
         for layer_idx in range(num_linear_layers):
             a = together_state[layer_idx].float().reshape(-1)
             b = isolated_state[layer_idx].float().reshape(-1)
-            cos = torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
+            cos = torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0), dim=-1).item()
             per_layer_cos.append(cos)
         min_cos = min(per_layer_cos)
         status = "PASS" if min_cos > STATE_COSINE_THRESHOLD else "FAIL"
@@ -497,7 +497,7 @@ def main():
             for layer_idx in range(num_linear_layers):
                 a = forced_state[layer_idx].float().reshape(-1)
                 b = single_shot_state[layer_idx].float().reshape(-1)
-                cos = torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
+                cos = torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0), dim=-1).item()
                 per_layer_cos.append(cos)
             min_cos = min(per_layer_cos)
             print(f"    DECISIVE: teacher-forced-sequential-decode vs single-shot-prefill "

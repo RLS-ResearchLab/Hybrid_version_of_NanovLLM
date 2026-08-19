@@ -336,7 +336,7 @@ def main():
         for layer_idx in range(num_linear_layers):
             a = packed_state[layer_idx].float().reshape(-1)
             b = iso_state[layer_idx].float().reshape(-1)
-            cos = torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
+            cos = torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0), dim=-1).item()
             per_layer_cos.append(cos)
         min_cos = min(per_layer_cos)
 

@@ -91,7 +91,7 @@ def make_small_config():
 
 def cosine_sim(a, b):
     a, b = a.float().reshape(-1), b.float().reshape(-1)
-    return F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
+    return F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0), dim=-1).item()
 
 
 def topk_overlap(a, b, k=5):

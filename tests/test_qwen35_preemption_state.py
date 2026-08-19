@@ -227,7 +227,7 @@ def main():
     for layer_idx in range(num_linear_layers):
         a = preempted_state[layer_idx].float().reshape(-1)
         b = isolated_state[layer_idx].float().reshape(-1)
-        cos = torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
+        cos = torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0), dim=-1).item()
         status = "PASS" if cos > 0.999 else "FAIL"
         if cos <= 0.999:
             all_pass = False
