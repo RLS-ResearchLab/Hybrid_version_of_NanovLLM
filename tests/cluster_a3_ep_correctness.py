@@ -208,7 +208,7 @@ def phase_compare(args):
     for rr, er in zip(ref, eng):
         assert rr["prompt"] == er["prompt"]
         rl, el = rr["prefill_logits"], er["routed_only_prefill_logits"]
-        cos_sim = torch.nn.functional.cosine_similarity(rl.unsqueeze(0), el.unsqueeze(0)).item()
+        cos_sim = torch.nn.functional.cosine_similarity(rl.unsqueeze(0), el.unsqueeze(0), dim=-1).item()
         argmax_match = int(rl.argmax()) == int(el.argmax())
         passed = cos_sim >= COSINE_SIM_THRESHOLD and argmax_match
         n_pass += int(passed)

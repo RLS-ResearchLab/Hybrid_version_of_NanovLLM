@@ -115,8 +115,8 @@ def main():
     args.max_model_len = cli.max_model_len
     args.gpu_memory_utilization = cli.gpu_memory_utilization
     args.tensor_parallel_size = cli.tensor_parallel_size
-    args.enforce_eager = True
-    args.use_fused_gdr_kernel = False
+    args.enforce_eager = False
+    args.use_fused_gdr_kernel = True
     args.fake_config_loader = cli.fake_config_loader
 
     print(f"Building engine: tensor_parallel_size={args.tensor_parallel_size} (== ep_size) "

@@ -220,7 +220,13 @@ class RegexStopCriteria:
 def generate_one(model, tokenizer, prompt_ids: list, max_new_tokens: int, use_stop_strings: bool):
     import torch
 
-    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=model.device)
+    if isinstance(prompt_ids, str):
+        prompt_ids = tokenizer.encode(prompt_ids, add_special_tokens=False)
+    elif hasattr(prompt_ids, "input_ids"):
+        prompt_ids = prompt_ids["input_ids"]
+    if len(prompt_ids) and isinstance(prompt_ids[0], list):
+        prompt_ids = prompt_ids[0]
+    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=next(model.parameters()).device)
     attention_mask = torch.ones_like(input_ids)
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
@@ -348,7 +354,7 @@ def run_sanity_check(args):
         print(f"Using hardcoded fallback question: {question}")
 
     prompt_ids = build_arm_prompt_ids(tokenizer, "chat-no-think", question)
-    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=model.device)
+    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=next(model.parameters()).device)
     with torch.no_grad():
         fwd_out = model(input_ids=input_ids)
     logits = fwd_out.logits

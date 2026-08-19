@@ -118,6 +118,19 @@ EXPECTED_TOTAL = 1319
 SUBSAMPLE_SEED = 42  # fixed so a given --num-examples always selects the same subset
 
 
+def _normalize_prompt_ids(x, tokenizer):
+    """transformers 5.x apply_chat_template(tokenize=True) may return a
+    tokenizers.Encoding, a str, or a BatchEncoding instead of list[int]."""
+    if hasattr(x, "ids"):
+        x = x.ids
+    elif isinstance(x, str):
+        x = tokenizer.encode(x, add_special_tokens=False)
+    elif hasattr(x, "input_ids"):
+        x = x["input_ids"]
+    if len(x) and isinstance(x[0], list):
+        x = x[0]
+    return list(x)
+
 def _results_path(num_examples, enforce_eager: bool, batch_size: int, max_tokens: int, stop_strings: bool,
                    prompt_format: str = "raw") -> str:
     # Keyed by every setting that affects what generate() actually produces,
@@ -308,18 +321,18 @@ def main():
             batch_examples = [ds[i] for i in batch_indices]
             if args.prompt_format == "chat-no-think":
                 prompts = [
-                    llm.tokenizer.apply_chat_template(
+                    _normalize_prompt_ids(llm.tokenizer.apply_chat_template(
                         build_chat_messages(ex["question"]),
                         tokenize=True, add_generation_prompt=True, enable_thinking=False,
-                    )
+                    ), llm.tokenizer)
                     for ex in batch_examples
                 ]
             elif args.prompt_format == "chat-think":
                 prompts = [
-                    llm.tokenizer.apply_chat_template(
+                    _normalize_prompt_ids(llm.tokenizer.apply_chat_template(
                         build_chat_messages(ex["question"]),
                         tokenize=True, add_generation_prompt=True,
-                    )
+                    ), llm.tokenizer)
                     for ex in batch_examples
                 ]
             else:
