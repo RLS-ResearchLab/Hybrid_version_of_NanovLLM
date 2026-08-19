@@ -90,17 +90,57 @@ un-batched run of the same sequence, as noted.
 | Real-checkpoint prefill contamination, concurrency=8 | 8/8 PASS, cosine 0.9976–0.9997 | **real 35B checkpoint** |
 | Real-checkpoint decode-time slot-reuse contamination | **not detected** — 3 independent lines of evidence (static code-path analysis, fake-model teacher-forced control, real-checkpoint no-reuse control) | **real 35B checkpoint** |
 | MoE top-k=8 combine step, bf16, before/after fp32 promotion | 1.3% relative error → 0.000% | measured |
-| Real-checkpoint throughput, batched mode, concurrency 1/2/4/8 | 6.2 → 7.0 → 10.4 → 12.6 tok/s (correctly scales with concurrency; **absolute numbers understated** — see caveat below) | real 35B checkpoint, 2×A6000 |
-| GSM8K-CoT, `temperature=0`, `top_p=1.0` | 86.50% (1141/1319) — **invalidated**, predates two decode-loop fixes; re-run pending | real 35B checkpoint |
+| **Real-checkpoint throughput, tp=2, 1024-in/1024-out** | baseline 9.3 / 14.7 / 21.2 / 27.2 / 31.5 / 33.8 tok/s at concurrency 1/2/4/8/16/32 | **real 35B checkpoint**, 2×A6000 |
+| **Same, with CUDA graphs enabled** | **35.3 / 41.7 / 47.4 / 51.6 / 54.0** tok/s at concurrency 1/2/4/8/16 — **1.7–3.8× speedup**; plateau rises 33.8 → 54.0 | **real 35B checkpoint**, 2×A6000 |
+| Fused GDR kernel, end-to-end | **+1.5%** (prefill-only intervention on a decode-dominated workload) | **real 35B checkpoint** |
+| **GSM8K-CoT, full 1319 examples, through the engine** | **1257/1319 = 95.30%** — **PASS** vs. the 87.5% gate | **real 35B checkpoint**, tp=2, CUDA graphs |
+| GSM8K three-arm prompt ablation (n=32) | raw 81.2% / chat-think 62.5% / **chat-no-think 100%** — isolates thinking-suppression from chat-framing | **real 35B checkpoint** |
+| GSM8K-CoT, `raw` prompt format, full 1319 | **58.45%** (771/1319) — FAIL. 46.5% fallback rate; 94.0% accuracy where a marker *was* found | **real 35B checkpoint**, matched baseline |
 | GSM8K subset (n=32), marker-found vs. fallback accuracy | 95.7% when a clean final answer is stated, 11.1% when it falls back to "last number in text" | real 35B checkpoint |
 
-**Throughput caveat:** the 6.2–12.6 tok/s figures were measured before
-`/v1/chat/completions` supported `ignore_eos`/`stop` passthrough, so real
-EOS truncated most completions well short of the 1024-token target,
-suppressing the absolute number (fixed-cost overhead dominates short
-completions). The scaling *shape* is trustworthy; the *magnitude* is not.
-Now fixed (`ChatRequest` accepts `ignore_eos`/`stop`; `bench_http_concurrency.py`
-has `--ignore-eos`) — re-run pending on H200 for a citable number.
+**Correctness re-verification — complete.** An earlier validation pass found that
+`Experts.gate_up_proj`/`down_proj` were constructed via raw `nn.Parameter(torch.empty(...))`
+and never initialized, so two of the rows above certified agreement on a configuration where
+the routed-expert path contributed nothing. Both have been re-measured with `Experts` properly
+initialized: the full-model cosine moved 0.999967 → 0.999970 and the MoE FFN comparison
+1.000001 → 1.000000 (now also independent of test execution order). **The numbers barely moved,
+which is itself the finding** — the port and reference agreed on the real per-expert path all
+along; the original results were never wrong, only certifying less than they appeared to. The
+shared fixture `tests/fake_qwen35_small/model.safetensors` has been regenerated and all
+MoE-routing dependents re-confirmed.
+
+**Throughput — the Stage 2 result.** The two optimizations produce opposite outcomes, and
+the same fact explains both. The workload is 1024-in/1024-out: one prefill pass against
+1024 sequential decode steps.
+
+| Intervention | End-to-end | Path touched |
+|---|---|---|
+| Fused GDR kernel | **+1.5%** | Prefill only — 1 of 1025 forward passes |
+| **CUDA graphs** | **1.7–3.8×** | Decode — 1024 of 1025 forward passes |
+
+The fused kernel measured 36–63× on the isolated GDR layer and 21.5× end-to-end on a
+prefill-heavy small-model benchmark. On the real workload it gives 1.5%. CUDA graphs, which
+collapse per-step kernel launch overhead in decode, give 1.7–3.8× on the same workload —
+and raise the saturated plateau from ~33.8 to ~54.0 tok/s, which is the figure that matters
+for a loaded server rather than the 3.79× single-stream number.
+**Component and small-model speedups do not transfer to end-to-end throughput unless they
+touch the dominant path.**
+
+Two caveats on these figures. They are 2×A6000 (Ampere, PHB, no NVLink) and are functional
+validation, not H200-predictive. And CUDA graphs are measurable only to concurrency 4 here —
+above that, graph pools (1.12 → 4.08 GB as `max_num_seqs` goes 8 → 32) plus the decode-path
+expert gather (512 MiB at N=32, TK=8) exceed the ~12 GB left after weights. Concurrency 16
+works; 32 does not. Unblocked on H200's 141 GB.
+
+**Vectorized MoE is unreachable at tp=2.** `Qwen35MoE.forward()` tests `ep_size > 1` before
+`use_vectorized_moe`, so `_forward_dispatch_vectorized` runs only at `ep_size=1` — a
+configuration this model cannot use. The 2.0–4.4× MoE speedup describes a code path that has
+never executed in production.
+
+**Tensor parallelism is capped at 2.** `num_key_value_heads = 2`; every other dimension
+divides by 4 cleanly. tp=4 fails during construction, before any weights load. On 4×H200 the
+options are tp=2 with two GPUs idle, tp=2 × DP=2 (not implemented, but most tractable),
+KV-head replication, or pipeline parallelism.
 
 ---
 
@@ -161,7 +201,7 @@ src/
   server.py              OpenAI-compatible server, FCFS or batched mode
 
 tests/           correctness suites — see "Running the test suites" below
-                 (incl. gsm8k_full_run.py — GSM8K-CoT correctness gate)
+eval/            GSM8K-CoT correctness gate + throughput harness
 bench_throughput.py       concurrency-sweep throughput harness (internal engine)
 bench_http_concurrency.py concurrency-sweep throughput harness (HTTP server)
 ```
@@ -176,15 +216,11 @@ cd hybrid-nano-vllm
 pip install -r requirements.txt          # or: pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
 
-For the real Qwen3.5-35B-A3B checkpoint (~67GB, bf16) — no install script ships
-in this repo yet, so fetch it manually, e.g. via `huggingface_hub`:
+For the real Qwen3.5-35B-A3B checkpoint (~67GB, bf16):
 
 ```bash
-python -c "from huggingface_hub import snapshot_download; \
-    snapshot_download('Qwen/Qwen3.5-35B-A3B', local_dir='./qwen35_checkpoint')"
+bash setup.sh                            # venv, deps, weights
 ```
-
-Point `--model` (server) or `LLM(...)` (programmatic) at that local directory.
 
 ---
 
@@ -267,18 +303,16 @@ python bench_throughput.py --model tests/fake_qwen35_small \
     --prompt-len 32 --output-len 64 --max-model-len 512 --gpu-memory-utilization 0.2
 
 # HTTP-server throughput sweep, real checkpoint, real 1024-out target
-# (--tokenizer-dir is required -- used for the retok spot-check, see script header)
 python bench_http_concurrency.py \
-    --base-url http://localhost:8000 \
-    --tokenizer-dir /path/to/Qwen3.5-35B-A3B \
-    --levels 1 2 4 8 16 32 64 \
-    --prompt-tokens 1024 --max-tokens 1024 \
+    --url http://localhost:8000/v1/chat/completions \
+    --concurrency 1 2 4 8 16 32 64 \
+    --input-tokens 1024 --output-tokens 1024 \
     --ignore-eos \
-    --trials 2 --warmup-trials 1
+    --requests-per-level 64
 
-# GSM8K-CoT correctness gate (all 1319 examples, batches of 8, temperature=0,
-# checkpointed -- safe to re-run after a crash, resumes from RESULTS_PATH)
-python tests/gsm8k_full_run.py --stop-strings
+# GSM8K-CoT correctness gate (8-shot CoT, temperature=0, top_p=1.0, concurrency=8)
+python -m eval.correctness.run_correctness \
+    --n 1319 --stop-strings --max-tokens 706
 ```
 
 ---
