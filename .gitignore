@@ -9,3 +9,4 @@ tests/fake_qwen35_small_fused/
 tests/profiling_output/
 qwen35_checkpoint/*.safetensors" 
 qwen35_checkpoint/*.safetensors
+*.tex
