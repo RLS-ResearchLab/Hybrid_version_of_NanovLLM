@@ -137,7 +137,8 @@ REGION_LABELS = (
 
 
 def build_runner(model_dir, fake_config_loader, max_num_seqs, max_model_len,
-                  gpu_memory_utilization, use_fused_gdr_kernel, tensor_parallel_size=1):
+                  gpu_memory_utilization, use_fused_gdr_kernel, tensor_parallel_size=1,
+                  enforce_eager=False):
     """Returns (runner, config, engine). `engine` is None at tp=1 (bare
     ModelRunner, no peer processes involved) -- at tp>1 it's the LLMEngine
     that owns rank>0's spawned processes; the caller MUST keep a reference to
@@ -180,7 +181,7 @@ def build_runner(model_dir, fake_config_loader, max_num_seqs, max_model_len,
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
             tensor_parallel_size=1,
-            enforce_eager=False,   # graphs must be built for this profiling script
+            enforce_eager=enforce_eager,
             use_fused_gdr_kernel=use_fused_gdr_kernel,
         )
         runner = ModelRunner(config, rank=0, event=[])
@@ -202,7 +203,7 @@ def build_runner(model_dir, fake_config_loader, max_num_seqs, max_model_len,
         max_model_len=max_model_len,
         gpu_memory_utilization=gpu_memory_utilization,
         tensor_parallel_size=tensor_parallel_size,
-        enforce_eager=False,   # graphs must be built for this profiling script
+        enforce_eager=enforce_eager,
         use_fused_gdr_kernel=use_fused_gdr_kernel,
     )
     return engine.model_runner, engine.model_runner.config, engine
@@ -623,6 +624,10 @@ def main():
                           "regardless -- this only changes whether the flag is threaded "
                           "through at all; use --check-fused-gdr-capture for the real "
                           "capturability question).")
+    ap.add_argument("--enforce-eager", action="store_true", default=False,
+                    help="Force eager execution (no CUDA graph capture/replay). Use this "
+                         "to bypass graph-capture hangs at tp>1; decode still profiles "
+                         "normally, but graph.replay-specific metrics are intentionally absent.")
     ap.add_argument("--check-fused-gdr-capture", dest="check_fused_gdr_capture",
                      action="store_true", default=True)
     ap.add_argument("--no-check-fused-gdr-capture", dest="check_fused_gdr_capture", action="store_false")
@@ -639,10 +644,12 @@ def main():
 
     print(f"Building ModelRunner (model={args.model}, max_num_seqs={max_num_seqs}, "
           f"use_fused_gdr_kernel={args.use_fused_gdr_kernel}, "
-          f"tensor_parallel_size={args.tensor_parallel_size})...")
+          f"tensor_parallel_size={args.tensor_parallel_size}, "
+          f"enforce_eager={args.enforce_eager})...")
     runner, config, engine = build_runner(
         args.model, args.fake_config_loader, max_num_seqs, args.max_model_len,
         args.gpu_memory_utilization, args.use_fused_gdr_kernel, args.tensor_parallel_size,
+        args.enforce_eager,
     )
     print(f"  [OK] constructed. graphs captured for batch sizes: "
           f"{getattr(runner, 'graph_bs', 'NONE -- enforce_eager or capture failed')}")
