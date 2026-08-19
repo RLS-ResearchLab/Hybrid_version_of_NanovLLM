@@ -41,11 +41,36 @@ counts will scale roughly 5x on the real checkpoint, ratios should not):
     python tests/make_fake_hf_config.py     # if not already run
     python tests/profile_decode_launch_overhead.py
 
-Usage (real checkpoint):
+Usage (real checkpoint, tp=1 -- will not fit the real ~69GB checkpoint on one
+GPU, included only for completeness):
     python tests/profile_decode_launch_overhead.py \\
         --model /path/to/qwen3.5-35b-a3b --no-fake-config-loader \\
         --max-model-len 4096 --gpu-memory-utilization 0.85 \\
         --batch-sizes 1 4 8 32
+
+Usage (real checkpoint, tp=2 -- the actual H200 target; tp=4 will fail an
+existing assert, num_key_value_heads=2 is not divisible by 4):
+    python tests/profile_decode_launch_overhead.py \\
+        --model /path/to/qwen3.5-35b-a3b --no-fake-config-loader \\
+        --tensor-parallel-size 2 \\
+        --max-model-len 4096 --gpu-memory-utilization 0.85 \\
+        --batch-sizes 1 4 8 32
+
+At tp>1, construction goes through LLMEngine (spawns rank>0 as separate
+processes, see build_runner()) and every decode/prefill call is routed
+through ModelRunner.call()'s shared-memory dispatch instead of a direct
+runner.run() (see run_step()) -- required to avoid a 600s NCCL-watchdog hang,
+since rank>0 only ever executes a method when rank0 dispatches it that way.
+This changes what's being measured in two ways the script prints explicitly
+at startup when tp>1: (1) host_ms now includes real cross-process IPC
+dispatch overhead that tp=1 never pays, so it is NOT directly comparable to a
+tp=1 host_ms number; (2) torch.profiler/CUDA events/RegionInstrumentation
+only ever observe rank0 (this process, GPU 0) -- rank>0's own device
+timeline and any inter-rank collective-wait skew are invisible to this
+script. The eager-mode per-layer-type attribution sub-pass (toggling
+runner.enforce_eager to see GDR_layer/FullAttn_layer/MoE_layer individually
+under non-graph decode) is skipped at tp>1 for the same reason: it would
+desync which code path each rank takes without a model_runner.py change.
 
 Also runs the fused-GDR capturability check by default; skip with
 --no-check-fused-gdr-capture if flash-linear-attention isn't installed in
@@ -112,8 +137,27 @@ REGION_LABELS = (
 
 
 def build_runner(model_dir, fake_config_loader, max_num_seqs, max_model_len,
-                  gpu_memory_utilization, use_fused_gdr_kernel):
+                  gpu_memory_utilization, use_fused_gdr_kernel, tensor_parallel_size=1):
+    """Returns (runner, config, engine). `engine` is None at tp=1 (bare
+    ModelRunner, no peer processes involved) -- at tp>1 it's the LLMEngine
+    that owns rank>0's spawned processes; the caller MUST keep a reference to
+    it (and eventually call engine.exit()) or those processes/GPU memory leak
+    -- see LLMEngine.exit()'s docstring on why atexit alone isn't relied on
+    elsewhere in this repo (bench_throughput.py's build_engine() calls
+    engine.exit() explicitly in a finally too)."""
     import nanovllm.utils.loader as loader_mod
+
+    if tensor_parallel_size > 1 and fake_config_loader:
+        raise ValueError(
+            "--tensor-parallel-size > 1 with the fake config loader (the default) is not "
+            "supported. The fake-config monkeypatch below (config_mod.AutoConfig.from_pretrained, "
+            "loader_mod.load_model) only patches THIS process's module globals -- LLMEngine "
+            "spawns rank>0 as separate multiprocessing('spawn') processes that re-import "
+            "nanovllm.config fresh and never see the patch, so rank>0 would try to load a REAL "
+            "AutoConfig from a directory that likely isn't a registered HF model_type, desyncing "
+            "rank0 and rank>0 (or hanging). tp>1 is only meaningful for the real checkpoint: "
+            "pass --model /path/to/checkpoint --no-fake-config-loader --tensor-parallel-size 2."
+        )
 
     if fake_config_loader:
         import nanovllm.config as config_mod
@@ -125,21 +169,43 @@ def build_runner(model_dir, fake_config_loader, max_num_seqs, max_model_len,
         # --no-fake-config-loader) -- that path needs real weight loading.
         loader_mod.load_model = lambda model, path: None
 
-    from nanovllm.config import Config
-    from nanovllm.engine.model_runner import ModelRunner
+    if tensor_parallel_size == 1:
+        from nanovllm.config import Config
+        from nanovllm.engine.model_runner import ModelRunner
 
-    config = Config(
-        model=model_dir,
+        config = Config(
+            model=model_dir,
+            max_num_batched_tokens=max(2048, max_model_len),
+            max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_memory_utilization,
+            tensor_parallel_size=1,
+            enforce_eager=False,   # graphs must be built for this profiling script
+            use_fused_gdr_kernel=use_fused_gdr_kernel,
+        )
+        runner = ModelRunner(config, rank=0, event=[])
+        return runner, config, None
+
+    # tp>1: a bare ModelRunner has no peer -- rank>0 must be a SEPARATE
+    # process that only ever executes a method when rank0 dispatches it
+    # through ModelRunner.call()/write_shm() (see run_step() below). LLMEngine
+    # is what spawns rank>0 and wires up that shared-memory dispatch; this
+    # mirrors bench_throughput.py's build_engine(), which already does exactly
+    # this for the real checkpoint at tp>1 -- reusing that established,
+    # already-relied-upon construction path rather than a new one.
+    from nanovllm.engine.llm_engine import LLMEngine
+
+    engine = LLMEngine(
+        model_dir,
         max_num_batched_tokens=max(2048, max_model_len),
         max_num_seqs=max_num_seqs,
         max_model_len=max_model_len,
         gpu_memory_utilization=gpu_memory_utilization,
-        tensor_parallel_size=1,
+        tensor_parallel_size=tensor_parallel_size,
         enforce_eager=False,   # graphs must be built for this profiling script
         use_fused_gdr_kernel=use_fused_gdr_kernel,
     )
-    runner = ModelRunner(config, rank=0, event=[])
-    return runner, config
+    return engine.model_runner, engine.model_runner.config, engine
 
 
 def init_weights_and_guard(runner, fake_config_loader, seed=7):
@@ -159,6 +225,29 @@ def init_weights_and_guard(runner, fake_config_loader, seed=7):
         runner.model, whitelist_zero=known_zero_initialized_param_names(runner.model)
     )
     print("  [OK] assert_all_parameters_initialized passed")
+
+
+def run_step(runner, seqs, is_prefill):
+    """Drop-in replacement for runner.run(seqs, is_prefill) that is safe at
+    tensor_parallel_size>1. Direct runner.run() only ever executes on rank0's
+    own ModelRunner object -- rank>0 (a separate process at tp>1, see
+    build_runner) never runs anything unless rank0 dispatches through
+    ModelRunner.call(), which pickles the call over shared memory and signals
+    rank>0's loop() to wake up and execute it too (see engine/model_runner.py's
+    call()/write_shm()/read_shm()). Skip that dispatch at tp>1 and forward()'s
+    NCCL collectives (the MoE all-reduce, TP all-reduces) block on rank0
+    forever -- rank>0 sits idling in loop(), waiting for a dispatch that never
+    comes -- until the 600s NCCL watchdog kills the process. This exact hang
+    has already been hit twice in this project.
+
+    At tp=1, ModelRunner.call()'s `if self.world_size > 1 and self.rank == 0`
+    dispatch branch is False (world_size==1), so call() there is already a
+    no-op wrapper around runner.run() -- branching explicitly here instead
+    keeps the tp=1 path IDENTICAL to the pre-existing direct call, not just
+    behaviorally equivalent to it."""
+    if runner.world_size > 1:
+        return runner.call("run", seqs, is_prefill)
+    return runner.run(seqs, is_prefill)
 
 
 # ─── sequence / batch helpers ──────────────────────────────────────────────
@@ -206,7 +295,7 @@ def run_prefill_to_completion(runner, scheduler, seqs_added, max_rounds=64):
             break
         seqs, is_prefill = scheduler.schedule()
         assert is_prefill, "expected prefill rounds only in this helper"
-        token_ids = runner.run(seqs, True)
+        token_ids = run_step(runner, seqs, True)
         scheduler.postprocess(seqs, token_ids, True)
     else:
         raise RuntimeError("prefill did not complete within max_rounds -- "
@@ -495,6 +584,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default=os.path.join(os.path.dirname(__file__), "fake_qwen35_small"))
     ap.add_argument("--no-fake-config-loader", dest="fake_config_loader", action="store_false", default=True)
+    ap.add_argument("--tensor-parallel-size", type=int, default=1,
+                     help="Default 1 (direct ModelRunner, tp=1 behavior byte-for-byte unchanged). "
+                          "At tp>1, constructed via LLMEngine (spawns rank>0 as separate "
+                          "processes) and every runner.run() call is routed through "
+                          "ModelRunner.call()'s shared-memory dispatch instead of called "
+                          "directly -- required to avoid a 600s NCCL-watchdog hang, not "
+                          "optional. Requires --no-fake-config-loader (real checkpoint only). "
+                          "The real Qwen3.5-35B-A3B checkpoint runs at tp=2; tp=4 will fail "
+                          "an existing assert (num_key_value_heads=2 not divisible by 4).")
     ap.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 8])
     ap.add_argument("--prefill-len", type=int, default=256)
     ap.add_argument("--prefill-batch-size", type=int, default=4)
@@ -524,13 +622,31 @@ def main():
     max_num_seqs = max(args.batch_sizes + [args.prefill_batch_size])
 
     print(f"Building ModelRunner (model={args.model}, max_num_seqs={max_num_seqs}, "
-          f"use_fused_gdr_kernel={args.use_fused_gdr_kernel})...")
-    runner, config = build_runner(
+          f"use_fused_gdr_kernel={args.use_fused_gdr_kernel}, "
+          f"tensor_parallel_size={args.tensor_parallel_size})...")
+    runner, config, engine = build_runner(
         args.model, args.fake_config_loader, max_num_seqs, args.max_model_len,
-        args.gpu_memory_utilization, args.use_fused_gdr_kernel,
+        args.gpu_memory_utilization, args.use_fused_gdr_kernel, args.tensor_parallel_size,
     )
     print(f"  [OK] constructed. graphs captured for batch sizes: "
           f"{getattr(runner, 'graph_bs', 'NONE -- enforce_eager or capture failed')}")
+
+    if config.tensor_parallel_size > 1:
+        print(
+            f"\n[TP={config.tensor_parallel_size}] Two things this changes about what's being "
+            f"measured below, read before trusting numbers against a tp=1 run:\n"
+            f"  1. Every decode/prefill step is dispatched through ModelRunner.call() (pickle + "
+            f"shared-memory write + event signal to wake rank>0, see run_step()) instead of a "
+            f"plain runner.run(). This is the SAME path LLMEngine.step() uses in production at "
+            f"tp>1, so it's a real cost, not a profiling artifact -- but tp=1 pays none of it, "
+            f"so host_ms here is NOT directly comparable to a tp=1 host_ms number.\n"
+            f"  2. torch.profiler / CUDA events / RegionInstrumentation in this process only "
+            f"observe rank0 (this process, GPU 0). rank>0 is a separate spawned process with its "
+            f"own CUDA context and its own copies of every class -- its device timeline, and any "
+            f"skew waiting on a shared NCCL collective, is invisible to this script. Treat "
+            f"rank0's numbers as a same-order-of-magnitude proxy, not full coverage.\n"
+        )
+
     init_weights_and_guard(runner, args.fake_config_loader)
 
     from nanovllm.engine.scheduler import Scheduler
@@ -619,7 +735,7 @@ def main():
         def decode_step():
             seqs, is_prefill = scheduler.schedule()
             assert not is_prefill, f"expected decode round at bs={bs}"
-            token_ids = runner.run(seqs, False)
+            token_ids = run_step(runner, seqs, False)
             scheduler.postprocess(seqs, token_ids, False)
 
         for _ in range(args.warmup_iters):
@@ -637,30 +753,49 @@ def main():
         print_analysis(f"decode (bs={bs})", host_ms, device_ms, analysis, top_k_table=table, top_level_table=tl_table)
         print(f"  chrome trace: {trace_path}")
 
-        # Also profile eager decode at this batch size for the layer-type
-        # breakdown -- under graph replay everything collapses into a
-        # single CPU "graph.replay" op, so GDR_layer/FullAttn_layer/
-        # MoE_layer labels only fire (are only individually visible at the
-        # CPU-op level) when NOT replaying a graph.
-        prev_eager = runner.enforce_eager
-        runner.enforce_eager = True
-        for _ in range(args.warmup_iters):
-            decode_step()
-        with RegionInstrumentation(runner):
-            trace_path = os.path.join(args.trace_dir, f"decode_trace_bs{bs}_eager_layertype.json")
-            prof_eager = profile_iters(decode_step, args.profiled_iters, trace_path)
-        runner.enforce_eager = prev_eager
+        if runner.world_size == 1:
+            # Also profile eager decode at this batch size for the layer-type
+            # breakdown -- under graph replay everything collapses into a
+            # single CPU "graph.replay" op, so GDR_layer/FullAttn_layer/
+            # MoE_layer labels only fire (are only individually visible at the
+            # CPU-op level) when NOT replaying a graph.
+            prev_eager = runner.enforce_eager
+            runner.enforce_eager = True
+            for _ in range(args.warmup_iters):
+                decode_step()
+            with RegionInstrumentation(runner):
+                trace_path = os.path.join(args.trace_dir, f"decode_trace_bs{bs}_eager_layertype.json")
+                prof_eager = profile_iters(decode_step, args.profiled_iters, trace_path)
+            runner.enforce_eager = prev_eager
 
-        analysis_eager = analyze_profile(prof_eager, args.profiled_iters)
-        print(f"  [eager decode, same bs={bs}, for layer-type attribution only -- "
-              f"NOT a graph-vs-eager speed comparison, warmup wasn't reset]")
-        if analysis_eager is not None:
-            for k, v in analysis_eager["regions_per_iter"].items():
-                if k in ("GDR_layer", "FullAttn_layer", "MoE_layer"):
-                    print(f"    {k:<16s} count={v['count']:.1f}  cpu={v['cpu_ms']:.3f}ms  device={v['device_ms']:.3f}ms")
+            analysis_eager = analyze_profile(prof_eager, args.profiled_iters)
+            print(f"  [eager decode, same bs={bs}, for layer-type attribution only -- "
+                  f"NOT a graph-vs-eager speed comparison, warmup wasn't reset]")
+            if analysis_eager is not None:
+                for k, v in analysis_eager["regions_per_iter"].items():
+                    if k in ("GDR_layer", "FullAttn_layer", "MoE_layer"):
+                        print(f"    {k:<16s} count={v['count']:.1f}  cpu={v['cpu_ms']:.3f}ms  device={v['device_ms']:.3f}ms")
+            else:
+                eager_table = prof_eager.key_averages().table(sort_by="cpu_time_total", row_limit=15)
+                print(eager_table)
         else:
-            eager_table = prof_eager.key_averages().table(sort_by="cpu_time_total", row_limit=15)
-            print(eager_table)
+            # NOT extended to tp>1. Toggling runner.enforce_eager only mutates
+            # rank0's own attribute in THIS process -- rank>0 is a separate
+            # process (see build_runner) whose ModelRunner.enforce_eager is
+            # fixed at construction time from config.enforce_eager and has no
+            # dispatch path to change it later. Doing this "properly" would
+            # silently run rank0 in eager mode while rank>0 stays on the
+            # graph-replay path -- a cross-rank control-flow desync -- unless
+            # ModelRunner grows a new dispatchable method to toggle it on every
+            # rank, which is a model_runner.py change this task's constraints
+            # said to flag before making, not one to make silently inside a
+            # diagnostic-only sub-pass. The graph-replay REGION_LABELS
+            # breakdown above (per batch size, via RegionInstrumentation) is
+            # this script's main deliverable and is unaffected; only this
+            # supplementary eager per-layer-type attribution is unavailable.
+            print("  [SKIPPED at tp>1] eager-mode layer-type attribution sub-pass -- "
+                  "see run_step()/build_runner() comments and the module docstring's "
+                  "tp>1 section for why; not safe to extend without a model_runner.py change.")
 
         cleanup_running(scheduler, decode_seqs)
 
@@ -673,6 +808,18 @@ def main():
           "this file's module docstring, and inspect the exported chrome traces in "
           f"{args.trace_dir} (chrome://tracing or https://ui.perfetto.dev) for anything "
           "the automated extraction may have mis-attributed.")
+
+    if engine is not None:
+        # Deterministic cleanup on the success path (frees GPU memory in
+        # rank>0's processes promptly instead of waiting for interpreter
+        # shutdown) -- matches bench_throughput.py's build_engine() usage.
+        # LLMEngine.__init__ also atexit.register(self.exit)'s this BEFORE
+        # constructing rank0's own ModelRunner (see LLMEngine's docstring
+        # comment), so rank>0 processes still get torn down even if
+        # something above raised before reaching this line -- exit() is
+        # safe to call twice (checked via getattr(self, "model_runner",
+        # None) and p.is_alive()).
+        engine.exit()
 
 
 if __name__ == "__main__":
