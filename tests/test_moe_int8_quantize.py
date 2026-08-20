@@ -71,14 +71,39 @@ def section(title: str) -> None:
 
 
 def relative_error(a: torch.Tensor, b: torch.Tensor) -> float:
-    """max |a-b| / max(|a|, eps), a single scalar summary. Deliberately
-    crude (matches this project's own "max abs diff" / "max rel error"
-    reporting style elsewhere) rather than a fancier norm, so the number is
-    directly comparable to the MoE combine-step and EP-dispatch precision
-    numbers already in the measurement notebook."""
+    """max |a-b| / max(|a|, eps), PER-ELEMENT. Kept for diagnostic printing
+    only -- see tensor_relative_error below for why this is not the right
+    metric to ASSERT on for weight reconstruction, and
+    test_near_zero_element_diagnosis for a worked example of why it blows
+    up on a healthy quantizer."""
     diff = (a.float() - b.float()).abs()
     denom = a.float().abs().clamp_min(1e-8)
     return (diff / denom).max().item()
+
+
+def tensor_relative_error(a: torch.Tensor, b: torch.Tensor) -> float:
+    """max |a-b| / max(|a|) -- error relative to the TENSOR's own dynamic
+    range, not to each individual element's own magnitude.
+
+    This is the metric to assert reconstruction quality against. Per-element
+    relative error (relative_error, above) is dominated by whichever element
+    happens to be closest to zero: if a weight's true value is on the same
+    order as the quantization step (absmax/127 within its group), any
+    quantization error at all looks like ~100% relative error for that one
+    element, regardless of how good the quantizer is. This project has
+    already hit exactly this pattern once -- the EP dispatch top_k=8 check's
+    "16.7% rel error is a near-zero reference element, not a dispatch bug"
+    finding, recorded in the measurement notebook. Reusing per-element
+    relative error here without correcting for it would be repeating a
+    mistake this project has already diagnosed and named.
+
+    tensor_relative_error instead answers "how large is the worst absolute
+    error, relative to the largest thing in this tensor" -- which is what
+    "1.3% relative error" meant when reported for the MoE combine-step
+    fix, and is comparable to it."""
+    diff = (a.float() - b.float()).abs()
+    scale = a.float().abs().max().clamp_min(1e-8)
+    return (diff.max() / scale).item()
 
 
 def test_group_size_divides_real_dims():
@@ -145,24 +170,25 @@ def test_reconstruction_error_gate_up_proj_shape():
     int8_w, scale = quantize_weight_int8_grouped(w, GROUP_SIZE)
     w_hat = dequantize_weight_int8_grouped(int8_w, scale, GROUP_SIZE, torch.bfloat16)
 
-    rel_err = relative_error(w, w_hat)
+    elementwise_rel_err = relative_error(w, w_hat)  # diagnostic only, see below
+    tensor_rel_err = tensor_relative_error(w, w_hat)
     max_abs_err = (w.float() - w_hat.float()).abs().max().item()
 
     print(f"  shape: {tuple(w.shape)}  dtype: {w.dtype}")
-    print(f"  max relative error: {rel_err:.6f}")
-    print(f"  max absolute error: {max_abs_err:.6e}")
+    print(f"  max absolute error:            {max_abs_err:.6e}")
+    print(f"  relative error (vs tensor max): {tensor_rel_err:.6f}  <- assert on this")
+    print(f"  relative error (per-element):   {elementwise_rel_err:.6f}  <- diagnostic only,")
+    print(f"                                    expected to be large near zero-valued")
+    print(f"                                    weights; see near-zero-element note above")
 
-    # INT8 symmetric RTN with 128-wide groups on roughly-Gaussian weights:
-    # expect max relative error well under 1% for the vast majority of
-    # values, with outliers near individual near-zero weights (where
-    # relative error is not a meaningful metric -- see the EP dispatch
-    # top_k=8 near-zero-reference-element caveat already documented in the
-    # measurement notebook for exactly this reason). Threshold set loosely
-    # to catch a broken implementation, not to certify a tight bound.
-    assert rel_err < 0.5, (
-        f"Reconstruction relative error {rel_err:.4f} is implausibly high "
-        f"for INT8 RTN -- likely an implementation bug, not expected "
-        f"quantization noise."
+    # Asserted against the TENSOR's dynamic range, not per-element -- see
+    # tensor_relative_error's docstring. Threshold is a bug-catcher (a
+    # broken quantizer would show several percent, not a fraction of one),
+    # not a tight precision claim.
+    assert tensor_rel_err < 0.05, (
+        f"Reconstruction error {tensor_rel_err:.4f} (relative to tensor max) "
+        f"is implausibly high for INT8 RTN with group_size={GROUP_SIZE} -- "
+        f"likely an implementation bug, not expected quantization noise."
     )
     print("  [PASS] (threshold is a bug-catcher, not a precision claim --")
     print("         see test_matmul_error_* below for the number that matters)")
@@ -179,10 +205,58 @@ def test_reconstruction_error_down_proj_shape():
     int8_w, scale = quantize_weight_int8_grouped(w, GROUP_SIZE)
     w_hat = dequantize_weight_int8_grouped(int8_w, scale, GROUP_SIZE, torch.bfloat16)
 
-    rel_err = relative_error(w, w_hat)
+    tensor_rel_err = tensor_relative_error(w, w_hat)
     print(f"  shape: {tuple(w.shape)}  dtype: {w.dtype}")
-    print(f"  max relative error: {rel_err:.6f}")
-    assert rel_err < 0.5
+    print(f"  relative error (vs tensor max): {tensor_rel_err:.6f}")
+    assert tensor_rel_err < 0.05
+    print("  [PASS]")
+
+
+def test_near_zero_element_diagnosis():
+    section("Diagnosing per-element relative error blowup -- is it a bug or "
+            "a near-zero weight?")
+
+    torch.manual_seed(SEED)
+    w = (torch.randn(NUM_EXPERTS_SAMPLE, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE) * 0.02).to(torch.bfloat16)
+    int8_w, scale = quantize_weight_int8_grouped(w, GROUP_SIZE)
+    w_hat = dequantize_weight_int8_grouped(int8_w, scale, GROUP_SIZE, torch.bfloat16)
+
+    diff = (w.float() - w_hat.float()).abs()
+    denom = w.float().abs().clamp_min(1e-8)
+    elementwise_rel = diff / denom
+
+    worst_idx = elementwise_rel.flatten().argmax().item()
+    flat_w = w.float().flatten()
+    flat_diff = diff.flatten()
+    tensor_max = w.float().abs().max().item()
+
+    worst_true_value = flat_w[worst_idx].item()
+    worst_abs_err = flat_diff[worst_idx].item()
+
+    print(f"  worst per-element relative error: {elementwise_rel.max().item():.4f}")
+    print(f"  that element's TRUE value:         {worst_true_value:.6e}")
+    print(f"  that element's absolute error:     {worst_abs_err:.6e}")
+    print(f"  tensor's max abs value:            {tensor_max:.6e}")
+    print(f"  true value as a fraction of tensor max: "
+          f"{abs(worst_true_value) / tensor_max * 100:.4f}%")
+
+    # This is the check that actually distinguishes "bug" from "near-zero
+    # artifact": if the worst-relative-error element's TRUE value is itself
+    # tiny relative to the tensor's dynamic range, the inflated relative
+    # error is expected quantization behavior, not a defect. If instead the
+    # worst element had a LARGE true value and still showed high relative
+    # error, that would indicate a real problem.
+    assert abs(worst_true_value) / tensor_max < 0.05, (
+        f"The worst per-element relative error occurred at a value that is "
+        f"NOT near zero ({abs(worst_true_value)/tensor_max*100:.2f}% of "
+        f"tensor max) -- this would NOT be the near-zero-element artifact, "
+        f"and would need investigating as a possible real bug."
+    )
+    print("  [OK] confirmed: the worst-case element is near zero relative to")
+    print("       the tensor's own scale. Same signature as the EP dispatch")
+    print("       top_k=8 near-zero-reference-element finding already in the")
+    print("       measurement notebook -- expected quantization behavior,")
+    print("       not a defect.")
     print("  [PASS]")
 
 
@@ -325,6 +399,7 @@ def main():
     test_zero_group_does_not_produce_nan()
     test_reconstruction_error_gate_up_proj_shape()
     test_reconstruction_error_down_proj_shape()
+    test_near_zero_element_diagnosis()
     test_matmul_error_gate_up_proj()
     test_matmul_error_down_proj()
     test_quantize_experts_module_wrapper()
