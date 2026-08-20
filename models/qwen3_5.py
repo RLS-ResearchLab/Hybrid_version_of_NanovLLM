@@ -1200,9 +1200,25 @@ class Qwen35MoE(nn.Module):
             if cnt == 0:
                 continue
             xt = owned_tokens[sel]
-            gw, uw = self.experts.gate_up_proj[local_e].chunk(2, 0)
+            
+            if hasattr(self.experts, "gate_up_proj_int8"):
+                G = self.experts.moe_w8a8_group_size
+                gate_up_e = dequantize_weight_int8_grouped(
+                    self.experts.gate_up_proj_int8[local_e],
+                    self.experts.gate_up_proj_scale[local_e],
+                    G, x.dtype,
+                )
+                down_e = dequantize_weight_int8_grouped(
+                    self.experts.down_proj_int8[local_e],
+                    self.experts.down_proj_scale[local_e],
+                    G, x.dtype,
+                )
+            else:
+                gate_up_e = self.experts.gate_up_proj[local_e]
+                down_e = self.experts.down_proj[local_e]
+            gw, uw = gate_up_e.chunk(2, 0)
             h = F.silu(xt @ gw.t()) * (xt @ uw.t())
-            h = h @ self.experts.down_proj[local_e].t()
+            h = h @ down_e.t()
             w_slice = owned_weights[sel].unsqueeze(-1).to(combine_dtype)
             contribution = w_slice * h.to(combine_dtype)
             local_out.index_add_(0, owned_token_idx[sel], contribution)
@@ -1210,14 +1226,6 @@ class Qwen35MoE(nn.Module):
         dist.all_reduce(local_out)
         local_out = local_out.to(x.dtype)
 
-        # Token-id round-trip check, using the exact same `owned` /
-        # owned_token_idx tensors as the real computation above. Sentinel
-        # -1 for untouched rows; MAX (not SUM) combine so a token whose two
-        # selected experts are both local to this rank -- writing the same
-        # correct value twice -- doesn't get double-counted the way a sum
-        # would. Every row is guaranteed touched by exactly the rank(s)
-        # owning that token's selected expert(s), so after the all_reduce
-        # every row equals its own index with no leftover sentinels.
         token_id_local = torch.full((N,), -1, dtype=torch.int64, device=x.device)
         token_id_local[owned_token_idx] = owned_token_idx
         dist.all_reduce(token_id_local, op=dist.ReduceOp.MAX)
@@ -1271,16 +1279,7 @@ class Qwen35DecoderLayer(nn.Module):
                 rms_norm_eps=rms_norm_eps,
             )
         else:
-            # Real checkpoints name these linear_num_key_heads /
-            # linear_num_value_heads / linear_key_head_dim /
-            # linear_conv_kernel_dim -- not the linear_attn_* / conv_kernel_size
-            # names this code originally looked for (those defaults happened
-            # to numerically match this checkpoint's real values, which is
-            # exactly the silent-coincidence failure mode to not rely on).
-            # Real name tried first; old name kept as a second fallback only
-            # for the small fake configs several existing tests build
-            # (tests/make_fake_hf_config.py and friends), which still use the
-            # old field names -- not because the old name is correct.
+           
             self.linear_attn = Qwen35LinearAttention(
                 hidden_size=hidden_size,
                 linear_attn_kq_heads=getattr(
