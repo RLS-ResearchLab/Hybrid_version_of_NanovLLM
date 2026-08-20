@@ -89,8 +89,56 @@ from cluster_a4_fused_gdr_gsm8k import (  # noqa: E402
     DEFAULT_CKPT,
     _maybe_install_fake_config_loader,
 )
+from gsm8k_prompt import build_chat_messages  # noqa: E402
+from gsm8k_full_run import _normalize_prompt_ids  # noqa: E402
+from gsm8k_extract import extract_answer_detailed, GSM8K_STOP_PATTERNS  # noqa: E402
 
 CACHE_DIR = os.path.join(ROOT, "tests", "_cluster_day_cache", "q6_moe_w8a8")
+
+
+def _run_arm_chat_no_think(llm, sp, examples, dry_run: bool, batch_size: int = 8):
+    """chat-no-think counterpart of A4's imported _run_arm (which is raw-
+    format only, hardcoded to build_prompt()). This is the ACTUAL
+    production/gate configuration -- chat-no-think + stop-strings is what
+    produced the 95.30% GSM8K result at tp=2 with CUDA graphs, per the
+    measurement notebook's diagnostic chain. Built as a separate function
+    rather than a modification to the imported _run_arm, so A4's own
+    raw-format behavior stays completely untouched and re-importable
+    exactly as before.
+
+    Reuses build_chat_messages (gsm8k_prompt.py) and _normalize_prompt_ids
+    (gsm8k_full_run.py) directly -- the same two calls gsm8k_full_run.py's
+    own chat-no-think arm uses, not reimplemented."""
+    records = []
+    n_batches = (len(examples) + batch_size - 1) // batch_size
+    for b in range(n_batches):
+        batch = examples[b:b + batch_size]
+        prompts = [
+            _normalize_prompt_ids(llm.tokenizer.apply_chat_template(
+                build_chat_messages(ex["question"]),
+                tokenize=True, add_generation_prompt=True, enable_thinking=False,
+            ), llm.tokenizer)
+            for ex in batch
+        ]
+        outputs = llm.generate(prompts, sp, use_tqdm=False)
+        for ex, out in zip(batch, outputs):
+            model_text = out["text"]
+            model_result = extract_answer_detailed(model_text)
+            record = {"idx": ex["idx"], "model_output": model_text,
+                      "extracted_answer": model_result.value, "extraction_method": model_result.method}
+            if not dry_run:
+                gold_result = extract_answer_detailed(ex["answer"])
+                assert gold_result.method == "hash", (
+                    f"example {ex['idx']}: gold answer did not contain '#### N': {ex['answer']!r}"
+                )
+                record["gold_answer"] = gold_result.value
+                record["correct"] = (
+                    model_result.value is not None
+                    and abs(model_result.value - gold_result.value) < 1e-6
+                )
+            records.append(record)
+        print(f"    batch {b // batch_size + 1}/{n_batches} done")
+    return records
 
 
 def mcnemar_exact_test(b: int, c: int) -> float:
@@ -155,6 +203,14 @@ def analyze(records_a, records_b, label_a: str, label_b: str):
           f"n_discordant={len(flipped)}  p={p:.4f}")
     if len(flipped) == 0:
         print("  No discordant pairs at all -- strongest possible non-regression result.")
+    elif len(flipped) < 10 and (len(b_to_a_correct) == 0 or len(a_to_b_wrong) == 0):
+        print(f"  ALL {len(flipped)} discordant pair(s) went the SAME direction (b={len(b_to_a_correct)}, "
+              f"c={len(a_to_b_wrong)}) -- p={p:.4f} may still be >= 0.05 simply because n_discordant "
+              f"is too small for ANY split to reach significance, NOT because the direction is "
+              f"actually ambiguous. A unanimous split at low n is a DIFFERENT finding than a "
+              f"balanced split at the same n (e.g. A4's 8/5) -- do not read this p-value alone as "
+              f"clearing the result. Read every flipped example's actual text before concluding "
+              f"anything.")
     elif p >= 0.05:
         print(f"  p={p:.4f} >= 0.05: no evidence of a systematic direction in the flips. "
               f"Consistent with symmetric noise (e.g. reduction-order-dependent bf16 "
@@ -204,8 +260,8 @@ def _run_and_cache_q6(args, examples, use_w8a8: bool, results_path: str):
 
     tag = "on" if use_w8a8 else "off"
     print(f"\n[arm={tag}] loading engine (tensor_parallel_size={args.tp}, "
-          f"use_moe_w8a8={use_w8a8}, group_size={args.moe_w8a8_group_size}) "
-          f"from {args.checkpoint} ...")
+          f"use_moe_w8a8={use_w8a8}, group_size={args.moe_w8a8_group_size}, "
+          f"prompt_format={args.prompt_format}) from {args.checkpoint} ...")
     llm = LLM(
         args.checkpoint,
         enforce_eager=True,
@@ -216,10 +272,17 @@ def _run_and_cache_q6(args, examples, use_w8a8: bool, results_path: str):
         use_moe_w8a8=use_w8a8,
         moe_w8a8_weight_group_size=args.moe_w8a8_group_size,
     )
-    sp = SamplingParams(temperature=0, max_tokens=args.max_tokens)
+    is_chat_no_think = args.prompt_format == "chat-no-think"
+    sp = SamplingParams(
+        temperature=0, max_tokens=args.max_tokens,
+        stop=GSM8K_STOP_PATTERNS if is_chat_no_think else None,
+    )
 
     t0 = perf_counter()
-    records = _run_arm(llm, sp, examples, args.dry_run)
+    if is_chat_no_think:
+        records = _run_arm_chat_no_think(llm, sp, examples, args.dry_run)
+    else:
+        records = _run_arm(llm, sp, examples, args.dry_run)
     elapsed = perf_counter() - t0
     print(f"[arm={tag}] {len(records)} example(s) in {elapsed:.1f}s")
 
@@ -245,6 +308,14 @@ def main():
                      help="Same default and SAME seed as A4 -- same 40 examples.")
     ap.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     ap.add_argument("--moe-w8a8-group-size", type=int, default=128)
+    ap.add_argument("--prompt-format", choices=["raw", "chat-no-think"], default="raw",
+                     help="'raw' (default): A4's own format, build_prompt(), no chat template "
+                          "-- kept default for direct A4 comparability (same subsample, same "
+                          "format). 'chat-no-think': the ACTUAL production/gate configuration "
+                          "(chat template, enable_thinking=False, stop-strings auto-enabled) "
+                          "-- use this to check quantization against the format that produced "
+                          "95.30% GSM8K, removing the raw-format <think>-ritual-truncation "
+                          "confound that raw format is already known to have.")
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     ap.add_argument("--dry-run", action="store_true", default=False)
     ap.add_argument("--fake-config-loader", action="store_true", default=False)
@@ -265,8 +336,8 @@ def main():
     os.makedirs(CACHE_DIR, exist_ok=True)
     examples = _build_examples(args.num_examples, args.dry_run)
 
-    off_path = os.path.join(CACHE_DIR, f"n{args.num_examples}_tp{args.tp}_w8a8_off.json")
-    on_path = os.path.join(CACHE_DIR, f"n{args.num_examples}_tp{args.tp}_w8a8_on.json")
+    off_path = os.path.join(CACHE_DIR, f"n{args.num_examples}_tp{args.tp}_w8a8_off_{args.prompt_format}.json")
+    on_path = os.path.join(CACHE_DIR, f"n{args.num_examples}_tp{args.tp}_w8a8_on_{args.prompt_format}.json")
 
     records_off = _run_and_cache_q6(args, examples, use_w8a8=False, results_path=off_path)
     records_on = _run_and_cache_q6(args, examples, use_w8a8=True, results_path=on_path)
