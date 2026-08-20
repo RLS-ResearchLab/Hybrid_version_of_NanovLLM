@@ -181,9 +181,9 @@ PROMPTS = [
 COSINE_SIM_THRESHOLD = 0.99
 
 
-def _engine_path(tp: int) -> str:
-    return os.path.join(CACHE_DIR, f"engine_tp{tp}.pt")
-
+def _engine_path(tp: int, moe_w8a8: bool = False) -> str:
+    suffix = "_w8a8" if moe_w8a8 else ""
+    return os.path.join(CACHE_DIR, f"engine_tp{tp}{suffix}.pt")
 
 def phase_reference(args):
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -227,22 +227,6 @@ def phase_reference(args):
 def phase_engine(args):
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    # Rank0-only weight-loader DISPATCH check, folded into construction
-    # rather than a separate phase (a separate real-weight-loading phase
-    # would just re-pay the ~69GB load cost for no new signal): tracks
-    # whether ANY parameter falls through to default_weight_loader instead
-    # of its own TP-aware weight_loader, at REAL config/REAL checkpoint/REAL
-    # world_size for the first time (test_load_model_tp.py already proves
-    # the DISPATCH mechanism itself is correct, but only against a tiny
-    # synthetic checkpoint). Rank0-only: LLMEngine constructs rank0's
-    # ModelRunner in THIS process (engine/llm_engine.py) but spawns rank>0 as
-    # SEPARATE processes via torch.multiprocessing -- a monkeypatch here
-    # cannot see across that boundary. The mechanism is rank-symmetric by
-    # construction (identical load_model()/weight_loader code runs on every
-    # rank), so this is corroborating evidence at real scale, not independent
-    # proof for ranks>1; output agreement below (which reflects EVERY rank's
-    # contribution once sharded weights combine to produce a result) is the
-    # load-bearing signal for full-engine weight-loading correctness.
     import nanovllm.utils.loader as loader_mod
     called_via_default = []
     real_default = loader_mod.default_weight_loader
@@ -266,17 +250,11 @@ def phase_engine(args):
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_num_seqs=len(PROMPTS),
         max_model_len=MAX_MODEL_LEN,
+        use_moe_w8a8=args.moe_w8a8,
+        moe_w8a8_weight_group_size=args.moe_w8a8_group_size,
     )
     loader_mod.default_weight_loader = real_default
 
-    # Every leaf nn.Parameter on rank0's model MUST have a real weight_loader
-    # attribute (set by ColumnParallelLinear/RowParallelLinear/ReplicatedLinear/
-    # MergedColumnParallelLinear's __init__, or explicitly by Experts/norm
-    # modules) -- anything that fell through to default_weight_loader for a
-    # module type that's supposed to be TP-aware would be a real dispatch bug.
-    # Report the raw count; this is diagnostic (see docstring on rank-scope),
-    # not an automatic fail by itself -- default_weight_loader IS the correct
-    # path for plain (non-sharded) parameters like norm weights.
     print(f"[weight-loader dispatch, rank0 only] {len(called_via_default)} parameter(s) loaded "
           f"via default_weight_loader (expected for plain/non-sharded params; cross-check the "
           f"names below by eye if this count looks larger than the model's norm/bias parameter count)")
@@ -286,17 +264,12 @@ def phase_engine(args):
         prompt_ids = llm.tokenizer.encode(prompt)
         seq = Sequence(prompt_ids)
         seq.num_scheduled_tokens = len(prompt_ids)
-        # See reference_check_phase6.py's identical lines for why: an empty
-        # block_table is treated as the warmup case and skips slot_mapping.
         llm.scheduler.block_manager.allocate(seq, 0)
         if llm.model_runner.state_manager is not None:
             llm.model_runner.call("allocate_state_slot", seq)
 
         prefill_logits = llm.model_runner.call("get_prefill_logits", [seq])
         assert prefill_logits is not None, "expected rank0 to return gathered logits"
-        # MUST free before generate() below allocates its OWN separate
-        # Sequence for the same prompt -- see _free_diagnostic_seq's
-        # docstring for the real crash this prevents.
         _free_diagnostic_seq(llm, seq)
 
         sp = SamplingParams(temperature=0, max_tokens=DECODE_MAX_TOKENS)
@@ -410,6 +383,15 @@ def main():
     ap.add_argument("--fake-config-loader", action="store_true", default=False,
                      help="Required for --phase engine against tests/fake_qwen35_small (default OFF -- "
                           "never needed against the real checkpoint). See _AttrDict's docstring for why.")
+    ap.add_argument("--moe-w8a8", action="store_true", default=False,
+                     help="Quantize MoE expert weights to INT8 after loading (Q4). Default OFF -- "
+                          "runs the existing bf16 path unchanged. Only affects --phase engine; "
+                          "--phase reference (the HF baseline) is never quantized.")
+    ap.add_argument("--moe-w8a8-group-size", type=int, default=128,
+                     help="Group size for INT8 grouped quantization. 128 divides both "
+                          "hidden_size=2048 and moe_intermediate_size=512 exactly on the real "
+                          "checkpoint (Q0). Only used when --moe-w8a8 is set.")
+
     args = ap.parse_args()
 
     if args.phase == "reference":
