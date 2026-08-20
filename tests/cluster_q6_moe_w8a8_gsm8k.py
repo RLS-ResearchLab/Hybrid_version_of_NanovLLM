@@ -112,7 +112,7 @@ def _run_arm_chat_no_think(llm, sp, examples, dry_run: bool, batch_size: int = 8
     records = []
     n_batches = (len(examples) + batch_size - 1) // batch_size
     for b in range(n_batches):
-        batch = examples[b:b + batch_size]
+        batch = examples[b * batch_size:(b + 1) * batch_size]
         prompts = [
             _normalize_prompt_ids(llm.tokenizer.apply_chat_template(
                 build_chat_messages(ex["question"]),
