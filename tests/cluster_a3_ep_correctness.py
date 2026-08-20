@@ -324,6 +324,7 @@ def phase_histogram(args):
         summary.append({
             "layer_idx": layer_idx, "n_pairs": n_pairs, "mean": mean, "std": std,
             "zero_experts": zero_experts, "rank_counts": rank_counts, "max_over_mean": max_over_mean,
+            "per_expert_counts": counts.tolist(),
         })
 
     out_path = os.path.join(CACHE_DIR, f"histogram_real_ep{args.tp}.json")
