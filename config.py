@@ -14,6 +14,9 @@ class Config:
     enforce_eager: bool = False
     use_fused_gdr_kernel: bool = False
     use_vectorized_moe: bool = False
+    use_moe_w8a8: bool = False
+    moe_w8a8_weight_group_size: int = 128
+    moe_w8a8_act_eps: float = 1e-6
     # Debug-only: prints argmax vs sampled token for every prefilled seq on
     # every prefill call. Forces an extra argmax() + host-sync .tolist() in
     # the hot path even when nobody reads the output -- default off so
@@ -74,3 +77,6 @@ class Config:
         # getattr(config, "use_fused_gdr_kernel", False) read.
         self.hf_config.use_fused_gdr_kernel = self.use_fused_gdr_kernel
         self.hf_config.use_vectorized_moe = self.use_vectorized_moe
+        self.hf_config.use_moe_w8a8 = self.use_moe_w8a8
+        self.hf_config.moe_w8a8_weight_group_size = self.moe_w8a8_weight_group_size
+        self.hf_config.moe_w8a8_act_eps = self.moe_w8a8_act_eps
