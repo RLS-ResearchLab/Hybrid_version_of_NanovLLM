@@ -108,6 +108,8 @@ def build_engine(args):
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
         use_fused_gdr_kernel=args.use_fused_gdr_kernel,
+        use_moe_w8a8=getattr(args, "use_moe_w8a8", False),
+        moe_w8a8_weight_group_size=getattr(args, "moe_w8a8_weight_group_size", 128),
     )
 
 

@@ -107,7 +107,20 @@ def main():
                      help="Pass this against the REAL checkpoint (registered config, no monkeypatch "
                           "needed). Default True is for the small fake model's unregistered model_type.")
     cli = ap.parse_args()
-
+    ap.add_argument("--use-fused-gdr-kernel", action="store_true", default=False,
+                     help="Off by default, matching the project's actual shipping default "
+                          "(A4 non-regression: 13/40 GSM8K flips, McNemar p~=0.58 -- not a "
+                          "defect, but the +1.5%% end-to-end gain wasn't worth the 8-10h "
+                          "n=1319 certification cost, so it ships off). This script previously "
+                          "hardcoded it ON unconditionally -- CHANGED here to a flag, "
+                          "defaulting OFF, so a vanilla run now measures the actual default "
+                          "config. Pass this flag explicitly to reproduce the original "
+                          "all-interventions-stacked A5 numbers.")
+    ap.add_argument("--moe-w8a8", action="store_true", default=False,
+                     help="Quantize MoE expert weights to INT8 (Q4/Q6 -- correctness- and "
+                          "accuracy-validated, 40/40 GSM8K non-regression under chat-no-think). "
+                          "Off by default.")
+    ap.add_argument("--moe-w8a8-group-size", type=int, default=128)
     args = _Args()
     args.model = cli.checkpoint
     args.max_num_batched_tokens = cli.max_num_batched_tokens
@@ -116,8 +129,9 @@ def main():
     args.gpu_memory_utilization = cli.gpu_memory_utilization
     args.tensor_parallel_size = cli.tensor_parallel_size
     args.enforce_eager = False
-    args.use_fused_gdr_kernel = True
-    args.fake_config_loader = cli.fake_config_loader
+    args.use_fused_gdr_kernel = cli.use_fused_gdr_kernel
+    args.use_moe_w8a8 = cli.moe_w8a8
+    args.moe_w8a8_weight_group_size = cli.moe_w8a8_group_size
 
     print(f"Building engine: tensor_parallel_size={args.tensor_parallel_size} (== ep_size) "
           f"from {args.model} ...")
