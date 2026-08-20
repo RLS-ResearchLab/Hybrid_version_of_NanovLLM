@@ -105,7 +105,20 @@ def dequantize_weight_int8_grouped(
     int8_weight: torch.Tensor, scale: torch.Tensor, group_size: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
     """Inverse of quantize_weight_int8_grouped. Returns a tensor of shape
-    and dtype matching the original input to quantize_weight_int8_grouped."""
+    and dtype matching the original input to quantize_weight_int8_grouped.
+
+    Computes in fp32 (same precision as quantize_weight_int8_grouped and as
+    every correctness number already measured against this function --
+    Q5's reconstruction/matmul checks and Q6's real GSM8K non-regression
+    both ran through this exact code path). The multiply is done IN PLACE
+    (w.mul_) rather than as w * scale_bcast, which would allocate a SECOND
+    full-size fp32 tensor for the product -- for the (N, TK, ...) gathered
+    decode buffer this roughly doubles the fp32 transient memory for no
+    numerical benefit (in-place and out-of-place multiply produce identical
+    floating-point results here). This was found by an actual OOM during
+    the A5 concurrency-sweep rerun at high concurrency: the gathered
+    buffer's fp32 intermediate was large enough to matter, not a
+    theoretical concern."""
     *lead, out_features, in_features = int8_weight.shape
     num_groups = in_features // group_size
     assert scale.shape == (*lead, out_features, num_groups), (
@@ -114,10 +127,11 @@ def dequantize_weight_int8_grouped(
         f"{tuple(int8_weight.shape)} at group_size={group_size}."
     )
 
-    w = int8_weight.reshape(*lead, out_features, num_groups, group_size).float()
-    scale_bcast = scale.unsqueeze(-1).float()
-    dequant = (w * scale_bcast).reshape(*lead, out_features, in_features)
-    return dequant.to(out_dtype)
+    w = int8_weight.reshape(*lead, out_features, num_groups, group_size).to(torch.float32)
+    scale_bcast = scale.unsqueeze(-1).to(torch.float32)
+    w.mul_(scale_bcast)  # in-place: no second fp32 tensor for the product
+    dequant = w.reshape(*lead, out_features, in_features).to(out_dtype)
+    return dequant
 
 
 def quantize_experts_module(gate_up_proj: torch.Tensor, down_proj: torch.Tensor, group_size: int):
