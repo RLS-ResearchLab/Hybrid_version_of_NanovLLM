@@ -286,14 +286,14 @@ def phase_engine(args):
     torch.save({
         "tp": args.tp, "results": results,
         "weight_loader_dispatch_default_count": len(called_via_default),
-    }, _engine_path(args.tp))
-    print(f"\nSaved engine (tp={args.tp}) results to {_engine_path(args.tp)}")
+    }, _engine_path(args.tp, args.moe_w8a8))
+    print(f"\nSaved engine (tp={args.tp}) results to {_engine_path(args.tp, args.moe_w8a8)}")
     print("PHASE COMPLETE -- exit this process fully before running --phase compare")
 
 
 def phase_compare(args):
     ref_path = REFERENCE_PATH
-    eng_path = _engine_path(args.tp)
+    eng_path = _engine_path(args.tp, args.moe_w8a8)
     if args.dry_run_no_hf_reference:
         print("--dry-run-no-hf-reference: SKIPPING comparison against an HF reference (none was "
               "generated -- fake_qwen35_small has random untrained weights, so an HF reference for "
