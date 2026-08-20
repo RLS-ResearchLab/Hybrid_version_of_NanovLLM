@@ -106,7 +106,6 @@ def main():
     ap.add_argument("--no-fake-config-loader", dest="fake_config_loader", action="store_false", default=True,
                      help="Pass this against the REAL checkpoint (registered config, no monkeypatch "
                           "needed). Default True is for the small fake model's unregistered model_type.")
-    cli = ap.parse_args()
     ap.add_argument("--use-fused-gdr-kernel", action="store_true", default=False,
                      help="Off by default, matching the project's actual shipping default "
                           "(A4 non-regression: 13/40 GSM8K flips, McNemar p~=0.58 -- not a "
@@ -121,6 +120,7 @@ def main():
                           "accuracy-validated, 40/40 GSM8K non-regression under chat-no-think). "
                           "Off by default.")
     ap.add_argument("--moe-w8a8-group-size", type=int, default=128)
+    cli = ap.parse_args()
     args = _Args()
     args.model = cli.checkpoint
     args.max_num_batched_tokens = cli.max_num_batched_tokens
@@ -129,6 +129,7 @@ def main():
     args.gpu_memory_utilization = cli.gpu_memory_utilization
     args.tensor_parallel_size = cli.tensor_parallel_size
     args.enforce_eager = False
+    args.fake_config_loader = cli.fake_config_loader
     args.use_fused_gdr_kernel = cli.use_fused_gdr_kernel
     args.use_moe_w8a8 = cli.moe_w8a8
     args.moe_w8a8_weight_group_size = cli.moe_w8a8_group_size

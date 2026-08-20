@@ -35,7 +35,7 @@ import argparse
 import os
 import sys
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import bench_throughput as bt  # noqa: E402
 

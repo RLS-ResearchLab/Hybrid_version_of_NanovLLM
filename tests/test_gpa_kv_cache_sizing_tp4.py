@@ -68,7 +68,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from nanovllm.layers.linear import local_num_kv_heads
+from layers.linear import local_num_kv_heads
 
 
 # ---------------------------------------------------------------------------
