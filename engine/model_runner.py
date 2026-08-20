@@ -32,24 +32,6 @@ ARCH_DISPATCH = {
     "Qwen35ForCausalLM": Qwen35ForCausalLM,
     "Qwen35MoEForCausalLM": Qwen35ForCausalLM,
     "Qwen3_5MoeForConditionalGeneration": Qwen35ForCausalLM,
-    # The REAL checkpoint's config.json (qwen35_checkpoint/config.json,
-    # model_type "qwen3_5_moe_text", a text-only MoE checkpoint, not the VLM
-    # variant the "ForConditionalGeneration" entry above targets) reports
-    # this exact string. Missing this key silently fell through to
-    # ARCH_DISPATCH.get(arch, Qwen3ForCausalLM)'s dense-model DEFAULT instead
-    # of raising -- discovered via a real cluster-day A1 run against real
-    # weights (never caught by this repo's other tests/scripts, which all
-    # construct SimpleNamespace fake configs or the small fake model's
-    # config.json, "architectures": ["Qwen35MoEForCausalLM"], which DOES
-    # match a pre-existing key). Symptom was two different downstream
-    # crashes depending on tp_size, both inside the WRONG (dense) model
-    # class: `assert num_key_value_heads % tp_size == 0` at tp=4 (real
-    # num_key_value_heads=2 fails that), and `config.intermediate_size`
-    # AttributeError at tp=2 (dense-only field; the MoE config only has
-    # moe_intermediate_size/shared_expert_intermediate_size) -- neither
-    # error mentions "wrong model class" directly, so this is worth knowing
-    # if a similarly-shaped AttributeError/AssertionError ever recurs against
-    # a DIFFERENT checkpoint variant's architectures string.
     "Qwen3_5MoeForCausalLM": Qwen35ForCausalLM,
 }
 
@@ -78,24 +60,8 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-        # Paired with `event`: rank>0 sets its own ack_event right after
-        # copying read_shm()'s buffer contents out into local Python objects
-        # (see read_shm/write_shm below) -- lets rank0 know it's safe to
-        # overwrite the shared buffer with the next call's payload. Without
-        # this, rank0 has no way to know rank>0 has actually finished
-        # reading before it writes again.
         self.ack_event = ack_event
         self.state_manager = None
-
-        # enforce_eager elsewhere in this file only gates CUDA graph
-        # capture/replay -- it does nothing about the @torch.compile
-        # decorators in layers/{layernorm,sampler,activation,rotary_embedding}.py,
-        # which are applied at import time independent of any engine config.
-        # Disabling dynamo globally is the only way enforce_eager=True actually
-        # guarantees zero compilation anywhere in the forward path. Set
-        # unconditionally (not just when True) so a later ModelRunner built
-        # with enforce_eager=False in the same process re-enables compilation
-        # instead of staying silently stuck off.
         torch._dynamo.config.disable = self.enforce_eager
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
@@ -103,18 +69,6 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-
-        # No `architectures` field at all -> assume dense Qwen3 (silent, same
-        # as before -- this is a genuinely missing-field default, not the
-        # dangerous case below). An `architectures` field that IS present but
-        # doesn't match any ARCH_DISPATCH key is different: silently falling
-        # back to the dense model there is exactly what caused a real
-        # incident (a cluster-day A1 run against the real Qwen3.5 checkpoint,
-        # whose "Qwen3_5MoeForCausalLM" string wasn't yet a dict key,
-        # silently got the WRONG -- dense -- model class, surfacing only much
-        # later as an unrelated-looking AttributeError/AssertionError deep
-        # inside Qwen3Attention, not as an obvious "wrong model" error). Fail
-        # loudly there instead.
         arch_list = getattr(hf_config, "architectures", None)
         if arch_list is None:
             arch, model_cls = "Qwen3ForCausalLM", Qwen3ForCausalLM
@@ -133,6 +87,14 @@ class ModelRunner:
 
         self.model = model_cls(hf_config)
         load_model(self.model, config.model)
+        if getattr(config, "use_moe_w8a8", False):
+            from moe_int8_integration import apply_moe_int8_quantization
+            n_quantized = apply_moe_int8_quantization(
+                self.model, config.moe_w8a8_weight_group_size
+            )
+            torch.cuda.empty_cache()
+            print(f"[MOE W8A8] quantized {n_quantized} Experts module(s) to "
+                  f"INT8, group_size={config.moe_w8a8_weight_group_size}")
         if self._is_hybrid_model:
             num_linear_layers = sum(1 for t in self.model.model.layer_types if t == "linear_attention")
             la0 = next(m for m in self.model.modules() if isinstance(m, Qwen35LinearAttention))

@@ -14,6 +14,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from moe_int8_quantize import dequantize_weight_int8_grouped
 
 from nanovllm.layers.layernorm import Qwen35RMSNorm, Qwen35RMSNormGated
 from nanovllm.layers.linear import (
@@ -907,9 +908,19 @@ class Qwen35MoE(nn.Module):
         local_slots = idx // P                                    # (N, TK) -- always in-bounds, see docstring
         owned_mask = (idx % P) == self.ep_rank                    # (N, TK) bool
 
-        gate_up = self.experts.gate_up_proj[local_slots]          # (N, TK, 2*MI, H)
-        down = self.experts.down_proj[local_slots]                # (N, TK, H, MI)
-        gw, uw = gate_up.chunk(2, dim=2)                           # each (N, TK, MI, H)
+        if hasattr(self.experts, "gate_up_proj_int8"):
+            gu_i8 = self.experts.gate_up_proj_int8[local_slots]           # (N, TK, 2*MI, H) int8
+            gu_sc = self.experts.gate_up_proj_scale[local_slots]          # (N, TK, 2*MI, H//G)
+            dp_i8 = self.experts.down_proj_int8[local_slots]              # (N, TK, H, MI) int8
+            dp_sc = self.experts.down_proj_scale[local_slots]             # (N, TK, H, MI//G)
+            G = self.experts.moe_w8a8_group_size
+            gate_up = dequantize_weight_int8_grouped(gu_i8, gu_sc, G, x.dtype)
+            down = dequantize_weight_int8_grouped(dp_i8, dp_sc, G, x.dtype)
+        else:
+            gate_up = self.experts.gate_up_proj[local_slots]          # (N, TK, 2*MI, H)
+            down = self.experts.down_proj[local_slots]                # (N, TK, H, MI)
+
+        gw, uw = gate_up.chunk(2, dim=2)                        # each (N, TK, MI, H)
 
         h_gate = torch.einsum('nkmh,nh->nkm', gw, x)               # (N, TK, MI)
         h_up = torch.einsum('nkmh,nh->nkm', uw, x)                 # (N, TK, MI)
