@@ -264,7 +264,7 @@ def _run_and_cache_q6(args, examples, use_w8a8: bool, results_path: str):
           f"prompt_format={args.prompt_format}) from {args.checkpoint} ...")
     llm = LLM(
         args.checkpoint,
-        enforce_eager=True,
+        enforce_eager=args.enforce_eager,
         tensor_parallel_size=args.tp,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_num_seqs=8,
@@ -308,6 +308,15 @@ def main():
                      help="Same default and SAME seed as A4 -- same 40 examples.")
     ap.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     ap.add_argument("--moe-w8a8-group-size", type=int, default=128)
+    ap.add_argument("--no-enforce-eager", dest="enforce_eager", action="store_false", default=True,
+                     help="Default True matches this script's original, only-ever-tested "
+                          "behavior (eager mode). Pass this flag to run under CUDA graph "
+                          "capture instead -- the ONLY way to exercise the graph-mode decode "
+                          "path (this script never touched it before), needed to validate "
+                          "the state-manager in-graph write-back fix (real EOS + max_num_seqs=8 "
+                          "batches naturally produce padding rows as sequences finish at "
+                          "different times, exactly the scenario that fix's scratch-slot "
+                          "design has to get right).")
     ap.add_argument("--prompt-format", choices=["raw", "chat-no-think"], default="raw",
                      help="'raw' (default): A4's own format, build_prompt(), no chat template "
                           "-- kept default for direct A4 comparability (same subsample, same "

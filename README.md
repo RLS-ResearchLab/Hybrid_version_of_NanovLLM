@@ -229,20 +229,44 @@ genuinely fast). Under **CUDA graph capture**, which eliminates exactly that per
 |---|---|
 | bf16 + graphs | 52.7 |
 | INT8 + graphs, fix 1+2 (no fused kernel) | 37.1 |
-| INT8 + graphs, **fused Triton kernel** | **172.7** |
+| INT8 + graphs, **fused Triton kernel**, concurrency=16 | **172.7** |
+| INT8 + graphs, **fused Triton kernel**, concurrency=32 | **202.0** |
 
-**172.7 tok/s — 3.3× the bf16 baseline, 4.65× the prior best INT8 number.** Verified correct via three
-independent checks before trusting it: isolated kernel math vs. the trusted reference (cosine=0.999988),
-real-checkpoint GSM8K non-regression in eager mode (8/8 both arms, zero flips), and real generated text
-read by eye under the exact graph-capture configuration that produced this number (coherent, arithmetically
-correct output on multiple prompts). `use_moe_w8a8` with the fused kernel is no longer just a
-capacity-for-speed trade — on this hardware, it beats bf16 outright. Not yet autotuned (one fixed,
-conservative kernel config throughout); real upside likely still on the table. Flag-gated behind
-`NANOVLLM_USE_FUSED_MOE_KERNEL=1` (not yet a `Config` field — still new enough to keep an explicit opt-in),
-prefill (`_forward_dispatch_ep`) not yet migrated to it (lower priority, ~1 of 1025 forward passes).
-`gpu_memory_utilization=0.60` (needed for the concurrency=32 capacity result above) is A6000-specific
-tuning, expected unnecessary on H200's 141GB — the throughput numbers above are a property of the
-dequantization path itself, not this hardware, and should be expected to carry over to H200.
+**172.7 tok/s at concurrency=16 — 3.3× the bf16 baseline, 4.65× the prior best INT8 number.** Verified
+correct via three independent checks before trusting it: isolated kernel math vs. the trusted reference
+(cosine=0.999988), real-checkpoint GSM8K non-regression in eager mode (8/8 both arms, zero flips), and real
+generated text read by eye under the exact graph-capture configuration that produced this number (coherent,
+arithmetically correct output on multiple prompts). `use_moe_w8a8` with the fused kernel is no longer just a
+capacity-for-speed trade — on this hardware, it beats bf16 outright.
+
+**Update, same day: pushed to concurrency=32 — 202.0 tok/s, 3.83× bf16, clears the user's stated 200 tok/s
+goal on 2×A6000 test hardware, which was explicitly not expected to get there regardless of software
+optimization** (bf16's own bandwidth-bound ceiling here is 52.7 tok/s; bf16 additionally cannot even run at
+concurrency=32 at all — OOMs — so this comparison only exists because INT8+the fused kernel unlocked the
+higher concurrency in the first place). Measured via TWO independent harnesses and found to agree:
+`cluster_a5_concurrency_sweep.py` (202.0 tok/s, mean of 2 trials, `gpu_memory_utilization=0.60`) and the
+primary matched-settings script used for every other row in this table, `diag_w8a8_eager_vs_graph.py`
+(≈202 tok/s, same settings) — cross-validated, not a single-harness artifact. Concurrency scaling from 16→32
+was sub-linear (1.17×, not 2×), consistent with MoE expert-coverage: as more concurrent tokens hit the model
+per layer, more distinct experts get touched, so the weight-read savings from batching shrink at higher
+concurrency. **Concurrency=64 does not fit on this hardware — confirmed a real capacity ceiling, not a tuning
+problem.** `max_num_seqs=64` sizes `StateManager` (this hybrid model's linear-attention recurrent state) about
+2GB larger than at 32, which combined with model weights already uses ~20GB/rank before any KV cache is
+allocated. Swept `gpu_memory_utilization` across the plausible range and found no working value: 0.60 and 0.52
+both OOM during CUDA graph capture (too little headroom left for capture's buffers at this batch size), 0.45
+fails the `num_kvcache_blocks > 0` assertion before capture even starts (too little headroom left for KV cache
+at all). The window this needs sits between "enough for KV cache" and "enough for graph capture," and on this
+48GB card at this batch size, that window doesn't exist. Concurrency=32 (202.0 tok/s) is the practical ceiling
+for this kernel path on 2×A6000.
+
+Not yet autotuned (one fixed, conservative kernel config throughout — `BLOCK_SIZE_M=16, N=64, K=64, warps=4,
+stages=2`); real upside likely still on the table, pending a graph-mode kernel-time profile (in progress) to
+confirm the GEMM is actually the dominant cost under graph capture before spending time tuning it. Flag-gated
+behind `NANOVLLM_USE_FUSED_MOE_KERNEL=1` (not yet a `Config` field — still new enough to keep an explicit
+opt-in), prefill (`_forward_dispatch_ep`) not yet migrated to it (lower priority, ~1 of 1025 forward passes).
+`gpu_memory_utilization=0.60` (needed for the concurrency=32 result above) is A6000-specific tuning, expected
+unnecessary on H200's 141GB — the throughput numbers above are a property of the dequantization path itself,
+not this hardware, and should be expected to carry over to H200.
 
 ---
 

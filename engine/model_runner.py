@@ -411,21 +411,21 @@ class ModelRunner:
                 gv["context_lens"].zero_()
                 gv["context_lens"][:bs] = context.context_lens
                 gv["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+                # Padding rows (this graph's captured size may exceed bs)
+                # must resolve to the reserved scratch slot, not leftover
+                # real slot ids from a previous, larger-bs call -- see
+                # capture_cudagraph()'s _step() for why this matters.
+                gv["state_slot_ids"].fill_(self.state_manager.scratch_slot_id)
                 gv["state_slot_ids"][:bs] = context.state_slot_ids
                 # cu_seqlens_q for decode is always arange(0, bs+1) — already
                 # correct as a static buffer, no per-call refresh needed.
- 
+
                 graph.replay()
- 
+
                 hidden = gv["outputs"][:bs]
-                num_layers = len(self.model.model.layers)
-                linear_idx = self.model.model.linear_layer_indices
-                new_states = [None] * num_layers
-                new_conv_states = [None] * num_layers
-                for compact_idx, full_idx in enumerate(linear_idx):
-                    new_states[full_idx] = gv["state_out_bufs"][compact_idx][:bs]
-                    new_conv_states[full_idx] = gv["conv_out_bufs"][compact_idx][:bs]
-                self.state_manager.set_all(context.state_slot_ids, new_states, new_conv_states, linear_idx)
+                # State write-back happens INSIDE the captured graph now
+                # (see capture_cudagraph()'s _step()) -- no eager
+                # index_copy_ needed here anymore.
                 logits = self.model.compute_logits(hidden)
             else:
                 num_layers = len(self.model.model.layers)
@@ -642,7 +642,12 @@ class ModelRunner:
             # cu_seqlens is always arange(0, bs+1) — same construction
             # prepare_decode() already uses at eager time.
             cu_seqlens_q = torch.arange(0, max_bs + 1, dtype=torch.int32)
-            state_slot_ids = torch.zeros(max_bs, dtype=torch.int64)
+            # Default-filled with the reserved scratch slot, not zeros --
+            # rows beyond the real batch size (this graph's capture size
+            # may exceed it) must never resolve to a real, in-use slot.
+            # run() re-fills this the same way before every replay; see
+            # StateManager.scratch_slot_id's docstring for why.
+            state_slot_ids = torch.full((max_bs,), self.state_manager.scratch_slot_id, dtype=torch.int64)
             graph_vars["cu_seqlens_q"] = cu_seqlens_q
             graph_vars["state_slot_ids"] = state_slot_ids
  
@@ -652,9 +657,10 @@ class ModelRunner:
  
             # Static output buffers for the recurrent state — one per
             # linear-attention layer, sized like StateManager's own
-            # per-layer slices. These live outside StateManager (StateManager
-            # itself gets written to AFTER replay, via set_all, same as
-            # compute_logits happens after replay).
+            # per-layer slices. No longer read by anything (state
+            # write-back now happens in-graph -- see _step() below) --
+            # left in place so this change stays additive rather than
+            # touching capture's buffer bookkeeping further.
             state_out_bufs = [
                 torch.zeros(max_bs, sm.states.shape[2], sm.states.shape[3], sm.states.shape[4],
                             dtype=torch.float32)
@@ -696,6 +702,25 @@ class ModelRunner:
                     for compact_idx, full_idx in enumerate(linear_idx):
                         state_out_bufs[compact_idx][:bs] = new_states[full_idx]
                         conv_out_bufs[compact_idx][:bs] = new_conv_states[full_idx]
+                        # Write the new recurrent/conv state directly back
+                        # into StateManager's real buffers, INSIDE the
+                        # captured graph -- eliminates the 64 index_copy_
+                        # calls/decode-step (32 linear layers x 2) that
+                        # previously ran in eager Python after every
+                        # replay (measured ~8.6% of total GPU time in a
+                        # graph-mode nsys profile, the largest per-step
+                        # cost found after the fused MoE kernel work).
+                        # Safe against padding rows (this graph's bs may
+                        # exceed the real request count) ONLY because
+                        # run() fills state_slot_ids' padding region with
+                        # StateManager.scratch_slot_id before every
+                        # replay -- without that, a padding row's stale
+                        # slot id could alias and silently corrupt a
+                        # different, currently-in-use sequence's state.
+                        sm.states[compact_idx].index_copy_(
+                            0, slot_ids_bs, new_states[full_idx].to(sm.states.dtype))
+                        sm.conv_states[compact_idx].index_copy_(
+                            0, slot_ids_bs, new_conv_states[full_idx].to(sm.conv_states.dtype))
  
                 _step()    # warmup
                 with torch.cuda.graph(graph, self.graph_pool):

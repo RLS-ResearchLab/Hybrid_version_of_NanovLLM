@@ -26,16 +26,29 @@ class StateManager:
         self.num_linear_layers = num_linear_layers
         self.ck = conv_kernel_size
 
+        # Slot `max_num_seqs` is a reserved SCRATCH slot, one past the real
+        # range and never handed out by allocate() (free_slot_ids only ever
+        # contains range(max_num_seqs)). It exists as a safe write target
+        # for CUDA-graph-captured decode steps: a captured graph's batch
+        # size is fixed, so a real request count smaller than that pads the
+        # remainder with whatever slot ids happen to be left in the graph's
+        # static buffer. Writing that padding's computed state back
+        # in-graph without a dedicated sink could alias and silently
+        # corrupt a DIFFERENT, currently-in-use sequence's real state — see
+        # model_runner.py's capture_cudagraph()/run() for how padding rows
+        # get routed here instead.
+        self.scratch_slot_id = max_num_seqs
+
         # Recurrent state accumulates in float32 (matches the GDR scan's
         # own precision — see src/model.py's comment on why bf16 state
         # compounds rounding error into degenerate repetition loops).
         self.states = torch.zeros(
-            num_linear_layers, max_num_seqs, lvh, lhd, lhd,
+            num_linear_layers, max_num_seqs + 1, lvh, lhd, lhd,
             dtype=torch.float32, device=device,
         )
         # Conv history stays in model dtype (matches conv1d's input dtype).
         self.conv_states = torch.zeros(
-            num_linear_layers, max_num_seqs, qkv_dim, conv_kernel_size - 1,
+            num_linear_layers, max_num_seqs + 1, qkv_dim, conv_kernel_size - 1,
             dtype=dtype, device=device,
         )
 
