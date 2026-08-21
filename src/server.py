@@ -421,6 +421,23 @@ def main():
                              "numbers/output after tests/decode_stagger_contamination_check.py "
                              "passes. Raise --max-num-seqs when using 'batched' -- see that "
                              "flag's help text.")
+    parser.add_argument("--moe-w8a8", dest="use_moe_w8a8", action="store_true", default=False,
+                        help="Quantize MoE expert weights to INT8 after loading (Q4/Q6 -- "
+                             "correctness- and accuracy-validated, 40/40 GSM8K non-regression "
+                             "under chat-no-think; see moe_quantization_memo.md). Off by "
+                             "default, matching every other entry point in this project. "
+                             "Under CUDA graphs (--cuda-graphs), needs more headroom than "
+                             "bf16 -- allocate_kv_cache() sizes the KV cache before "
+                             "capture_cudagraph() claims its private pool, so pass a lower "
+                             "--gpu-memory-utilization than you would for bf16 (0.75 was the "
+                             "smallest that worked at concurrency=16 on a 48GB A6000; the "
+                             "margin needed grows with --max-num-seqs, since that sets the "
+                             "largest captured graph bucket).")
+    parser.add_argument("--moe-w8a8-group-size", type=int, default=128,
+                        dest="moe_w8a8_weight_group_size",
+                        help="Group size for INT8 grouped quantization. 128 divides both "
+                             "hidden_size=2048 and moe_intermediate_size=512 exactly on the "
+                             "real checkpoint (Q0). Only used when --moe-w8a8 is set.")
     args = parser.parse_args()
 
     if args.fake_config_loader:
@@ -437,6 +454,8 @@ def main():
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
         enforce_eager=args.enforce_eager,
+        use_moe_w8a8=args.use_moe_w8a8,
+        moe_w8a8_weight_group_size=args.moe_w8a8_weight_group_size,
     )
 
     print(f"Starting engine (concurrency_mode={args.concurrency_mode})...")

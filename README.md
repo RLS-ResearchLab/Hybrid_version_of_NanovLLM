@@ -129,18 +129,67 @@ touch the dominant path.**
 Two caveats on these figures. They are 2×A6000 (Ampere, PHB, no NVLink) and are functional
 validation, not H200-predictive. And CUDA graphs are measurable only to concurrency 4 here —
 above that, graph pools (1.12 → 4.08 GB as `max_num_seqs` goes 8 → 32) plus the decode-path
-expert gather (512 MiB at N=32, TK=8) exceed the ~12 GB left after weights. Concurrency 16
-works; 32 does not. Unblocked on H200's 141 GB.
+expert gather exceed the ~12 GB left after weights. Concurrency 16 works; 32 does not.
+Unblocked on H200's 141 GB.
+
+*Correction: the gather was previously cited here as "512 MiB at N=32, TK=8," undifferentiated
+between the two expert tensors. At the real dims (`hidden_size=2048`,
+`moe_intermediate_size=512`), `gate_up_proj[local_slots]` (shape `(N,TK,2·MI,H)`) is
+**1024 MiB**; 512 MiB is actually `down_proj[local_slots]`'s size (shape `(N,TK,H,MI)`, half
+as wide). Both are gathered every decode step, so the correct combined figure is **1536 MiB**,
+3× the original number.*
 
 **Vectorized MoE is unreachable at tp=2.** `Qwen35MoE.forward()` tests `ep_size > 1` before
 `use_vectorized_moe`, so `_forward_dispatch_vectorized` runs only at `ep_size=1` — a
 configuration this model cannot use. The 2.0–4.4× MoE speedup describes a code path that has
 never executed in production.
 
-**Tensor parallelism is capped at 2.** `num_key_value_heads = 2`; every other dimension
-divides by 4 cleanly. tp=4 fails during construction, before any weights load. On 4×H200 the
-options are tp=2 with two GPUs idle, tp=2 × DP=2 (not implemented, but most tractable),
-KV-head replication, or pipeline parallelism.
+**Tensor parallelism at tp=4 — resolved via GQA kv-head replication, CPU-validated, real-hardware confirmation pending.**
+`num_key_value_heads = 2` is smaller than `tp_size = 4`, so the old shard-only scheme (`num_kv_heads % tp_size == 0`)
+had no valid mapping and failed during construction before any weights loaded. The fix replicates each of the 2
+physical kv heads onto 2 ranks instead of splitting one (`layers/linear.py`'s `local_num_kv_heads`/
+`kv_head_replica_source`, shared by `Qwen35FullAttention` construction and `allocate_kv_cache`'s sizing so the
+two can't independently drift). Shard-selection math, weight-loader dispatch, and real multi-process
+(`mp.spawn`+gloo) construction are CPU-validated end to end. **Not yet run:** construction against real
+`.safetensors` weights, real NCCL collectives at tp=4, or output agreement against an HF reference — needs 4
+GPUs, unavailable in the current 2-GPU window. tp=2 regression-checked on real hardware in the meantime (A2,
+real checkpoint): 5/5 prefill (cosine 0.997320–0.998977) and 5/5 decode first-token match, sitting inside the
+pre-existing bf16 baseline range (0.997236–0.999786) — the GQA-replication code changes did not regress the
+already-shipping tp=2 path.
+
+**MoE weight-only INT8 quantization (W8A8) — correctness-validated, capacity issue found and resolved.**
+Grouped symmetric INT8 quantization of `Experts.gate_up_proj`/`down_proj` (group_size=128, exact division of
+both `hidden_size=2048` and `moe_intermediate_size=512`), applied in place after `load_model()` with the
+original bf16 Parameters explicitly deleted (`moe_int8_integration.py`). Validated in stages: quantize/dequantize
+reconstruction and downstream-matmul error on random weights at real dims; quantize-then-shard vs.
+shard-then-quantize proven bitwise identical under EP, which is what justifies quantizing after the existing
+EP-sharded load with zero changes to `load_model()`; and a 40-example GSM8K non-regression against the same
+subsample A4 used, matching baseline. Decode-path integration covers `_forward_gathered_ep` only (EP decode);
+prefill and the non-EP decode path are unmodified and remain bf16-only by design.
+
+At concurrency=16 with CUDA graphs enabled, construction OOMs at the default `gpu_memory_utilization` on this
+48GB A6000 — root-caused to `allocate_kv_cache()` sizing the KV cache before `capture_cudagraph()` claims its
+CUDA-graph private pool (2.95 GiB at concurrency=16; grows with the largest captured graph bucket), so nothing
+reserves margin for it. INT8 frees more weight memory than bf16, so it over-allocates the KV cache by
+comparison — this is why it regressed to a *lower* concurrency ceiling than bf16 despite having more headroom.
+Not a reference leak — ruled out directly (eager-mode construction and a full decode trial succeed cleanly at
+the same weights/concurrency, well under one GPU's capacity).
+
+**Mitigation:** lowering `gpu_memory_utilization` to reserve margin for the private pool fixes it — confirmed
+at `0.60` on this hardware (down from bf16's 0.82–0.90; the margin needed scales with `max_num_seqs`, so this
+number is A6000-specific tuning, not a portable constant). A5 sweep at that setting, tp=2, real checkpoint:
+
+| Concurrency | tok/s (INT8+graphs, gmu=0.60) |
+|---|---|
+| 16 | 20.5 |
+| 32 | 20.9 |
+
+Single trial each, functional validation not a polished benchmark (matches this project's own scoping
+convention). The qualitative result is what matters: **concurrency=32 now completes cleanly under INT8+graphs
+on hardware where bf16+graphs could not** (bf16's own ceiling was 32→OOM, above). tok/s is nearly flat
+16→32, unlike bf16's clearly-scaling curve — consistent with the dequantization compute cost eating into
+what CUDA graphs would otherwise buy from batching; not a red flag on its own. Expected to be a non-issue on
+H200's 141GB either way.
 
 ---
 
