@@ -164,8 +164,13 @@ original bf16 Parameters explicitly deleted (`moe_int8_integration.py`). Validat
 reconstruction and downstream-matmul error on random weights at real dims; quantize-then-shard vs.
 shard-then-quantize proven bitwise identical under EP, which is what justifies quantizing after the existing
 EP-sharded load with zero changes to `load_model()`; and a 40-example GSM8K non-regression against the same
-subsample A4 used, matching baseline. Decode-path integration covers `_forward_gathered_ep` only (EP decode);
-prefill and the non-EP decode path are unmodified and remain bf16-only by design.
+subsample A4 used, matching baseline. Decode-path integration covers `_forward_gathered_ep` and the prefill
+`_forward_dispatch_ep` only — both EP (`tensor_parallel_size>1`) paths. **`use_moe_w8a8=True` at
+`tensor_parallel_size=1` will `AttributeError` on the first MoE forward call** — quantization deletes the bf16
+`gate_up_proj`/`down_proj` Parameters unconditionally, but the non-EP paths (`_forward_gathered`,
+`_forward_dispatch`, `_forward_dispatch_vectorized`) were never given an int8 branch; this was a deliberate
+scoping decision (see `moe_int8_integration.py`'s own docstring), not an accident, but it means quantization is
+currently EP-only, not "bf16 fallback" as earlier phrasing here implied.
 
 At concurrency=16 with CUDA graphs enabled, construction OOMs at the default `gpu_memory_utilization` on this
 48GB A6000 — root-caused to `allocate_kv_cache()` sizing the KV cache before `capture_cudagraph()` claims its
@@ -250,7 +255,7 @@ src/
   server.py              OpenAI-compatible server, FCFS or batched mode
 
 tests/           correctness suites — see "Running the test suites" below
-eval/            GSM8K-CoT correctness gate + throughput harness
+                 (incl. gsm8k_full_run.py — GSM8K-CoT correctness gate)
 bench_throughput.py       concurrency-sweep throughput harness (internal engine)
 bench_http_concurrency.py concurrency-sweep throughput harness (HTTP server)
 ```
@@ -265,11 +270,15 @@ cd hybrid-nano-vllm
 pip install -r requirements.txt          # or: pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
 
-For the real Qwen3.5-35B-A3B checkpoint (~67GB, bf16):
+For the real Qwen3.5-35B-A3B checkpoint (~67GB, bf16) — no install script ships
+in this repo yet, so fetch it manually, e.g. via `huggingface_hub`:
 
 ```bash
-bash setup.sh                            # venv, deps, weights
+python -c "from huggingface_hub import snapshot_download; \
+    snapshot_download('Qwen/Qwen3.5-35B-A3B', local_dir='./qwen35_checkpoint')"
 ```
+
+Point `--model` (server) or `LLM(...)` (programmatic) at that local directory.
 
 ---
 
@@ -352,16 +361,18 @@ python bench_throughput.py --model tests/fake_qwen35_small \
     --prompt-len 32 --output-len 64 --max-model-len 512 --gpu-memory-utilization 0.2
 
 # HTTP-server throughput sweep, real checkpoint, real 1024-out target
+# (--tokenizer-dir is required -- used for the retok spot-check, see script header)
 python bench_http_concurrency.py \
-    --url http://localhost:8000/v1/chat/completions \
-    --concurrency 1 2 4 8 16 32 64 \
-    --input-tokens 1024 --output-tokens 1024 \
+    --base-url http://localhost:8000 \
+    --tokenizer-dir /path/to/Qwen3.5-35B-A3B \
+    --levels 1 2 4 8 16 32 64 \
+    --prompt-tokens 1024 --max-tokens 1024 \
     --ignore-eos \
-    --requests-per-level 64
+    --trials 2 --warmup-trials 1
 
-# GSM8K-CoT correctness gate (8-shot CoT, temperature=0, top_p=1.0, concurrency=8)
-python -m eval.correctness.run_correctness \
-    --n 1319 --stop-strings --max-tokens 706
+# GSM8K-CoT correctness gate (all 1319 examples, batches of 8, temperature=0,
+# checkpointed -- safe to re-run after a crash, resumes from RESULTS_PATH)
+python tests/gsm8k_full_run.py --stop-strings
 ```
 
 ---

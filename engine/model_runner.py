@@ -88,6 +88,14 @@ class ModelRunner:
         self.model = model_cls(hf_config)
         load_model(self.model, config.model)
         if getattr(config, "use_moe_w8a8", False):
+            # moe_int8_integration.py lives under tests/, not on any production
+            # sys.path -- the models/qwen3_5.py import above happens to already put
+            # tests/ on sys.path as a side effect (see that file's own comment), which
+            # is why this worked in every real invocation today, but that's an
+            # implicit dependency on import order, not a guarantee. Guard explicitly.
+            _tests_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests")
+            if _tests_dir not in sys.path:
+                sys.path.insert(0, _tests_dir)
             from moe_int8_integration import apply_moe_int8_quantization
             n_quantized = apply_moe_int8_quantization(
                 self.model, config.moe_w8a8_weight_group_size

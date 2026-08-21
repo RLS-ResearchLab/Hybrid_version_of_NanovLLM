@@ -10,10 +10,26 @@ Layer schedule:
 """
 
 import math
+import os
+import sys
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+
+# dequantize_weight_int8_grouped lives under tests/ (moe_int8_quantize.py), not on any
+# production sys.path -- every real invocation this session (src/server.py,
+# bench_throughput.py run directly, or `from nanovllm.models.qwen3_5 import ...` from
+# an arbitrary caller) only happened to work today because it was launched via a
+# tests/*.py wrapper script, which puts tests/ on sys.path[0] as a side effect of how
+# `python tests/foo.py` resolves the running script's own directory. Outside that
+# accident, this top-level, unconditional import raised `ModuleNotFoundError:
+# No module named 'moe_int8_quantize'` before any model could even be constructed --
+# reproduced directly against src/server.py's own sys.path setup. Guard explicitly
+# instead of depending on the caller's launch method.
+_TESTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests")
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
 from moe_int8_quantize import dequantize_weight_int8_grouped
 
 from nanovllm.layers.layernorm import Qwen35RMSNorm, Qwen35RMSNormGated
