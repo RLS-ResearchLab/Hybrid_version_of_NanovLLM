@@ -28,11 +28,10 @@ from moe_int8_quantize import (                                  # noqa: E402
 
 
 def reference_output(x, w_int8, w_scale, group_size, topk_ids, topk_weights, top_k):
-    """Exactly what models/qwen3_5.py's _forward_gathered_ep does today:
-    gather per-token expert weights, dequantize (our validated, fixed
-    fused-multiply version), matmul. Ungrouped by block -- a straightforward
-    per-token loop, deliberately simple/obviously-correct rather than fast,
-    since this IS the correctness reference everything else is judged against."""
+    """Deliberately naive per-token Python loop -- NOT the production path,
+    kept only as a slow-but-obviously-correct ground truth to validate the
+    vectorized reference below against, one level removed from trusting a
+    single implementation's self-consistency."""
     M = x.shape[0]
     K = x.shape[1]
     N = w_int8.shape[1]
@@ -42,6 +41,22 @@ def reference_output(x, w_int8, w_scale, group_size, topk_ids, topk_weights, top
             e = int(topk_ids[m, k].item())
             w = dequantize_weight_int8_grouped(w_int8[e], w_scale[e], group_size, x.dtype)
             out[m, k] = x[m] @ w.t()
+    return out
+
+
+def vectorized_reference_output(x, w_int8, w_scale, group_size, topk_ids, top_k):
+    """The ACTUAL production path -- models/qwen3_5.py's _forward_gathered_ep,
+    the hasattr(self.experts, "gate_up_proj_int8") branch, same shape as its
+    down_proj usage: one batched fancy-index gather across all (M, top_k)
+    selections at once, one batched dequant call (today's fixed, verified
+    version -- no fp32 intermediate, fused cast+multiply), one einsum. No
+    per-token Python loop. This is what actually measured 37.1 tok/s in
+    production earlier this session -- THIS is the number the kernel needs
+    to beat, not the naive loop above."""
+    gu_i8 = w_int8[topk_ids]   # (M, top_k, N, K) int8
+    gu_sc = w_scale[topk_ids]  # (M, top_k, N, K//group_size)
+    w = dequantize_weight_int8_grouped(gu_i8, gu_sc, group_size, x.dtype)  # (M, top_k, N, K)
+    out = torch.einsum('mkoh,mh->mko', w, x)
     return out
 
 
@@ -79,13 +94,34 @@ def main():
     topk_ids = torch.randint(0, E, (M, top_k), dtype=torch.int32, device=device)
     topk_weights = torch.rand((M, top_k), dtype=torch.float32, device=device)
 
-    # ---- Reference (existing, trusted path) ----
+    # ---- Reference (naive loop, ground truth only) ----
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     ref = reference_output(x, w_int8, w_scale, group_size, topk_ids, topk_weights, top_k)
     torch.cuda.synchronize()
     ref_s = time.perf_counter() - t0
-    print(f"Reference (existing dequant-then-matmul path): {ref_s*1000:.2f} ms")
+    print(f"Naive loop (ground truth, not production): {ref_s*1000:.2f} ms")
+
+    # ---- Vectorized reference (the ACTUAL production path) ----
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    vec_ref = vectorized_reference_output(x, w_int8, w_scale, group_size, topk_ids, top_k)
+    torch.cuda.synchronize()
+    vec_ref_s = time.perf_counter() - t0
+    print(f"Vectorized (PRODUCTION path, first call): {vec_ref_s*1000:.2f} ms")
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    vec_ref = vectorized_reference_output(x, w_int8, w_scale, group_size, topk_ids, top_k)
+    torch.cuda.synchronize()
+    vec_ref_warm_s = time.perf_counter() - t0
+    print(f"Vectorized (PRODUCTION path, warm): {vec_ref_warm_s*1000:.2f} ms")
+
+    cos_vec_vs_naive = torch.nn.functional.cosine_similarity(
+        ref.float().reshape(-1), vec_ref.float().reshape(-1), dim=0
+    ).item()
+    print(f"Sanity: naive vs. vectorized reference agree, cosine={cos_vec_vs_naive:.6f} "
+          f"(both should be ~identical -- this just confirms the vectorized reference "
+          f"itself isn't the thing introducing an error)")
 
     # ---- Kernel path ----
     block_size_m = 16
@@ -136,21 +172,30 @@ def main():
     kernel_warm_s = time.perf_counter() - t0
     print(f"Kernel (warm, second call): {kernel_warm_s*1000:.2f} ms")
 
-    # ---- Correctness ----
+    # ---- Correctness, against the naive ground truth ----
     kernel_out = C  # (M, top_k, N)
     cos = torch.nn.functional.cosine_similarity(
         ref.float().reshape(-1), kernel_out.float().reshape(-1), dim=0
     ).item()
     max_abs_err = (ref.float() - kernel_out.float()).abs().max().item()
-    print(f"\nCorrectness: cosine_similarity={cos:.6f}  max_abs_err={max_abs_err:.6f}")
+    print(f"\nCorrectness (kernel vs. naive ground truth): cosine_similarity={cos:.6f}  "
+          f"max_abs_err={max_abs_err:.6f}")
     print("PASS" if cos > 0.999 else "FAIL -- investigate before trusting this kernel")
 
-    print(f"\nSpeed (warm): reference={ref_s*1000:.2f}ms  kernel={kernel_warm_s*1000:.2f}ms  "
-          f"speedup={ref_s/kernel_warm_s:.2f}x")
-    print("NOTE: reference uses a naive per-token Python loop -- NOT the same as this "
-          "project's actual vectorized _forward_gathered_ep gather+dequant+einsum path. "
-          "This speed number is illustrative of the kernel's own raw performance, not a "
-          "direct A/B against the 37.1 tok/s figure already measured in production.")
+    # ---- The number that actually matters: kernel vs. PRODUCTION ----
+    print(f"\n{'='*70}")
+    print("REAL COMPARISON -- kernel vs. the actual production path")
+    print(f"{'='*70}")
+    print(f"  Vectorized/production (warm): {vec_ref_warm_s*1000:.3f} ms")
+    print(f"  Kernel (warm):                {kernel_warm_s*1000:.3f} ms")
+    print(f"  Speedup: {vec_ref_warm_s/kernel_warm_s:.2f}x")
+    print(f"{'='*70}")
+    print("This is a single-GEMM microbenchmark (matching down_proj's shape), not the "
+          "full two-GEMM+SiLU decode step or an end-to-end tok/s number -- real inside "
+          "the actual engine may differ (kernel-launch overhead, CUDA graph capture "
+          "behavior, the second GEMM, EP local_slots indexing not yet wired in). This is "
+          "the right first checkpoint before investing in full integration, not the final "
+          "production number.")
 
 
 def tl_compute_type(dtype):
