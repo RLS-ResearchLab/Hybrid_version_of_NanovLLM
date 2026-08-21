@@ -112,7 +112,7 @@ def main():
 
     def run_kernel():
         invoke_fused_moe_kernel(
-            A, B, C.view(M * top_k, N),
+            A, B, C,
             None, w_scale,
             topk_weights, topk_ids,
             sorted_ids, expert_ids, num_tokens_post_padded,
