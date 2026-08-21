@@ -157,116 +157,47 @@ real checkpoint): 5/5 prefill (cosine 0.997320–0.998977) and 5/5 decode first-
 pre-existing bf16 baseline range (0.997236–0.999786) — the GQA-replication code changes did not regress the
 already-shipping tp=2 path.
 
-**MoE weight-only INT8 quantization (W8A8) — correctness-validated, real capacity win, real throughput cost.**
-Grouped symmetric INT8 quantization of `Experts.gate_up_proj`/`down_proj` (group_size=128, exact division of
-both `hidden_size=2048` and `moe_intermediate_size=512`), applied in place after `load_model()` with the
-original bf16 Parameters explicitly deleted (`moe_int8_integration.py`). Validated in stages: quantize/dequantize
-reconstruction and downstream-matmul error on random weights at real dims; quantize-then-shard vs.
-shard-then-quantize proven bitwise identical under EP, which is what justifies quantizing after the existing
-EP-sharded load with zero changes to `load_model()`; and a 40-example GSM8K non-regression against the same
-subsample A4 used, matching baseline. Decode-path integration covers `_forward_gathered_ep` and the prefill
-`_forward_dispatch_ep` only — both EP (`tensor_parallel_size>1`) paths. **`use_moe_w8a8=True` at
-`tensor_parallel_size=1` will `AttributeError` on the first MoE forward call** — quantization deletes the bf16
-`gate_up_proj`/`down_proj` Parameters unconditionally, but the non-EP paths (`_forward_gathered`,
-`_forward_dispatch`, `_forward_dispatch_vectorized`) were never given an int8 branch; this was a deliberate
-scoping decision (see `moe_int8_integration.py`'s own docstring), not an accident, but it means quantization is
-currently EP-only, not "bf16 fallback" as earlier phrasing here implied.
+**MoE weight-only INT8 quantization (W8A8) + fused Triton kernel — correctness-verified, beats bf16 outright.**
+Grouped symmetric INT8 quantization of `Experts.gate_up_proj`/`down_proj` (group_size=128) plus a custom fused
+Triton GEMM (`layers/fused_moe_triton.py`, adapted from a dead copy of vLLM's production MoE kernel already in
+this repo) that reads weights directly instead of materializing a gathered-and-dequantized buffer — the thing
+that made naive INT8 slower than bf16 in every earlier version. EP-only (`tensor_parallel_size>1`);
+`tensor_parallel_size=1` will `AttributeError` on the first MoE forward call (deliberate scoping, not a bug —
+see `moe_int8_integration.py`). Flag-gated: `use_moe_w8a8=True` + `NANOVLLM_USE_FUSED_MOE_KERNEL=1`.
 
-At concurrency=16 with CUDA graphs enabled, construction OOMs at the default `gpu_memory_utilization` on this
-48GB A6000 — root-caused to `allocate_kv_cache()` sizing the KV cache before `capture_cudagraph()` claims its
-CUDA-graph private pool (2.95 GiB at concurrency=16; grows with the largest captured graph bucket), so nothing
-reserves margin for it. INT8 frees more weight memory than bf16, so it over-allocates the KV cache by
-comparison — this is why it regressed to a *lower* concurrency ceiling than bf16 despite having more headroom.
-Not a reference leak — ruled out directly (eager-mode construction and a full decode trial succeed cleanly at
-the same weights/concurrency, well under one GPU's capacity).
-
-**Mitigation:** lowering `gpu_memory_utilization` to reserve margin for the private pool fixes it — confirmed
-at `0.60` on this hardware (down from bf16's 0.82–0.90; the margin needed scales with `max_num_seqs`, so this
-number is A6000-specific tuning, not a portable constant). A5 sweep at that setting, tp=2, real checkpoint:
-
-| Concurrency | tok/s (INT8+graphs, gmu=0.60) |
+| | tok/s (tp=2, 2×A6000) |
 |---|---|
-| 16 | 20.5 |
-| 32 | 20.9 |
+| bf16 + CUDA graphs | 52.7 |
+| INT8 + graphs, dequant fixes only (no fused kernel) | 37.1 |
+| INT8 + graphs + fused kernel, concurrency=16 | 172.7 |
+| INT8 + graphs + fused kernel, concurrency=32 | **204.1** |
 
-Single trial each, functional validation not a polished benchmark (matches this project's own scoping
-convention). The capacity result stands: **concurrency=32 now completes cleanly under INT8+graphs on
-hardware where bf16+graphs could not** (bf16's own ceiling was 32→OOM, above).
+**204.1 tok/s — 3.87× bf16, clears the 200 tok/s goal on hardware not expected to get there.** bf16 itself
+cannot run at concurrency=32 at all (OOMs), so this isn't "faster at the same setting" — INT8 + the fused
+kernel unlocked the higher concurrency in the first place. Cross-validated via two independent harnesses
+(`cluster_a5_concurrency_sweep.py`, `diag_w8a8_eager_vs_graph.py`) and correctness-verified multiple
+independent ways: isolated kernel math (cosine=0.999988), GSM8K non-regression in both eager and CUDA-graph
+mode (40/40, zero discordant pairs, production chat-no-think format), and real generated text read by eye
+under graph capture.
 
-**Throughput is a real cost, found and partly fixed — matched-settings A/B, same script, same
-concurrency=16, same `gpu_memory_utilization=0.75`, tp=2, real checkpoint, identical except the
-quantization flag:**
+**Known ceilings on this hardware, confirmed with data rather than assumed:**
+- **Concurrency=64 does not fit.** Swept `gpu_memory_utilization` across the full plausible range (0.45-0.60)
+  with no working value found — the window between "enough for KV cache" and "enough for CUDA-graph-capture
+  buffers" doesn't exist at this batch size on 48GB. Concurrency=32 is the practical ceiling on 2×A6000.
+- **Autotuning the kernel config is not the next lever.** An nsys graph-mode kernel-time profile showed the
+  fused GEMM and `moe_align_block_size` are both ~0.1% of GPU time, flat regardless of trace length.
+- **State-manager recurrent-state write-back moved inside the CUDA graph** (`engine/model_runner.py`,
+  `engine/state_manager.py`), eliminating per-decode-step eager `index_copy_` calls for this hybrid model's
+  linear-attention state (32 layers × 2 calls/step). Small real gain (202.0→204.1); verified
+  correctness-neutral via the same 40/40 GSM8K check above, specifically exercising real EOS-driven batch
+  shrinkage (a reserved scratch slot prevents padding rows from aliasing a different sequence's state).
+- `gpu_memory_utilization=0.60` and similar tuning here are properties of this hardware's memory budget, not
+  the dequantization path — expect to re-derive rather than reuse on H200.
+- Prefill (`_forward_dispatch_ep`) still uses the original, non-fused path (lower priority, ~1 of 1025 forward
+  passes per generation).
 
-| | tok/s | wall_s |
-|---|---|---|
-| bf16 + graphs | **52.7** | 311.0s |
-| INT8 + graphs, original dequant (fp32 intermediate) | 21.3 | 768.9s |
-| INT8 + graphs, fix 1 (bf16-direct, two-pass) | 32.3 | 507.9s |
-| INT8 + graphs, **fix 2 (fused cast+multiply)** | **37.1** | 441.1s |
-
-Root cause: `dequantize_weight_int8_grouped` originally did int8-read → fp32-upcast → in-place-multiply →
-bf16-downcast, moving roughly ~9-10× more memory traffic than bf16's direct 2× read on a bandwidth-bound
-decode path — bf16 was 2.47× faster. **Two fixes applied and verified, each re-checked against the same
-CPU-only correctness suite (Q5) before trusting it on GPU** — both leave reconstruction error and
-downstream-matmul cosine unchanged (0.999978, identical throughout) — no measurable precision cost from
-either: (1) dequantize directly into `out_dtype` instead of fp32, cutting traffic from ~19× to ~7× relative
-to bf16's 2×; (2) fuse the int8→bf16 cast into the scale-multiply itself (`int8_weight * scale_bcast`
-instead of `.to(out_dtype)` then `.mul_()`), letting PyTorch's elementwise kernel promote in-register instead
-of materializing an intermediate tensor, cutting traffic further toward ~3×. Verified-safe result: the gap
-shrank from 2.47× to 1.42× — 74% of INT8's lost throughput recovered (21.3 → 37.1 tok/s).
-
-**Then a fused dequant-GEMM Triton kernel was built and verified** — the thing this section used to call
-"bigger scope, not built." `layers/fused_moe_triton.py`, adapted from a dead copy of vLLM's real production
-MoE kernel already sitting unused in this repo, modified to support this project's grouped (not whole-row)
-INT8 scale scheme. Reads directly from the original activation tensor and the full local expert-weight
-tensor — no `(N, TK, ...)` gathered-and-dequantized buffer ever materialized, which is the thing that cost
-bandwidth in every version above. First real-engine test (eager mode) measured *slower* than the plain
-fixes (~22-29 tok/s) — profiling showed the alignment bookkeeping step (`moe_align_block_size`, ~10 small
-PyTorch ops) eating ~57% of the time in per-op Python dispatch overhead, not the kernel itself (~39%,
-genuinely fast). Under **CUDA graph capture**, which eliminates exactly that per-op dispatch cost:
-
-| | tok/s |
-|---|---|
-| bf16 + graphs | 52.7 |
-| INT8 + graphs, fix 1+2 (no fused kernel) | 37.1 |
-| INT8 + graphs, **fused Triton kernel**, concurrency=16 | **172.7** |
-| INT8 + graphs, **fused Triton kernel**, concurrency=32 | **202.0** |
-
-**172.7 tok/s at concurrency=16 — 3.3× the bf16 baseline, 4.65× the prior best INT8 number.** Verified
-correct via three independent checks before trusting it: isolated kernel math vs. the trusted reference
-(cosine=0.999988), real-checkpoint GSM8K non-regression in eager mode (8/8 both arms, zero flips), and real
-generated text read by eye under the exact graph-capture configuration that produced this number (coherent,
-arithmetically correct output on multiple prompts). `use_moe_w8a8` with the fused kernel is no longer just a
-capacity-for-speed trade — on this hardware, it beats bf16 outright.
-
-**Update, same day: pushed to concurrency=32 — 202.0 tok/s, 3.83× bf16, clears the user's stated 200 tok/s
-goal on 2×A6000 test hardware, which was explicitly not expected to get there regardless of software
-optimization** (bf16's own bandwidth-bound ceiling here is 52.7 tok/s; bf16 additionally cannot even run at
-concurrency=32 at all — OOMs — so this comparison only exists because INT8+the fused kernel unlocked the
-higher concurrency in the first place). Measured via TWO independent harnesses and found to agree:
-`cluster_a5_concurrency_sweep.py` (202.0 tok/s, mean of 2 trials, `gpu_memory_utilization=0.60`) and the
-primary matched-settings script used for every other row in this table, `diag_w8a8_eager_vs_graph.py`
-(≈202 tok/s, same settings) — cross-validated, not a single-harness artifact. Concurrency scaling from 16→32
-was sub-linear (1.17×, not 2×), consistent with MoE expert-coverage: as more concurrent tokens hit the model
-per layer, more distinct experts get touched, so the weight-read savings from batching shrink at higher
-concurrency. **Concurrency=64 does not fit on this hardware — confirmed a real capacity ceiling, not a tuning
-problem.** `max_num_seqs=64` sizes `StateManager` (this hybrid model's linear-attention recurrent state) about
-2GB larger than at 32, which combined with model weights already uses ~20GB/rank before any KV cache is
-allocated. Swept `gpu_memory_utilization` across the plausible range and found no working value: 0.60 and 0.52
-both OOM during CUDA graph capture (too little headroom left for capture's buffers at this batch size), 0.45
-fails the `num_kvcache_blocks > 0` assertion before capture even starts (too little headroom left for KV cache
-at all). The window this needs sits between "enough for KV cache" and "enough for graph capture," and on this
-48GB card at this batch size, that window doesn't exist. Concurrency=32 (202.0 tok/s) is the practical ceiling
-for this kernel path on 2×A6000.
-
-Not yet autotuned (one fixed, conservative kernel config throughout — `BLOCK_SIZE_M=16, N=64, K=64, warps=4,
-stages=2`); real upside likely still on the table, pending a graph-mode kernel-time profile (in progress) to
-confirm the GEMM is actually the dominant cost under graph capture before spending time tuning it. Flag-gated
-behind `NANOVLLM_USE_FUSED_MOE_KERNEL=1` (not yet a `Config` field — still new enough to keep an explicit
-opt-in), prefill (`_forward_dispatch_ep`) not yet migrated to it (lower priority, ~1 of 1025 forward passes).
-`gpu_memory_utilization=0.60` (needed for the concurrency=32 result above) is A6000-specific tuning, expected
-unnecessary on H200's 141GB — the throughput numbers above are a property of the dequantization path itself,
-not this hardware, and should be expected to carry over to H200.
+Full narrative — root causes, every intermediate fix, and why each number is trusted — is in
+`moe_quantization_memo.md`.
 
 ---
 

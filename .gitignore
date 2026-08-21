@@ -7,8 +7,10 @@ tests/_gsm8k_cache/
 tests/fake_qwen35_small/
 tests/fake_qwen35_small_fused/
 tests/profiling_output/
-qwen35_checkpoint/*.safetensors" 
-qwen35_checkpoint/*.safetensors
+qwen35_checkpoint/
 *.tex
+*.csv
 Gpu window checklist.md
 moe_quantization_memo.md
+SESSION_HANDOFF*.md
+H200_test_day_checklist.md
