@@ -157,7 +157,7 @@ real checkpoint): 5/5 prefill (cosine 0.997320–0.998977) and 5/5 decode first-
 pre-existing bf16 baseline range (0.997236–0.999786) — the GQA-replication code changes did not regress the
 already-shipping tp=2 path.
 
-**MoE weight-only INT8 quantization (W8A8) — correctness-validated, capacity issue found and resolved.**
+**MoE weight-only INT8 quantization (W8A8) — correctness-validated, real capacity win, real throughput cost.**
 Grouped symmetric INT8 quantization of `Experts.gate_up_proj`/`down_proj` (group_size=128, exact division of
 both `hidden_size=2048` and `moe_intermediate_size=512`), applied in place after `load_model()` with the
 original bf16 Parameters explicitly deleted (`moe_int8_integration.py`). Validated in stages: quantize/dequantize
@@ -190,11 +190,26 @@ number is A6000-specific tuning, not a portable constant). A5 sweep at that sett
 | 32 | 20.9 |
 
 Single trial each, functional validation not a polished benchmark (matches this project's own scoping
-convention). The qualitative result is what matters: **concurrency=32 now completes cleanly under INT8+graphs
-on hardware where bf16+graphs could not** (bf16's own ceiling was 32→OOM, above). tok/s is nearly flat
-16→32, unlike bf16's clearly-scaling curve — consistent with the dequantization compute cost eating into
-what CUDA graphs would otherwise buy from batching; not a red flag on its own. Expected to be a non-issue on
-H200's 141GB either way.
+convention). The capacity result stands: **concurrency=32 now completes cleanly under INT8+graphs on
+hardware where bf16+graphs could not** (bf16's own ceiling was 32→OOM, above).
+
+**But throughput is a real cost, not a rounding error — matched-settings A/B, same script, same
+concurrency=16, same `gpu_memory_utilization=0.75`, tp=2, real checkpoint, identical except the
+quantization flag:**
+
+| | tok/s | wall_s |
+|---|---|---|
+| bf16 + graphs | **52.7** | 311.0s |
+| INT8 + graphs | **21.3** | 768.9s |
+
+**bf16 is ~2.5× faster than INT8 at matched settings.** Root cause: `dequantize_weight_int8_grouped`'s
+int8-read → fp32-upcast → in-place-multiply → bf16-downcast moves roughly ~9-10× more memory traffic than
+bf16's direct 2× read, and decode is bandwidth-bound. This is a **capacity-for-speed trade, not a free
+win** — enable `use_moe_w8a8` when concurrency is memory-constrained and would otherwise be capped, not as
+a default. Fixable (dequantize straight into `out_dtype` without the fp32 stage, or a fused dequant-GEMM
+kernel), but not built. `gpu_memory_utilization=0.60` is A6000-specific tuning, expected unnecessary on
+H200's 141GB — but the throughput cost is a property of the dequantization path itself, not this hardware,
+and should be expected to carry over to H200 too until the fp32 round-trip is removed.
 
 ---
 

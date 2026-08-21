@@ -107,18 +107,34 @@ def dequantize_weight_int8_grouped(
     """Inverse of quantize_weight_int8_grouped. Returns a tensor of shape
     and dtype matching the original input to quantize_weight_int8_grouped.
 
-    Computes in fp32 (same precision as quantize_weight_int8_grouped and as
-    every correctness number already measured against this function --
-    Q5's reconstruction/matmul checks and Q6's real GSM8K non-regression
-    both ran through this exact code path). The multiply is done IN PLACE
-    (w.mul_) rather than as w * scale_bcast, which would allocate a SECOND
-    full-size fp32 tensor for the product -- for the (N, TK, ...) gathered
-    decode buffer this roughly doubles the fp32 transient memory for no
-    numerical benefit (in-place and out-of-place multiply produce identical
-    floating-point results here). This was found by an actual OOM during
-    the A5 concurrency-sweep rerun at high concurrency: the gathered
-    buffer's fp32 intermediate was large enough to matter, not a
-    theoretical concern."""
+    Computes directly in out_dtype (bf16 in production), NOT fp32 -- changed
+    2026-08-21 after a matched-settings A/B on real hardware measured the
+    fp32 intermediate costing ~2.5x decode throughput (52.7 -> 21.3 tok/s,
+    concurrency=16, gpu_memory_utilization=0.75, tp=2, real checkpoint,
+    identical otherwise), root-caused to this function: int8-read (1x) ->
+    fp32-upcast (4x) -> fp32 in-place multiply (4x+4x) -> fp32-read for the
+    final downcast (4x) -> bf16-write (2x) is ~19x the traffic of bf16
+    directly reading gate_up_proj/down_proj (2x), on a bandwidth-bound
+    decode path. Going straight to out_dtype cuts this to int8-read (1x) ->
+    out_dtype-upcast (2x) -> in-place multiply (2x+2x) = ~7x -- not as good
+    as bf16's native 2x, but a ~2.7x reduction in the dequant step's own
+    traffic, expected to close most of the measured gap.
+
+    Precision trade-off, stated plainly: this rounds the per-group scale to
+    out_dtype BEFORE the multiply, instead of multiplying in fp32 and
+    rounding only the final product (multiply-then-round beats
+    round-then-multiply for accuracy, in general). The int8 values
+    themselves are unaffected -- integers in [-127, 127] cast exactly to
+    bf16, which represents integers exactly up to 256. Re-validated against
+    the same reconstruction/matmul-error checks this function was already
+    measured against (Q5) before trusting this on GPU -- see
+    tests/test_moe_int8_quantize.py's printed before/after numbers, not
+    assumed safe from the traffic argument alone.
+
+    The multiply is still done IN PLACE (w.mul_) rather than as
+    w * scale_bcast, which would allocate a second full-size out_dtype
+    tensor for the product -- same OOM-driven reasoning as before, just
+    at out_dtype width now instead of fp32 width."""
     *lead, out_features, in_features = int8_weight.shape
     num_groups = in_features // group_size
     assert scale.shape == (*lead, out_features, num_groups), (
@@ -127,10 +143,10 @@ def dequantize_weight_int8_grouped(
         f"{tuple(int8_weight.shape)} at group_size={group_size}."
     )
 
-    w = int8_weight.reshape(*lead, out_features, num_groups, group_size).to(torch.float32)
-    scale_bcast = scale.unsqueeze(-1).to(torch.float32)
-    w.mul_(scale_bcast)  # in-place: no second fp32 tensor for the product
-    dequant = w.reshape(*lead, out_features, in_features).to(out_dtype)
+    w = int8_weight.reshape(*lead, out_features, num_groups, group_size).to(out_dtype)
+    scale_bcast = scale.unsqueeze(-1).to(out_dtype)
+    w.mul_(scale_bcast)  # in-place: no second out_dtype tensor for the product
+    dequant = w.reshape(*lead, out_features, in_features)
     return dequant
 
 
