@@ -37,10 +37,18 @@ def main():
     ap.add_argument("--tp", type=int, default=2)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.75)
     ap.add_argument("--enforce-eager", action="store_true", default=False)
+    ap.add_argument("--concurrency", type=int, default=16,
+                    help="How many prompts to submit at once, and max_num_seqs to build "
+                         "with. Matters beyond just batch size: a different concurrency "
+                         "means a DIFFERENT captured CUDA graph bucket (graph_bs in "
+                         "capture_cudagraph()) -- correctness at one concurrency does not "
+                         "guarantee correctness at another, so this needs pointing at "
+                         "whichever bucket you actually want to verify, not left at the "
+                         "default.")
     args = ap.parse_args()
 
     print(f"NANOVLLM_USE_FUSED_MOE_KERNEL={os.environ.get('NANOVLLM_USE_FUSED_MOE_KERNEL', '0')}  "
-          f"enforce_eager={args.enforce_eager}  tp={args.tp}", flush=True)
+          f"enforce_eager={args.enforce_eager}  tp={args.tp}  concurrency={args.concurrency}", flush=True)
 
     # Not `from nanovllm import LLM, SamplingParams` -- the repo-root
     # __init__.py exposes those via a module-level __getattr__ (PEP 562),

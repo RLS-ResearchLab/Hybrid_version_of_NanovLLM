@@ -123,7 +123,6 @@ def main():
                           "OOM seen at concurrency 32/64 with this kernel earlier this session; "
                           "the script's own default elsewhere (0.82-0.90) is NOT safe here.")
     ap.add_argument("--moe-w8a8-group-size", type=int, default=128)
-    ap.add_argument("--no-fake-config-loader", dest="fake_config_loader", action="store_false", default=True)
     ap.add_argument("--top-n", type=int, default=20)
     ap.add_argument("--trace-out", default=None,
                      help="Optional: also write a chrome://tracing-compatible JSON trace here "
@@ -138,13 +137,23 @@ def main():
     args.gpu_memory_utilization = cli.gpu_memory_utilization
     args.tensor_parallel_size = cli.tp
     args.enforce_eager = False  # graph mode -- the whole point of this script
-    args.fake_config_loader = cli.fake_config_loader
+    args.fake_config_loader = False  # real checkpoint only -- this script has no fake-model path,
+    # unlike cluster_a5_concurrency_sweep.py's dry-run mode; matches diag_w8a8_eager_vs_graph.py's
+    # own hardcoded False rather than cluster_a5's default-True-needs-a-flag polarity, precisely so
+    # this can't be run against a real checkpoint with the fake loader active by omission.
     args.use_fused_gdr_kernel = False
     args.use_moe_w8a8 = True
     args.moe_w8a8_weight_group_size = cli.moe_w8a8_group_size
 
-    print(f"NANOVLLM_USE_FUSED_MOE_KERNEL={os.environ.get('NANOVLLM_USE_FUSED_MOE_KERNEL', '0')}  "
-          f"(must be 1 for this profile to be measuring the fused kernel at all)")
+    if os.environ.get("NANOVLLM_USE_FUSED_MOE_KERNEL") != "1":
+        sys.exit(
+            "NANOVLLM_USE_FUSED_MOE_KERNEL is not set to '1' -- refusing to run. This whole "
+            "script exists to profile the FUSED kernel path under graph capture; running it "
+            "without this env var would silently profile the old gather+dequant+einsum path "
+            "instead and produce a bucket breakdown that looks plausible but answers the wrong "
+            "question. Re-run as:\n"
+            "  NANOVLLM_USE_FUSED_MOE_KERNEL=1 python tests/diag_fused_kernel_graph_profile.py ..."
+        )
     print(f"Building engine: tp={args.tensor_parallel_size}  concurrency={cli.concurrency}  "
           f"gpu_memory_utilization={args.gpu_memory_utilization}  graph_mode=True ...")
     engine = bt.build_engine(args)
