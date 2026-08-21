@@ -109,16 +109,36 @@ def dequantize_weight_int8_grouped(
 
     Computes directly in out_dtype (bf16 in production), NOT fp32 -- changed
     2026-08-21 after a matched-settings A/B on real hardware measured the
-    fp32 intermediate costing ~2.5x decode throughput (52.7 -> 21.3 tok/s,
+    fp32 intermediate costing ~2.47x decode throughput (52.7 -> 21.3 tok/s,
     concurrency=16, gpu_memory_utilization=0.75, tp=2, real checkpoint,
     identical otherwise), root-caused to this function: int8-read (1x) ->
     fp32-upcast (4x) -> fp32 in-place multiply (4x+4x) -> fp32-read for the
     final downcast (4x) -> bf16-write (2x) is ~19x the traffic of bf16
     directly reading gate_up_proj/down_proj (2x), on a bandwidth-bound
-    decode path. Going straight to out_dtype cuts this to int8-read (1x) ->
-    out_dtype-upcast (2x) -> in-place multiply (2x+2x) = ~7x -- not as good
-    as bf16's native 2x, but a ~2.7x reduction in the dequant step's own
-    traffic, expected to close most of the measured gap.
+    decode path.
+
+    Second pass, same day: the int8-cast and the scale-multiply are now ONE
+    fused elementwise op (`int8_weight * scale_bcast`) instead of two
+    separate passes (a prior version here did `.to(out_dtype)` THEN
+    `w.mul_(scale_bcast)` in place -- ~7x traffic, a real improvement over
+    the fp32 version's ~19x but still two full read+write passes). PyTorch's
+    binary elementwise kernels promote mixed dtypes (int8 * bf16 -> bf16)
+    INSIDE the kernel -- read int8, cast in-register, multiply, write bf16,
+    all in one pass -- as long as int8_weight is never explicitly `.to()`'d
+    first; pre-casting forces materialization of a separate intermediate
+    tensor and throws that fusion away. Expected ~3x traffic (int8 read 1x +
+    out_dtype write 2x) vs. the ~7x two-pass version -- ANOTHER ~2.3x
+    reduction on top of the first fix, not yet confirmed on real hardware
+    (this is a plausible-from-first-principles claim, not a profiled one --
+    verify with the same matched A/B before trusting the number).
+
+    This does NOT increase peak memory vs. the two-pass version: both
+    allocate exactly one out_dtype-sized result tensor (`w * scale_bcast`
+    allocates one new tensor; the prior two-pass version's `.to(out_dtype)`
+    also allocated one, then mutated it in place). The earlier docstring
+    here reasoned that avoiding a second allocation required the in-place
+    form -- that reasoning was wrong; there is no second allocation either
+    way, only a difference in kernel-launch count.
 
     Precision trade-off, stated plainly: this rounds the per-group scale to
     out_dtype BEFORE the multiply, instead of multiplying in fp32 and
@@ -129,12 +149,7 @@ def dequantize_weight_int8_grouped(
     the same reconstruction/matmul-error checks this function was already
     measured against (Q5) before trusting this on GPU -- see
     tests/test_moe_int8_quantize.py's printed before/after numbers, not
-    assumed safe from the traffic argument alone.
-
-    The multiply is still done IN PLACE (w.mul_) rather than as
-    w * scale_bcast, which would allocate a second full-size out_dtype
-    tensor for the product -- same OOM-driven reasoning as before, just
-    at out_dtype width now instead of fp32 width."""
+    assumed safe from the traffic argument alone."""
     *lead, out_features, in_features = int8_weight.shape
     num_groups = in_features // group_size
     assert scale.shape == (*lead, out_features, num_groups), (
@@ -143,10 +158,9 @@ def dequantize_weight_int8_grouped(
         f"{tuple(int8_weight.shape)} at group_size={group_size}."
     )
 
-    w = int8_weight.reshape(*lead, out_features, num_groups, group_size).to(out_dtype)
+    w = int8_weight.reshape(*lead, out_features, num_groups, group_size)
     scale_bcast = scale.unsqueeze(-1).to(out_dtype)
-    w.mul_(scale_bcast)  # in-place: no second out_dtype tensor for the product
-    dequant = w.reshape(*lead, out_features, in_features)
+    dequant = (w * scale_bcast).reshape(*lead, out_features, in_features)
     return dequant
 
 
