@@ -183,6 +183,17 @@ def main():
              "tests/test_qwen35_fused_gdr.py for the correctness validation "
              "this should only be trusted after passing.",
     )
+    p.add_argument(
+        "--moe-w8a8", dest="use_moe_w8a8", action="store_true", default=False,
+        help="Quantize MoE expert weights to INT8 after loading (Q4/Q6 -- correctness- "
+             "and accuracy-validated, 40/40 GSM8K non-regression under chat-no-think; "
+             "see moe_quantization_memo.md). Off by default. Previously only reachable "
+             "via the tests/*.py wrapper scripts that build their own args object --"
+             "build_engine() already reads use_moe_w8a8 via getattr, this just exposes "
+             "it here too so running this file directly can use it.",
+    )
+    p.add_argument("--moe-w8a8-group-size", type=int, default=128, dest="moe_w8a8_weight_group_size",
+                    help="Group size for INT8 grouped quantization. Only used when --moe-w8a8 is set.")
     p.add_argument("--trials", type=int, default=5, help="Timed trials per concurrency level.")
     p.add_argument(
         "--warmup-trials", type=int, default=2,

@@ -101,11 +101,33 @@ def quantize_weight_int8_grouped(
     return int8_w, scale
 
 
+@torch.compile
 def dequantize_weight_int8_grouped(
     int8_weight: torch.Tensor, scale: torch.Tensor, group_size: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
     """Inverse of quantize_weight_int8_grouped. Returns a tensor of shape
     and dtype matching the original input to quantize_weight_int8_grouped.
+
+    @torch.compile added 2026-08-21, third pass at the same throughput problem, same
+    pattern this project already uses for layers/layernorm.py's rms_forward -- letting
+    TorchInductor fuse the reshape/multiply/reshape sequence into fewer kernel launches
+    than the hand-fused version above achieves manually, and proven compatible with the
+    manual outer `torch.cuda.graph()` capture this project uses for decode (rms_forward
+    is itself compiled and already runs correctly inside that capture in production).
+    NOT free, though -- real, understood risk: torch._dynamo has a default
+    cache_size_limit of 8 distinct compiled shapes before silently falling back to eager
+    for further shapes (see bench_throughput.py's own module docstring for the earlier
+    incident this caused). This function's tensor shapes vary with N (batch size) and
+    local_slots count, which vary per captured CUDA-graph bucket (graph_bs = [1,2,4,8,16,
+    ...] in engine/model_runner.py's capture_cudagraph()) -- combined with rms_forward's
+    own per-shape compiles, this can plausibly exceed the limit before every bucket gets
+    compiled, meaning SOME concurrency levels silently get no speedup from this decorator
+    while others do. Not a correctness risk (eager fallback is still correct), but a real
+    performance-consistency one -- watch for "torch._dynamo hit config.cache_size_limit"
+    warnings in the log and consider raising torch._dynamo.config.cache_size_limit if they
+    appear for shapes that matter. Verify with the same matched A/B before trusting any
+    number this produces -- not assumed safe from the "other functions already do this"
+    argument alone.
 
     Computes directly in out_dtype (bf16 in production), NOT fp32 -- changed
     2026-08-21 after a matched-settings A/B on real hardware measured the
