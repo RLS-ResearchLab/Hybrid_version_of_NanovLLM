@@ -193,23 +193,29 @@ Single trial each, functional validation not a polished benchmark (matches this 
 convention). The capacity result stands: **concurrency=32 now completes cleanly under INT8+graphs on
 hardware where bf16+graphs could not** (bf16's own ceiling was 32→OOM, above).
 
-**But throughput is a real cost, not a rounding error — matched-settings A/B, same script, same
+**Throughput is a real cost, found and partly fixed — matched-settings A/B, same script, same
 concurrency=16, same `gpu_memory_utilization=0.75`, tp=2, real checkpoint, identical except the
 quantization flag:**
 
 | | tok/s | wall_s |
 |---|---|---|
 | bf16 + graphs | **52.7** | 311.0s |
-| INT8 + graphs | **21.3** | 768.9s |
+| INT8 + graphs, original dequant (fp32 intermediate) | 21.3 | 768.9s |
+| INT8 + graphs, **fixed dequant (bf16-direct)** | **32.3** | 507.9s |
 
-**bf16 is ~2.5× faster than INT8 at matched settings.** Root cause: `dequantize_weight_int8_grouped`'s
-int8-read → fp32-upcast → in-place-multiply → bf16-downcast moves roughly ~9-10× more memory traffic than
-bf16's direct 2× read, and decode is bandwidth-bound. This is a **capacity-for-speed trade, not a free
-win** — enable `use_moe_w8a8` when concurrency is memory-constrained and would otherwise be capped, not as
-a default. Fixable (dequantize straight into `out_dtype` without the fp32 stage, or a fused dequant-GEMM
-kernel), but not built. `gpu_memory_utilization=0.60` is A6000-specific tuning, expected unnecessary on
-H200's 141GB — but the throughput cost is a property of the dequantization path itself, not this hardware,
-and should be expected to carry over to H200 too until the fp32 round-trip is removed.
+Root cause: `dequantize_weight_int8_grouped` originally did int8-read → fp32-upcast → in-place-multiply →
+bf16-downcast, moving roughly ~9-10× more memory traffic than bf16's direct 2× read on a bandwidth-bound
+decode path — bf16 was 2.47× faster. **Fix applied and verified**: dequantize directly into `out_dtype`
+(bf16), skipping the fp32 stage — cuts the dequant step's own traffic from ~19× to ~7× relative to bf16's
+2×. Re-validated against the same CPU-only correctness checks (Q5) first: reconstruction error and
+downstream-matmul cosine are unchanged (0.999978, identical to before) — no measurable precision cost.
+**Result: the gap shrank from 2.47× to 1.63× (bf16 still faster, but the fix recovered ~52% of INT8's lost
+throughput).** The remaining gap is the dequant path still moving more data than a direct bf16 read even
+optimized — fully closing it needs a fused dequant-GEMM kernel, bigger scope, not built. `use_moe_w8a8` is
+still a capacity-for-speed trade, not a free win, but a substantially better one than first measured.
+`gpu_memory_utilization=0.60` (needed for the concurrency=32 capacity result above) is A6000-specific
+tuning, expected unnecessary on H200's 141GB — the throughput numbers above are a property of the
+dequantization path itself, not this hardware, and should be expected to carry over to H200.
 
 ---
 
