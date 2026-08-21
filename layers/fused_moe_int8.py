@@ -15,11 +15,45 @@ models/qwen3_5.py (not a hard replacement) specifically because those things
 are unverified -- see the flag's own docstring there for exactly what's
 still open before this should be trusted as the default.
 """
+import os
+import time
+
 import torch
 import torch.nn.functional as F
 
 from nanovllm.layers.moe_align_block_size import moe_align_block_size
 from nanovllm.layers.fused_moe_triton import invoke_fused_moe_kernel
+
+# Diagnostic-only timing, added 2026-08-21 after the first real-engine test
+# (eager, concurrency=16) measured 29.3 tok/s -- SLOWER than the 37.1 tok/s
+# baseline this was supposed to beat, contradicting the isolated
+# microbenchmark's 4.71x. Accumulates wall time per stage across calls and
+# prints a running breakdown every _PRINT_EVERY calls, so we can see WHICH
+# stage (alignment vs. kernel launch vs. silu) actually dominates at real
+# scale (40 layers x up to 1024 decode steps) instead of guessing from an
+# isolated warm-loop benchmark that never paid this call volume's launch
+# overhead. Env-var gated, off by default -- adds real sync overhead of its
+# own, not meant to stay on once the bottleneck is identified.
+_PROFILE = os.environ.get("NANOVLLM_PROFILE_FUSED_MOE", "0") == "1"
+_PRINT_EVERY = 200
+_timing_acc = {"align1": 0.0, "kernel1": 0.0, "silu": 0.0, "align2": 0.0, "kernel2": 0.0, "calls": 0}
+
+
+def _tick():
+    torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _maybe_print_timing():
+    if _timing_acc["calls"] > 0 and _timing_acc["calls"] % _PRINT_EVERY == 0:
+        c = _timing_acc["calls"]
+        total = sum(v for k, v in _timing_acc.items() if k != "calls")
+        print(f"[FUSED MOE PROFILE] after {c} calls, avg per call (ms), "
+              f"total_avg={total/c*1000:.3f}ms:")
+        for stage in ("align1", "kernel1", "silu", "align2", "kernel2"):
+            v = _timing_acc[stage]
+            print(f"    {stage:8s}: {v/c*1000:7.3f} ms/call  "
+                  f"({v/total*100:5.1f}% of this function's own time)")
 
 # Single, fixed, conservative config -- validated in the smoke tests, not yet
 # autotuned per shape/concurrency. layers/fused_moe_triton_raw.py's own
@@ -98,10 +132,17 @@ def fused_moe_int8_forward(
         f"fused_moe_triton.py's docstring on why."
     )
 
+    if _PROFILE:
+        t0 = _tick()
+
     # ---- GEMM 1: gate_up_proj ----
     sorted_ids1, expert_ids1, ntpp1 = moe_align_block_size(
         local_slots, config["BLOCK_SIZE_M"], local_num_experts
     )
+    if _PROFILE:
+        t1 = _tick()
+        _timing_acc["align1"] += t1 - t0
+        t0 = t1
     gate_up_out = torch.empty((N, top_k, two_mi), dtype=dtype, device=device)
     # MUL_ROUTED_WEIGHT=False -- the real per-(token,k) softmax weight is
     # applied later in _forward_gathered_ep's own combine step, in fp32,
@@ -116,8 +157,16 @@ def fused_moe_int8_forward(
         use_fp8_w8a8=False, use_int8_w8a16=True,
         quant_group_size=group_size,
     )
+    if _PROFILE:
+        t1 = _tick()
+        _timing_acc["kernel1"] += t1 - t0
+        t0 = t1
     gw, uw = gate_up_out.chunk(2, dim=2)   # each (N, TK, MI)
     h = F.silu(gw) * uw                     # (N, TK, MI)
+    if _PROFILE:
+        t1 = _tick()
+        _timing_acc["silu"] += t1 - t0
+        t0 = t1
 
     # ---- GEMM 2: down_proj -- each (token, k) pair is its own "virtual
     # token" with top_k=1, since h's rows are already expert-specific (see
@@ -127,6 +176,10 @@ def fused_moe_int8_forward(
     sorted_ids2, expert_ids2, ntpp2 = moe_align_block_size(
         local_slots_flat, config["BLOCK_SIZE_M"], local_num_experts
     )
+    if _PROFILE:
+        t1 = _tick()
+        _timing_acc["align2"] += t1 - t0
+        t0 = t1
     down_out = torch.empty((N * top_k, 1, H), dtype=dtype, device=device)
     dummy_w2 = torch.ones((N * top_k, 1), dtype=torch.float32, device=device)
     invoke_fused_moe_kernel(
@@ -138,4 +191,9 @@ def fused_moe_int8_forward(
         use_fp8_w8a8=False, use_int8_w8a16=True,
         quant_group_size=group_size,
     )
+    if _PROFILE:
+        t1 = _tick()
+        _timing_acc["kernel2"] += t1 - t0
+        _timing_acc["calls"] += 1
+        _maybe_print_timing()
     return down_out.reshape(N, top_k, H)
