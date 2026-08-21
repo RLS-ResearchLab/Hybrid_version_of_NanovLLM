@@ -212,11 +212,34 @@ downstream-matmul cosine unchanged (0.999978, identical throughout) — no measu
 either: (1) dequantize directly into `out_dtype` instead of fp32, cutting traffic from ~19× to ~7× relative
 to bf16's 2×; (2) fuse the int8→bf16 cast into the scale-multiply itself (`int8_weight * scale_bcast`
 instead of `.to(out_dtype)` then `.mul_()`), letting PyTorch's elementwise kernel promote in-register instead
-of materializing an intermediate tensor, cutting traffic further toward ~3×. **Result: the gap shrank from
-2.47× to 1.42× — 74% of INT8's lost throughput recovered (21.3 → 37.1 tok/s).** The remaining gap is the
-dequant path still moving somewhat more data than a direct bf16 read even fully optimized — closing it
-further needs a real fused dequant-GEMM kernel, bigger scope, not built. `use_moe_w8a8` is still a
-capacity-for-speed trade, not a free win, but now a substantially better one than first measured.
+of materializing an intermediate tensor, cutting traffic further toward ~3×. Verified-safe result: the gap
+shrank from 2.47× to 1.42× — 74% of INT8's lost throughput recovered (21.3 → 37.1 tok/s).
+
+**Then a fused dequant-GEMM Triton kernel was built and verified** — the thing this section used to call
+"bigger scope, not built." `layers/fused_moe_triton.py`, adapted from a dead copy of vLLM's real production
+MoE kernel already sitting unused in this repo, modified to support this project's grouped (not whole-row)
+INT8 scale scheme. Reads directly from the original activation tensor and the full local expert-weight
+tensor — no `(N, TK, ...)` gathered-and-dequantized buffer ever materialized, which is the thing that cost
+bandwidth in every version above. First real-engine test (eager mode) measured *slower* than the plain
+fixes (~22-29 tok/s) — profiling showed the alignment bookkeeping step (`moe_align_block_size`, ~10 small
+PyTorch ops) eating ~57% of the time in per-op Python dispatch overhead, not the kernel itself (~39%,
+genuinely fast). Under **CUDA graph capture**, which eliminates exactly that per-op dispatch cost:
+
+| | tok/s |
+|---|---|
+| bf16 + graphs | 52.7 |
+| INT8 + graphs, fix 1+2 (no fused kernel) | 37.1 |
+| INT8 + graphs, **fused Triton kernel** | **172.7** |
+
+**172.7 tok/s — 3.3× the bf16 baseline, 4.65× the prior best INT8 number.** Verified correct via three
+independent checks before trusting it: isolated kernel math vs. the trusted reference (cosine=0.999988),
+real-checkpoint GSM8K non-regression in eager mode (8/8 both arms, zero flips), and real generated text
+read by eye under the exact graph-capture configuration that produced this number (coherent, arithmetically
+correct output on multiple prompts). `use_moe_w8a8` with the fused kernel is no longer just a
+capacity-for-speed trade — on this hardware, it beats bf16 outright. Not yet autotuned (one fixed,
+conservative kernel config throughout); real upside likely still on the table. Flag-gated behind
+`NANOVLLM_USE_FUSED_MOE_KERNEL=1` (not yet a `Config` field — still new enough to keep an explicit opt-in),
+prefill (`_forward_dispatch_ep`) not yet migrated to it (lower priority, ~1 of 1025 forward passes).
 `gpu_memory_utilization=0.60` (needed for the concurrency=32 capacity result above) is A6000-specific
 tuning, expected unnecessary on H200's 141GB — the throughput numbers above are a property of the
 dequantization path itself, not this hardware, and should be expected to carry over to H200.

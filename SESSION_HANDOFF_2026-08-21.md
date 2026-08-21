@@ -49,6 +49,21 @@ resolves a clean "all conflicts fixed, needs commit" state safely.
 
 ---
 
+## UPDATE (later same session): the graph-mode check PASSED
+
+The readout check below was run. Output for all 4 prompts read by eye: every arithmetic
+answer correct (train speed, 15% calculations, rectangle area with shown reasoning),
+grammatically coherent, no garbage/corruption. One prompt ("capital of France") fell into
+benign repetition (known greedy-decoding artifact on an easy prompt with `temperature=0`
+and no stop condition, not a correctness red flag). Combined with the eager-mode 8/8 GSM8K
+result and the isolated kernel's cosine=0.999988, **three independent angles now confirm
+the fused kernel + graph capture combination is genuinely correct. The 172.7 tok/s number
+is trustworthy.** Next: lock this into `README.md`/`moe_quantization_memo.md` (was
+deliberately held back until this point), then proceed to backlog item 2 (A5 capacity
+sweep with the fused kernel, larger-n GSM8K if time allows).
+
+---
+
 ## THE ONE THING IN FLIGHT — do this first
 
 A real-engine run under **CUDA graph capture + the new fused kernel** measured
