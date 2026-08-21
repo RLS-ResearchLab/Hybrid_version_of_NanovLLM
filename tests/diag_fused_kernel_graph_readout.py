@@ -12,15 +12,28 @@ Usage:
 import argparse
 import os
 import sys
+import types
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.dirname(ROOT))
+# tests/ itself on sys.path (bench_throughput.py-style modules some of our
+# imports transitively need), plus the repo-root "nanovllm" package shim
+# every real entry point in this project sets up (repo root isn't an
+# installed package -- this fakes it into sys.modules the same way
+# bench_throughput.py/engine/model_runner.py do).
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(TESTS_DIR)
+sys.path.insert(0, TESTS_DIR)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+if "nanovllm" not in sys.modules:
+    nanovllm_pkg = types.ModuleType("nanovllm")
+    nanovllm_pkg.__path__ = [ROOT]
+    nanovllm_pkg.__file__ = os.path.join(ROOT, "__init__.py")
+    sys.modules["nanovllm"] = nanovllm_pkg
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default=os.path.join(os.path.dirname(ROOT), "qwen35_checkpoint"))
+    ap.add_argument("--checkpoint", default=os.path.join(ROOT, "qwen35_checkpoint"))
     ap.add_argument("--tp", type=int, default=2)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.75)
     ap.add_argument("--enforce-eager", action="store_true", default=False)
@@ -29,7 +42,16 @@ def main():
     print(f"NANOVLLM_USE_FUSED_MOE_KERNEL={os.environ.get('NANOVLLM_USE_FUSED_MOE_KERNEL', '0')}  "
           f"enforce_eager={args.enforce_eager}  tp={args.tp}", flush=True)
 
-    from nanovllm import LLM, SamplingParams
+    # Not `from nanovllm import LLM, SamplingParams` -- the repo-root
+    # __init__.py exposes those via a module-level __getattr__ (PEP 562),
+    # which only works if that file's own code actually ran. The manual
+    # sys.modules["nanovllm"] shim above (same pattern bench_throughput.py
+    # uses) creates a bare empty module object and never executes
+    # __init__.py, so that __getattr__ is never attached -- submodule
+    # imports sidestep the whole issue and match how every other script in
+    # this project actually does it.
+    from nanovllm.llm import LLM
+    from nanovllm.sampling_params import SamplingParams
 
     llm = LLM(
         args.checkpoint,
