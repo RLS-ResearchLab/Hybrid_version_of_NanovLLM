@@ -66,28 +66,53 @@ def main():
         tensor_parallel_size=args.tp,
         enforce_eager=args.enforce_eager,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        max_num_seqs=16,
+        max_num_seqs=args.concurrency,
         max_model_len=2048,
         use_moe_w8a8=True,
         moe_w8a8_weight_group_size=128,
     )
 
-    prompts = [
+    base_prompts = [
         "Q: If a train travels 60 miles in 1.5 hours, what is its average speed in miles per hour? A:",
         "Q: What is 15% of 200? A:",
         "Q: A rectangle has length 8 and width 5. What is its area? A:",
         "The capital of France is",
+        "Q: If a car travels 90 miles in 1.5 hours, what is its average speed in miles per hour? A:",
+        "Q: What is 25% of 400? A:",
+        "Q: A rectangle has length 12 and width 4. What is its area? A:",
+        "The capital of Japan is",
     ]
+    # Cycle through the base set to fill the requested concurrency -- actually
+    # submits `concurrency` simultaneous requests, exercising the real batch
+    # size / graph bucket, not just a handful regardless of --concurrency.
+    prompts = [base_prompts[i % len(base_prompts)] for i in range(args.concurrency)]
     sp = SamplingParams(temperature=0, max_tokens=64)
 
-    print("\nGenerating (temperature=0, deterministic) ...\n", flush=True)
+    print(f"\nGenerating {len(prompts)} prompts at once (temperature=0, deterministic) ...\n", flush=True)
     outputs = llm.generate(prompts, sp, use_tqdm=False)
 
+    # Group by prompt text: print each DISTINCT prompt's answer once (avoids
+    # flooding output at concurrency=32+), and separately check that EVERY
+    # repeat of the same prompt at a different batch slot produced the
+    # IDENTICAL answer -- this project has real prior history of
+    # decode-time slot-reuse/cross-request contamination bugs (see
+    # README.md), so this isn't a hypothetical check at higher concurrency.
+    by_prompt = {}
     for p, o in zip(prompts, outputs):
+        by_prompt.setdefault(p, []).append(o["text"])
+
+    for p, texts in by_prompt.items():
         print("=" * 78)
         print(f"PROMPT: {p}")
-        print(f"OUTPUT: {o['text']!r}")
+        print(f"OUTPUT: {texts[0]!r}")
+        if len(texts) > 1:
+            all_same = all(t == texts[0] for t in texts)
+            status = "OK, all identical" if all_same else "MISMATCH -- possible cross-request contamination"
+            print(f"  ({len(texts)} copies at different batch slots: {status})")
     print("=" * 78)
+    print(f"\n{len(prompts)} total requests at concurrency={args.concurrency}, "
+          f"{len(by_prompt)} distinct prompts. Read the OUTPUTs for coherence, and check "
+          f"none of the repeat-consistency lines above say MISMATCH.")
     print("\nRead these by eye: do they look like real, coherent answers, or "
           "garbage/repeated tokens/gibberish? That's the actual question here, "
           "not the tok/s number.")
