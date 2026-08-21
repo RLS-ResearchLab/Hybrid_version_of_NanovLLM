@@ -32,6 +32,17 @@ if _TESTS_DIR not in sys.path:
     sys.path.insert(0, _TESTS_DIR)
 from moe_int8_quantize import dequantize_weight_int8_grouped
 
+# Fused-Triton-kernel MoE path -- an alternative to the gather+dequantize+
+# einsum sequence below, validated in isolation first (cosine=0.999988,
+# 4.71x on the full gate_up+silu+down_proj pattern,
+# layers/smoke_test_full_moe_pipeline.py, 2026-08-21) but NOT yet validated
+# for CUDA graph capture, real EP combine, or real-checkpoint GSM8K
+# correctness -- see _USE_FUSED_MOE_KERNEL's own comment below for exactly
+# what's still open. Flag-gated via an env var rather than a proper Config
+# field while still experimental; promote to Config once trusted.
+from nanovllm.layers.fused_moe_int8 import fused_moe_int8_forward
+_USE_FUSED_MOE_KERNEL = os.environ.get("NANOVLLM_USE_FUSED_MOE_KERNEL", "0") == "1"
+
 from nanovllm.layers.layernorm import Qwen35RMSNorm, Qwen35RMSNormGated
 from nanovllm.layers.linear import (
     ColumnParallelLinear,
@@ -924,24 +935,48 @@ class Qwen35MoE(nn.Module):
         local_slots = idx // P                                    # (N, TK) -- always in-bounds, see docstring
         owned_mask = (idx % P) == self.ep_rank                    # (N, TK) bool
 
-        if hasattr(self.experts, "gate_up_proj_int8"):
-            gu_i8 = self.experts.gate_up_proj_int8[local_slots]           # (N, TK, 2*MI, H) int8
-            gu_sc = self.experts.gate_up_proj_scale[local_slots]          # (N, TK, 2*MI, H//G)
-            dp_i8 = self.experts.down_proj_int8[local_slots]              # (N, TK, H, MI) int8
-            dp_sc = self.experts.down_proj_scale[local_slots]             # (N, TK, H, MI//G)
-            G = self.experts.moe_w8a8_group_size
-            gate_up = dequantize_weight_int8_grouped(gu_i8, gu_sc, G, x.dtype)
-            down = dequantize_weight_int8_grouped(dp_i8, dp_sc, G, x.dtype)
+        if _USE_FUSED_MOE_KERNEL and hasattr(self.experts, "gate_up_proj_int8"):
+            # Fused-Triton-kernel path -- NANOVLLM_USE_FUSED_MOE_KERNEL=1.
+            # Replaces gather+dequantize+einsum entirely (no (N,TK,...)
+            # gathered-and-dequantized weight buffer ever materialized --
+            # that buffer IS the thing today's default path pays for, and
+            # this avoids it structurally, not just by shrinking it).
+            # STILL OPEN as of 2026-08-21, do not treat this branch as
+            # equally trusted to the one below yet: (1) CUDA graph capture
+            # compatibility unverified -- moe_align_block_size's
+            # torch.argsort/cumsum/searchsorted are all static-shape given
+            # fixed (N, TK)/local_num_experts, expected graph-safe, but
+            # "expected" is not "confirmed under torch.cuda.graph()"; (2) no
+            # real-checkpoint GSM8K check run through this path yet; (3) no
+            # real engine tok/s number, only isolated microbenchmarks
+            # (layers/smoke_test_full_moe_pipeline.py: cosine=0.999988,
+            # 4.71x vs. the branch below, single-GPU, synthetic weights).
+            out_e = fused_moe_int8_forward(
+                x,
+                self.experts.gate_up_proj_int8, self.experts.gate_up_proj_scale,
+                self.experts.down_proj_int8, self.experts.down_proj_scale,
+                self.experts.moe_w8a8_group_size,
+                local_slots, TK, self.experts.gate_up_proj_int8.shape[0],
+            )
         else:
-            gate_up = self.experts.gate_up_proj[local_slots]          # (N, TK, 2*MI, H)
-            down = self.experts.down_proj[local_slots]                # (N, TK, H, MI)
+            if hasattr(self.experts, "gate_up_proj_int8"):
+                gu_i8 = self.experts.gate_up_proj_int8[local_slots]           # (N, TK, 2*MI, H) int8
+                gu_sc = self.experts.gate_up_proj_scale[local_slots]          # (N, TK, 2*MI, H//G)
+                dp_i8 = self.experts.down_proj_int8[local_slots]              # (N, TK, H, MI) int8
+                dp_sc = self.experts.down_proj_scale[local_slots]             # (N, TK, H, MI//G)
+                G = self.experts.moe_w8a8_group_size
+                gate_up = dequantize_weight_int8_grouped(gu_i8, gu_sc, G, x.dtype)
+                down = dequantize_weight_int8_grouped(dp_i8, dp_sc, G, x.dtype)
+            else:
+                gate_up = self.experts.gate_up_proj[local_slots]          # (N, TK, 2*MI, H)
+                down = self.experts.down_proj[local_slots]                # (N, TK, H, MI)
 
-        gw, uw = gate_up.chunk(2, dim=2)                        # each (N, TK, MI, H)
+            gw, uw = gate_up.chunk(2, dim=2)                        # each (N, TK, MI, H)
 
-        h_gate = torch.einsum('nkmh,nh->nkm', gw, x)               # (N, TK, MI)
-        h_up = torch.einsum('nkmh,nh->nkm', uw, x)                 # (N, TK, MI)
-        h = F.silu(h_gate) * h_up                                  # (N, TK, MI)
-        out_e = torch.einsum('nkhm,nkm->nkh', down, h)             # (N, TK, H)
+            h_gate = torch.einsum('nkmh,nh->nkm', gw, x)               # (N, TK, MI)
+            h_up = torch.einsum('nkmh,nh->nkm', uw, x)                 # (N, TK, MI)
+            h = F.silu(h_gate) * h_up                                  # (N, TK, MI)
+            out_e = torch.einsum('nkhm,nkm->nkh', down, h)             # (N, TK, H)
 
         # Weighted-multiply/local-accumulate/all_reduce combine always
         # happens in fp32 -- see docstring.
