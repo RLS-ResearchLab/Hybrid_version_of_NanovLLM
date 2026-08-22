@@ -2,241 +2,104 @@
 <img width="300" src="assets/logo.png">
 </p>
 
-# Hybrid Nano-vLLM — Qwen3.5-35B-A3B Serving Engine
+# qLLM — Qwen3.5-35B-A3B Serving Engine
 
 *A research project under the [RLS Research Lab](https://github.com/RLS-ResearchLab) umbrella, mentored by Ghassen Fatnassi.*
 
-A from-scratch extension of [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm)
-that serves **Qwen3.5-35B-A3B**, a *hybrid* architecture mixing linear-attention
-(Gated Delta Rule), full attention, and Mixture-of-Experts — validated end-to-end
-against a numerical reference implementation on the real 34.66B-parameter checkpoint.
+A from-scratch extension of [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm) that serves
+**Qwen3.5-35B-A3B**, a *hybrid* architecture mixing linear attention (Gated Delta Rule), full
+attention, and Mixture-of-Experts — validated end-to-end against a numerical reference on the real
+34.66B-parameter checkpoint.
 
 ---
 
-## Why this project exists
+## What this is
 
-Standard LLM-serving engines — vLLM, SGLang, nano-vLLM — are built around one
-core assumption: every layer needs the same kind of per-sequence memory, a
-**paged KV cache** that grows linearly with context length. That assumption
-holds for a dense transformer. It does not hold for Qwen3.5-35B-A3B.
+Standard serving engines (vLLM, SGLang, nano-vLLM) assume every layer needs the same kind of
+per-sequence memory: a paged KV cache that grows with context length. That holds for a dense
+transformer. It doesn't hold for Qwen3.5-35B-A3B, whose 40 layers alternate two different attention
+mechanisms in a fixed 4-layer block:
 
-Qwen3.5-35B-A3B's 40 decoder layers alternate two fundamentally different
-attention mechanisms, repeated in a fixed 4-layer block 10 times:
+- **3× Gated Delta Rule linear attention** — a recurrent scan carrying a **fixed-size** per-sequence
+  state (doesn't grow with context, unrelated to a KV cache).
+- **1× grouped-query full attention** — needs the conventional growing, paged KV cache.
 
-- **3× Gated Delta Rule (GDR) linear attention** — a recurrent, per-token
-  delta-rule scan (causal depthwise conv1d, L2-normalized Q/K, a learned
-  per-head decay gate, float32 state accumulation). This layer type carries a
-  **fixed-size recurrent state + convolution buffer per sequence** — memory
-  that does *not* grow with context length, and is architecturally unrelated
-  to a KV cache.
-- **1× grouped-query full attention** — standard GQA, with partial RoPE
-  (only 25% of each head's dimension is rotated) and a gated output. This
-  layer type still needs the conventional paged, growing **KV cache**.
+Every layer also routes through a **256-expert MoE FFN** (top-8 + 1 shared), adding its own batching
+and memory-layout concerns. A scheduler/block-manager/CUDA-graph pipeline built for "one growing cache
+per sequence" can't serve this without real architectural surgery — this project does that surgery on
+nano-vLLM specifically because its small, auditable codebase makes it realistic to extend *correctly*
+within a research-internship timeframe.
 
-Every layer additionally routes through a **256-expert MoE FFN** (top-8
-routed + 1 shared expert), adding its own batching and memory-layout
-concerns on top of the dual-cache problem above.
+**What was built:** `StateManager` (`engine/state_manager.py`) — a fixed-size recurrent-state/conv-buffer
+slot pool for the linear-attention layers, wired into the scheduler at the same points the KV-cache
+block manager fires; the hybrid model itself (`models/qwen3_5.py`) with TP-aware sharding for every
+GDR tensor; a batched HTTP server (`src/server.py`) with a single background thread driving the
+scheduler.
 
-The result: a scheduler, block manager, and CUDA-graph pipeline built for
-"one growing cache per sequence" cannot serve this model without real
-architectural surgery — not a config flag, not a wrapper. This project does
-that surgery on nano-vLLM specifically because its ~1,200-line, auditable
-codebase makes it realistic to *correctly* extend within a research
-internship timeframe, rather than writing a production-scale engine from
-zero, or serving the model indefinitely from an unbatched reference server.
-
-**The bet this project tests:** that a minimal, dense-transformer-oriented
-reference engine can be extended — without a wholesale rewrite of its
-scheduler/batching core — to correctly serve a hybrid linear-attention +
-full-attention + MoE architecture under continuous batching, preemption, and
-CUDA-graph decode, and that doing so productively de-risks the design of a
-bespoke, higher-performance engine built for this architecture class before
-committing to that harder, from-scratch system.
-
-This is a **correctness-and-architecture-validation** project, not a
-performance project. Kernel fusion, expert-parallel MoE dispatch, and
-per-layer-type CUDA graphs are explicitly deferred future work — see
-[Known limitations](#known-limitations--open-work) below.
+This is a **correctness-and-architecture-validation** project — see [What's still open](#whats-still-open)
+for what's explicitly deferred.
 
 ---
 
-## What was built
+## Results
 
-| Component | File | Purpose |
-|---|---|---|
-| `StateManager` | `engine/state_manager.py` | Fixed-size recurrent-state + conv-buffer slot pool for GDR layers, sized to `max_num_seqs` (not context length). Allocate/free wired into the scheduler at exactly the points the KV-cache block manager already fires. |
-| Hybrid model | `models/qwen3_5.py` | `Qwen35FullAttention`, `Qwen35LinearAttention`, `Qwen35MoE`, full decoder stack — config-driven throughout, so it generalizes to the real checkpoint's config without code changes. |
-| Packed-batch GDR scan | `models/qwen3_5.py` | Projects once over the full flat packed-token dimension; loops only over per-sequence segments for the two boundary-sensitive operations (causal conv1d, recurrent scan). |
-| TP-aware sharding | `models/qwen3_5.py`, `layers/linear.py` | Every per-head GDR tensor (`in_proj_qkv`, `in_proj_a/b`, `A_log`, `dt_bias`) shards in lockstep across tensor-parallel ranks; the scan body itself is TP-agnostic by construction. |
-| Batched HTTP server | `src/server.py` | `BatchedEngine` — single background thread drives `Scheduler`/`LLMEngine`, HTTP handlers only enqueue and block on a per-request event. Gated behind `--concurrency-mode {fcfs,batched}`. |
+**Correctness**, cosine similarity against `src/model.py` (the validated PyTorch reference, itself
+checked against HuggingFace: cosine > 0.98, top-1 5/6) unless noted:
 
----
-
-## Measured results
-
-All correctness numbers below are cosine similarity against `src/model.py`
-(the numerically-validated PyTorch reference, itself checked against
-HuggingFace: cosine > 0.98, top-1 match 5/6) or against an isolated,
-un-batched run of the same sequence, as noted.
-
-| Check | Result | Scope |
-|---|---|---|
-| Full hybrid model vs. reference, single sequence | cosine 0.999970, top-1 exact | small model |
-| GDR linear attention vs. reference | cosine 1.000001 | small model |
-| MoE FFN vs. reference | cosine 1.000000 | small model |
-| Eager vs. CUDA-graph decode, batch sizes 1/4/8 | cosine 1.000000, top-1 exact | small model |
-| KV-cache memory shrinkage from full-attention-only sizing | 4.00× | measured, matches `full_attention_interval=4` exactly |
-| Real-checkpoint single-forward-pass vs. HF, 5 varied prompts | cosine 0.9982–0.9997, 5/5 argmax match | **real 35B checkpoint** |
-| Real-checkpoint prefill contamination, concurrency=8 | 8/8 PASS, cosine 0.9976–0.9997 | **real 35B checkpoint** |
-| Real-checkpoint decode-time slot-reuse contamination | **not detected** — 3 independent lines of evidence (static code-path analysis, fake-model teacher-forced control, real-checkpoint no-reuse control) | **real 35B checkpoint** |
-| MoE top-k=8 combine step, bf16, before/after fp32 promotion | 1.3% relative error → 0.000% | measured |
-| **Real-checkpoint throughput, tp=2, 1024-in/1024-out** | baseline 9.3 / 14.7 / 21.2 / 27.2 / 31.5 / 33.8 tok/s at concurrency 1/2/4/8/16/32 | **real 35B checkpoint**, 2×A6000 |
-| **Same, with CUDA graphs enabled** | **35.3 / 41.7 / 47.4 / 51.6 / 54.0** tok/s at concurrency 1/2/4/8/16 — **1.7–3.8× speedup**; plateau rises 33.8 → 54.0 | **real 35B checkpoint**, 2×A6000 |
-| Fused GDR kernel, end-to-end | **+1.5%** (prefill-only intervention on a decode-dominated workload) | **real 35B checkpoint** |
-| **GSM8K-CoT, full 1319 examples, through the engine** | **1257/1319 = 95.30%** — **PASS** vs. the 87.5% gate | **real 35B checkpoint**, tp=2, CUDA graphs |
-| GSM8K three-arm prompt ablation (n=32) | raw 81.2% / chat-think 62.5% / **chat-no-think 100%** — isolates thinking-suppression from chat-framing | **real 35B checkpoint** |
-| GSM8K-CoT, `raw` prompt format, full 1319 | **58.45%** (771/1319) — FAIL. 46.5% fallback rate; 94.0% accuracy where a marker *was* found | **real 35B checkpoint**, matched baseline |
-| GSM8K subset (n=32), marker-found vs. fallback accuracy | 95.7% when a clean final answer is stated, 11.1% when it falls back to "last number in text" | real 35B checkpoint |
-
-**Correctness re-verification — complete.** An earlier validation pass found that
-`Experts.gate_up_proj`/`down_proj` were constructed via raw `nn.Parameter(torch.empty(...))`
-and never initialized, so two of the rows above certified agreement on a configuration where
-the routed-expert path contributed nothing. Both have been re-measured with `Experts` properly
-initialized: the full-model cosine moved 0.999967 → 0.999970 and the MoE FFN comparison
-1.000001 → 1.000000 (now also independent of test execution order). **The numbers barely moved,
-which is itself the finding** — the port and reference agreed on the real per-expert path all
-along; the original results were never wrong, only certifying less than they appeared to. The
-shared fixture `tests/fake_qwen35_small/model.safetensors` has been regenerated and all
-MoE-routing dependents re-confirmed.
-
-**Throughput — the Stage 2 result.** The two optimizations produce opposite outcomes, and
-the same fact explains both. The workload is 1024-in/1024-out: one prefill pass against
-1024 sequential decode steps.
-
-| Intervention | End-to-end | Path touched |
-|---|---|---|
-| Fused GDR kernel | **+1.5%** | Prefill only — 1 of 1025 forward passes |
-| **CUDA graphs** | **1.7–3.8×** | Decode — 1024 of 1025 forward passes |
-
-The fused kernel measured 36–63× on the isolated GDR layer and 21.5× end-to-end on a
-prefill-heavy small-model benchmark. On the real workload it gives 1.5%. CUDA graphs, which
-collapse per-step kernel launch overhead in decode, give 1.7–3.8× on the same workload —
-and raise the saturated plateau from ~33.8 to ~54.0 tok/s, which is the figure that matters
-for a loaded server rather than the 3.79× single-stream number.
-**Component and small-model speedups do not transfer to end-to-end throughput unless they
-touch the dominant path.**
-
-Two caveats on these figures. They are 2×A6000 (Ampere, PHB, no NVLink) and are functional
-validation, not H200-predictive. And CUDA graphs are measurable only to concurrency 4 here —
-above that, graph pools (1.12 → 4.08 GB as `max_num_seqs` goes 8 → 32) plus the decode-path
-expert gather exceed the ~12 GB left after weights. Concurrency 16 works; 32 does not.
-Unblocked on H200's 141 GB.
-
-*Correction: the gather was previously cited here as "512 MiB at N=32, TK=8," undifferentiated
-between the two expert tensors. At the real dims (`hidden_size=2048`,
-`moe_intermediate_size=512`), `gate_up_proj[local_slots]` (shape `(N,TK,2·MI,H)`) is
-**1024 MiB**; 512 MiB is actually `down_proj[local_slots]`'s size (shape `(N,TK,H,MI)`, half
-as wide). Both are gathered every decode step, so the correct combined figure is **1536 MiB**,
-3× the original number.*
-
-**Vectorized MoE is unreachable at tp=2.** `Qwen35MoE.forward()` tests `ep_size > 1` before
-`use_vectorized_moe`, so `_forward_dispatch_vectorized` runs only at `ep_size=1` — a
-configuration this model cannot use. The 2.0–4.4× MoE speedup describes a code path that has
-never executed in production.
-
-**Tensor parallelism at tp=4 — resolved via GQA kv-head replication, CPU-validated, real-hardware confirmation pending.**
-`num_key_value_heads = 2` is smaller than `tp_size = 4`, so the old shard-only scheme (`num_kv_heads % tp_size == 0`)
-had no valid mapping and failed during construction before any weights loaded. The fix replicates each of the 2
-physical kv heads onto 2 ranks instead of splitting one (`layers/linear.py`'s `local_num_kv_heads`/
-`kv_head_replica_source`, shared by `Qwen35FullAttention` construction and `allocate_kv_cache`'s sizing so the
-two can't independently drift). Shard-selection math, weight-loader dispatch, and real multi-process
-(`mp.spawn`+gloo) construction are CPU-validated end to end. **Not yet run:** construction against real
-`.safetensors` weights, real NCCL collectives at tp=4, or output agreement against an HF reference — needs 4
-GPUs, unavailable in the current 2-GPU window. tp=2 regression-checked on real hardware in the meantime (A2,
-real checkpoint): 5/5 prefill (cosine 0.997320–0.998977) and 5/5 decode first-token match, sitting inside the
-pre-existing bf16 baseline range (0.997236–0.999786) — the GQA-replication code changes did not regress the
-already-shipping tp=2 path.
-
-**MoE weight-only INT8 quantization (W8A8) + fused Triton kernel — correctness-verified, beats bf16 outright.**
-Grouped symmetric INT8 quantization of `Experts.gate_up_proj`/`down_proj` (group_size=128) plus a custom fused
-Triton GEMM (`layers/fused_moe_triton.py`, adapted from a dead copy of vLLM's production MoE kernel already in
-this repo) that reads weights directly instead of materializing a gathered-and-dequantized buffer — the thing
-that made naive INT8 slower than bf16 in every earlier version. EP-only (`tensor_parallel_size>1`);
-`tensor_parallel_size=1` will `AttributeError` on the first MoE forward call (deliberate scoping, not a bug —
-see `moe_int8_integration.py`). Flag-gated: `use_moe_w8a8=True` + `NANOVLLM_USE_FUSED_MOE_KERNEL=1`.
-
-| | tok/s (tp=2, 2×A6000) |
+| Check | Result |
 |---|---|
-| bf16 + CUDA graphs | 52.7 |
-| INT8 + graphs, dequant fixes only (no fused kernel) | 37.1 |
-| INT8 + graphs + fused kernel, concurrency=16 | 172.7 |
-| INT8 + graphs + fused kernel, concurrency=32 | **204.1** |
+| Hybrid model vs. reference (small model) | cosine 0.999970, top-1 exact |
+| Eager vs. CUDA-graph decode parity | cosine 1.000000, top-1 exact |
+| Real-checkpoint vs. HF reference, 5 prompts | cosine 0.9982–0.9997, 5/5 argmax match |
+| Real-checkpoint decode-time slot-reuse/contamination | **not detected** — 3 independent checks |
+| **GSM8K-CoT, full 1319 examples** (chat-no-think, real checkpoint) | **95.30%** (1257/1319) — PASS vs. 87.5% gate |
+| MoE INT8 + fused kernel non-regression, CUDA-graph mode | **40/40, zero discordant pairs** |
 
-**204.1 tok/s — 3.87× bf16, clears the 200 tok/s goal on hardware not expected to get there.** bf16 itself
-cannot run at concurrency=32 at all (OOMs), so this isn't "faster at the same setting" — INT8 + the fused
-kernel unlocked the higher concurrency in the first place. Cross-validated via two independent harnesses
-(`cluster_a5_concurrency_sweep.py`, `diag_w8a8_eager_vs_graph.py`) and correctness-verified multiple
-independent ways: isolated kernel math (cosine=0.999988), GSM8K non-regression in both eager and CUDA-graph
-mode (40/40, zero discordant pairs, production chat-no-think format), and real generated text read by eye
-under graph capture.
+**Throughput**, real 35B checkpoint, tp=2, 2×A6000 (Ampere, no NVLink — functional validation, not
+H200-predictive):
 
-**Known ceilings on this hardware, confirmed with data rather than assumed:**
-- **Concurrency=64 does not fit.** Swept `gpu_memory_utilization` across the full plausible range (0.45-0.60)
-  with no working value found — the window between "enough for KV cache" and "enough for CUDA-graph-capture
-  buffers" doesn't exist at this batch size on 48GB. Concurrency=32 is the practical ceiling on 2×A6000.
-- **Autotuning the kernel config is not the next lever.** An nsys graph-mode kernel-time profile showed the
-  fused GEMM and `moe_align_block_size` are both ~0.1% of GPU time, flat regardless of trace length.
-- **State-manager recurrent-state write-back moved inside the CUDA graph** (`engine/model_runner.py`,
-  `engine/state_manager.py`), eliminating per-decode-step eager `index_copy_` calls for this hybrid model's
-  linear-attention state (32 layers × 2 calls/step). Small real gain (202.0→204.1); verified
-  correctness-neutral via the same 40/40 GSM8K check above, specifically exercising real EOS-driven batch
-  shrinkage (a reserved scratch slot prevents padding rows from aliasing a different sequence's state).
-- `gpu_memory_utilization=0.60` and similar tuning here are properties of this hardware's memory budget, not
-  the dequantization path — expect to re-derive rather than reuse on H200.
-- Prefill (`_forward_dispatch_ep`) still uses the original, non-fused path (lower priority, ~1 of 1025 forward
-  passes per generation).
+| Config | tok/s |
+|---|---|
+| bf16, no CUDA graphs | 33.8 (concurrency=32 plateau) |
+| bf16 + CUDA graphs | 52.7–54.0 |
+| INT8 (weight-only) + graphs, no fused kernel | 37.1 |
+| INT8 + graphs + fused Triton kernel, concurrency=32 | **204.1 — 3.87× bf16** |
 
-Full narrative — root causes, every intermediate fix, and why each number is trusted — is in
+**204.1 tok/s clears the 200 tok/s target on hardware not expected to reach it** — bf16 itself can't
+even run at concurrency=32 (OOMs), so INT8 + a custom fused kernel unlocked the higher concurrency in
+the first place, not just a faster path at the same setting. Cross-validated via two independent
+harnesses and correctness-verified multiple independent ways (isolated kernel math, GSM8K
+non-regression in both eager and graph mode, real generated text read under graph capture). Full
+derivation — every intermediate fix, root causes, and why each number is trusted — is in
 `moe_quantization_memo.md`.
 
 ---
 
-## Known limitations / open work
+## What's still open
 
-- **Correctness gate not yet met.** GSM8K-CoT accuracy is currently blocked
-  by answer-termination behavior, not reasoning quality: the model solves
-  the arithmetic correctly in the large majority of cases but sometimes
-  never emits a clean, extractable final-answer statement within the token
-  budget. Root cause (length vs. unproductive reasoning loops) under
-  investigation.
-- **Batch-composition floating-point sensitivity at decode scale.** Batching
-  alone — with slot reuse structurally ruled out — produced actual
-  argmax-level token divergence in 2 of 5 long real-checkpoint sequences
-  tested (42–128 decode steps). This is the same bf16 accumulation
-  sensitivity behind the MoE combine-step fix, but newly observed to affect
-  *generated tokens*, not just cosine similarity, at decode scale. Sample
-  size (n=5) is too small to state a rate; needs a larger (≥20–30 sequence)
-  measurement before batched-mode output is treated as reproducible across
-  concurrency levels for any application that needs it (aggregate
-  correctness evaluation is far more robust to this than any single-completion
-  reproducibility claim).
-- **`shared_expert` bf16 residual** (~0.6–0.8% isolated, cosine-based) —
-  accepted as bounded based on representation similarity only; downstream
-  task (GSM8K accuracy) impact not yet ablated.
-- **Tensor parallelism** — shard-selection math verified in isolation
-  (CPU-only, all four TP-aware `weight_loader`s), full multi-process engine
-  construction at TP≥2 on real hardware not yet run.
-- **Prefix caching is disabled whenever `StateManager` is active** — a
-  permanent, real throughput cost: recurrent state cannot be reconstructed
-  from a cached KV prefix, so any sequence reusing cached blocks would
-  otherwise compute as if it had no prior context. Trades redundant prefill
-  recompute for correctness.
-- **Round-robin MoE expert sharding** chosen without a measured
-  expert-utilization histogram.
-- **Two narrow, unfixed gaps:** `load_model()` cannot accept a checkpoint
-  using a model's native fused parameter name (split/HF-style names only);
-  `LLMEngine`'s `atexit`-based lifecycle keeps every engine instance alive
-  for the process's lifetime (`del engine` alone never frees GPU memory).
+- **tp=4** (GQA kv-head replication) — CPU-validated end to end; real 4-GPU hardware confirmation
+  (NCCL, HF-reference agreement) still pending. Top of `H200_test_day_checklist.md`.
+- **Concurrency=64 doesn't fit on 2×A6000** — confirmed a real memory ceiling (swept
+  `gpu_memory_utilization` across the full plausible range, no working value), not a tuning gap.
+  Expected to lift on H200's 141GB.
+- **Prefill** (`_forward_dispatch_ep`) not yet migrated to the fused INT8 kernel — low priority
+  (~1 of 1025 forward passes per generation).
+- **True W8A8** (activation quantization, not just weights) and **FP8** — blocked on Ampere having no
+  FP8 tensor cores; a real candidate once on H200.
+- **GSM8K answer-termination edge cases** — solves the arithmetic but sometimes doesn't emit a clean,
+  extractable final answer within the token budget.
+- **Batch-composition bf16 sensitivity** — argmax-level token divergence in 2/5 long sequences tested;
+  n=5 is too small to state a rate, needs a larger sample.
+- **`shared_expert` bf16 residual** (~0.6–0.8%, cosine-based) — accepted as bounded, not yet ablated
+  against GSM8K accuracy.
+- **Prefix caching is disabled whenever `StateManager` is active** — permanent, correctness-driven:
+  recurrent state can't be reconstructed from a cached KV prefix.
+- **Round-robin MoE expert sharding** chosen without a measured expert-utilization histogram.
+- Two narrow gaps: `load_model()` only accepts split/HF-style parameter names (not a model's native
+  fused name); `LLMEngine`'s `atexit`-based lifecycle keeps every engine instance alive for the
+  process's life (`del engine` alone never frees GPU memory).
+
+See `H200_test_day_checklist.md` for the prioritized plan going into the next hardware window.
 
 ---
 
@@ -269,7 +132,7 @@ bench_http_concurrency.py concurrency-sweep throughput harness (HTTP server)
 
 ```bash
 git clone <this-repo>
-cd hybrid-nano-vllm
+cd qLLM
 pip install -r requirements.txt          # or: pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
 
