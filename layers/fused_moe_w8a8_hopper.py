@@ -36,7 +36,7 @@ def _get_ext():
                 os.path.join(_THIS_DIR, "moe_w8a8.cu"),
                 os.path.join(_THIS_DIR, "moe_w8a8_binding.cpp"),
             ],
-            extra_cuda_cflags=["-O3", "-std=c++17", "-arch=sm_90a"],
+            extra_cuda_cflags=["-O3", "-std=c++17", "-gencode=arch=compute_90a,code=sm_90a"],
             extra_cflags=["-O3", "-std=c++17"],
             verbose=True,
         )
