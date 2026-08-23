@@ -38,6 +38,7 @@ def _get_ext():
             ],
             extra_cuda_cflags=["-O3", "-std=c++17", "-gencode=arch=compute_90a,code=sm_90a"],
             extra_cflags=["-O3", "-std=c++17"],
+            extra_ldflags=["-lcuda"],
             verbose=True,
         )
     return _ext
