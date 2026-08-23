@@ -124,5 +124,20 @@ def apply_lm_head_int8_quantization(model: nn.Module, group_size: int = 128) -> 
     lm_head = getattr(model, "lm_head", None)
     if lm_head is None:
         return 0
+    # If tie_word_embeddings is set, models/qwen3_5.py's Qwen35ForCausalLM.__init__
+    # does `lm_head.weight.data = embed_tokens.weight.data` -- deleting lm_head.weight
+    # below then only drops LM_HEAD's reference; embed_tokens still holds the same
+    # underlying bf16 storage alive, so the whole point of this pass (freeing that
+    # memory) silently doesn't happen. Not a correctness bug -- inference still
+    # produces the right numbers -- but the ~485MiB capacity claim this pass exists
+    # for would be false in that configuration. Not applicable to the real checkpoint
+    # (tie_word_embeddings=False there, confirmed against config.json), but loud here
+    # rather than silent in case this ever runs against a tied checkpoint.
+    if getattr(getattr(model, "config", None), "tie_word_embeddings", False):
+        print("[LM_HEAD INT8] WARNING: tie_word_embeddings=True -- lm_head.weight shares "
+              "storage with the input embedding table. Quantizing it will NOT free that "
+              "memory (embed_tokens keeps the bf16 data alive), so the capacity win this "
+              "flag exists for will not happen, even though quantization itself proceeds "
+              "and produces correct output.")
     quantize_lm_head_inplace(lm_head, group_size)
     return 1

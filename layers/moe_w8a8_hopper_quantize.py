@@ -81,6 +81,14 @@ def quantize_weight_fp8_grouped(weight: torch.Tensor, group_size: int = 128):
     an already-sharded local Experts slice, same as the INT8 scheme.
     """
     E, N, K = weight.shape
+    assert group_size == 128, (
+        f"group_size={group_size} requested, but moe_w8a8.cu's block_shape={{128,128}} is "
+        f"hardcoded, not parameterized -- Config.moe_w8a8_hopper_weight_group_size looks like "
+        f"an independent tuning knob (mirroring the INT8 scheme's own group_size field) but "
+        f"isn't one for this kernel. A different value here would silently misalign this "
+        f"function's scale tiles against the kernel's fixed indexing rather than error -- "
+        f"caught here instead."
+    )
     assert N % group_size == 0 and K % group_size == 0, (
         f"N={N}, K={K} must both be divisible by group_size={group_size} -- "
         f"moe_w8a8.cu's block_shape={{128,128}} is hardcoded, not parameterized."

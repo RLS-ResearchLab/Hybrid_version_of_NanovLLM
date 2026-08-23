@@ -56,7 +56,10 @@ _USE_FUSED_MOE_KERNEL = os.environ.get("NANOVLLM_USE_FUSED_MOE_KERNEL", "0") == 
 # real call, not at import time, same lazy-compile pattern this file's other
 # CUDA-only imports already rely on.
 from nanovllm.layers.moe_align_block_size import moe_align_block_size
-from nanovllm.layers.moe_w8a8_hopper_quantize import quantize_activation_fp8_dynamic
+from nanovllm.layers.moe_w8a8_hopper_quantize import (
+    quantize_activation_fp8_dynamic,
+    dequantize_weight_fp8_grouped_gathered,
+)
 from nanovllm.layers.fused_moe_w8a8_hopper import fused_moe_w8a8_hopper_forward
 _USE_MOE_W8A8_HOPPER = os.environ.get("NANOVLLM_USE_MOE_W8A8_HOPPER", "0") == "1"
 # moe_w8a8.h: block_n/warp_n must be exactly (32,8) or (64,4) -- any other pair
@@ -1261,6 +1264,27 @@ class Qwen35MoE(nn.Module):
                     self.experts.down_proj_scale[e],
                     G, x.dtype,
                 )
+            elif hasattr(self.experts, "gate_up_proj_fp8"):
+                # Plain FP8 dequant branch -- W8A8 Hopper's decode-only
+                # branches (_forward_gathered/_forward_gathered_ep) never
+                # gave prefill an FP8-aware path at all, so
+                # use_moe_w8a8_hopper=True deleted the bf16 Parameters and
+                # left this function reading them anyway -- AttributeError
+                # on the very first prefill call, before decode is ever
+                # reached. Mirrors the int8 branch above exactly; no fused
+                # kernel for prefill here either, same deferral precedent
+                # the int8 fused kernel already established.
+                G = self.experts.moe_w8a8_hopper_group_size
+                gate_up_e = dequantize_weight_fp8_grouped_gathered(
+                    self.experts.gate_up_proj_fp8[e],
+                    self.experts.gate_up_proj_scale_fp8[e],
+                    G, x.dtype,
+                )
+                down_e = dequantize_weight_fp8_grouped_gathered(
+                    self.experts.down_proj_fp8[e],
+                    self.experts.down_proj_scale_fp8[e],
+                    G, x.dtype,
+                )
             else:
                 gate_up_e = self.experts.gate_up_proj[e]
                 down_e = self.experts.down_proj[e]
@@ -1467,6 +1491,20 @@ class Qwen35MoE(nn.Module):
                 down_e = dequantize_weight_int8_grouped(
                     self.experts.down_proj_int8[local_e],
                     self.experts.down_proj_scale[local_e],
+                    G, x.dtype,
+                )
+            elif hasattr(self.experts, "gate_up_proj_fp8"):
+                # Same fix, same reason as _forward_dispatch's twin branch --
+                # see that one's comment.
+                G = self.experts.moe_w8a8_hopper_group_size
+                gate_up_e = dequantize_weight_fp8_grouped_gathered(
+                    self.experts.gate_up_proj_fp8[local_e],
+                    self.experts.gate_up_proj_scale_fp8[local_e],
+                    G, x.dtype,
+                )
+                down_e = dequantize_weight_fp8_grouped_gathered(
+                    self.experts.down_proj_fp8[local_e],
+                    self.experts.down_proj_scale_fp8[local_e],
                     G, x.dtype,
                 )
             else:

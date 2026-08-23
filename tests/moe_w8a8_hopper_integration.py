@@ -75,7 +75,23 @@ def quantize_experts_module_fp8_inplace(experts: nn.Module, group_size: int = 12
     this stays exercisable by a CPU-only test suite as well as the real CUDA
     call site this is designed for (ModelRunner.__init__, where
     torch.set_default_device("cuda") is already active).
+
+    Running both quantization schemes on the SAME module is not supported --
+    config.py describes the two flags as "additive not a replacement" in the
+    sense that they're independent Config fields, not in the sense that
+    enabling both together does anything sane. If use_moe_w8a8=True already
+    ran first (ModelRunner.__init__'s ordering), experts.gate_up_proj/
+    down_proj are already deleted, replaced by *_int8 buffers -- reading them
+    here would AttributeError with no indication of why. Fail with a message
+    that says so instead of a bare attribute error.
     """
+    if not hasattr(experts, "gate_up_proj"):
+        raise RuntimeError(
+            "quantize_experts_module_fp8_inplace: experts.gate_up_proj is already gone "
+            "(quantized by something else first -- likely use_moe_w8a8=True's INT8 pass, "
+            "which runs before this one in ModelRunner.__init__). Running both INT8 and "
+            "W8A8 Hopper quantization on the same model is not supported; enable only one."
+        )
     gu_fp8, gu_scale = quantize_weight_fp8_grouped(experts.gate_up_proj.data, group_size)
     dp_fp8, dp_scale = quantize_weight_fp8_grouped(experts.down_proj.data, group_size)
 
