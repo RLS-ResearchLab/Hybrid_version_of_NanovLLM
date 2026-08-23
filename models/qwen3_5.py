@@ -43,6 +43,32 @@ from moe_int8_quantize import dequantize_weight_int8_grouped
 from nanovllm.layers.fused_moe_int8 import fused_moe_int8_forward
 _USE_FUSED_MOE_KERNEL = os.environ.get("NANOVLLM_USE_FUSED_MOE_KERNEL", "0") == "1"
 
+# True W8A8 Hopper fused kernel -- Phase 1/2 of w8a8_activation_quant_scoping_memo.md,
+# written 2026-08-22. UNVALIDATED end-to-end: moe_w8a8.cu has never compiled or run
+# (no CUDA toolchain on this dev machine, confirmed empirically). This wiring is
+# written blind, same discipline the tp=1 INT8 fix used, so it's ready to validate the
+# moment Hopper GPU access exists rather than written only once the window opens. Do
+# NOT trust NANOVLLM_USE_MOE_W8A8_HOPPER=1 to produce correct output until Phase 0
+# (compile moe_w8a8.cu + run layers/smoke_test_moe_w8a8_hopper.py) and the full Phase 3
+# validation chain (H200_test_day_checklist.md) have actually run on real hardware.
+# Importing these modules is safe without CUDA -- the JIT compile in
+# fused_moe_w8a8_hopper.py fires lazily inside fused_moe_w8a8_hopper_forward's first
+# real call, not at import time, same lazy-compile pattern this file's other
+# CUDA-only imports already rely on.
+from nanovllm.layers.moe_align_block_size import moe_align_block_size
+from nanovllm.layers.moe_w8a8_hopper_quantize import quantize_activation_fp8_dynamic
+from nanovllm.layers.fused_moe_w8a8_hopper import fused_moe_w8a8_hopper_forward
+_USE_MOE_W8A8_HOPPER = os.environ.get("NANOVLLM_USE_MOE_W8A8_HOPPER", "0") == "1"
+# moe_w8a8.h: block_n/warp_n must be exactly (32,8) or (64,4) -- any other pair
+# silently no-ops the kernel launch instead of erroring (see that file's own contract
+# comment). block_m/stages default to the same "one safe config, autotune later, only
+# after correctness is established" values fused_moe_w8a8_hopper_forward's own
+# docstring already uses -- not chosen from any measurement, there isn't one yet.
+_W8A8_HOPPER_BLOCK_M = 32
+_W8A8_HOPPER_BLOCK_N = 32
+_W8A8_HOPPER_WARP_N = 8
+_W8A8_HOPPER_STAGES = 2
+
 from nanovllm.layers.layernorm import Qwen35RMSNorm, Qwen35RMSNormGated
 from nanovllm.layers.linear import (
     ColumnParallelLinear,
@@ -844,32 +870,116 @@ class Qwen35MoE(nn.Module):
             return self._forward_dispatch_vectorized(x)
         return self._forward_dispatch(x)
  
+    def _forward_gathered_w8a8_hopper(self, x: torch.Tensor, w: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        """True W8A8 Hopper path for _forward_gathered (ep_size=1 decode).
+        UNVALIDATED -- see the import-site comment above and
+        w8a8_activation_quant_scoping_memo.md.
+
+        Unlike every INT8 branch in this file, fused_moe_w8a8_hopper_forward
+        does the FULL top_k-weighted combine internally (reduce-add per
+        (token,k) pair inside the kernel, per moe_w8a8.h) -- it returns the
+        final (N, H) MoE output directly, not a (N, TK, H) out_e for a
+        caller-side combine step to reduce.
+
+        idx plays the same role local_slots plays in the EP branch's
+        equivalent call: at ep_size=1, self.experts holds ALL experts, so a
+        global expert id IS already a valid local slot -- same reasoning
+        this function's INT8 siblings already rely on.
+        """
+        n_local_experts = self.experts.gate_up_proj_fp8.shape[0]
+        x_fp8, x_scale = quantize_activation_fp8_dynamic(x)
+        sorted_ids, expert_ids, ntpp = moe_align_block_size(idx, _W8A8_HOPPER_BLOCK_M, n_local_experts)
+        out = fused_moe_w8a8_hopper_forward(
+            x_fp8, x_scale,
+            self.experts.gate_up_proj_fp8, self.experts.gate_up_proj_scale_fp8,
+            self.experts.down_proj_fp8, self.experts.down_proj_scale_fp8,
+            sorted_ids, expert_ids, ntpp,
+            w.to(torch.float32), self.top_k, n_local_experts,
+            block_m=_W8A8_HOPPER_BLOCK_M, block_n=_W8A8_HOPPER_BLOCK_N,
+            warp_n=_W8A8_HOPPER_WARP_N, stages=_W8A8_HOPPER_STAGES,
+        )
+        return out.to(x.dtype)
+
     def _forward_gathered(self, x: torch.Tensor) -> torch.Tensor:
         """Capture-safe MoE forward for decode. No loops, no .item(), no
         data-dependent branching -- every op's shape is static given N (batch
         size) and self.top_k, both fixed for a given call/captured graph."""
         H, TK = self.hidden_size, self.top_k
         N = x.shape[0]
- 
+
         w, idx = torch.topk(self.gate(x), TK, dim=-1)          # (N, TK)
         w = F.softmax(w, dim=-1).to(x.dtype)
- 
+
+        if _USE_MOE_W8A8_HOPPER and hasattr(self.experts, "gate_up_proj_fp8"):
+            # Early return, deliberately not interleaved into the int8/bf16
+            # chain below -- this kernel already produces the final combined
+            # output (see helper docstring), and keeping the existing chain's
+            # indentation/structure untouched avoids risking a transcription
+            # error in code that was already reasoned through and is not
+            # re-testable here.
+            moe_out = self._forward_gathered_w8a8_hopper(x, w, idx)
+            sg = torch.sigmoid(self.shared_expert_gate(x))
+            return moe_out + sg * self.shared_expert(x)
+
         # Advanced indexing: dynamic VALUES, static SHAPE (N, TK, ...) --
         # safe under graph capture, same principle as StateManager's
-        # index_select on state_slot_ids.
-        gate_up = self.experts.gate_up_proj[idx]                # (N, TK, 2*MI, H)
-        down = self.experts.down_proj[idx]                      # (N, TK, H, MI)
-        gw, uw = gate_up.chunk(2, dim=2)                        # each (N, TK, MI, H)
- 
-        # Per-token, per-selected-expert projection -- equivalent to the
-        # dispatch loop's `xt @ gw.t()` / `xt @ uw.t()`, just batched over
-        # (N, TK) instead of looped over experts with a token subset each.
-        h_gate = torch.einsum('nkmh,nh->nkm', gw, x)            # (N, TK, MI)
-        h_up = torch.einsum('nkmh,nh->nkm', uw, x)              # (N, TK, MI)
-        h = F.silu(h_gate) * h_up                                # (N, TK, MI)
- 
-        # Equivalent to the dispatch loop's `h @ down_proj[e].t()`.
-        out_e = torch.einsum('nkhm,nkm->nkh', down, h)          # (N, TK, H)
+        # index_select on state_slot_ids. At ep_size=1 every global expert id
+        # IS a local slot directly (self.experts holds ALL experts, no
+        # sharding) -- unlike _forward_gathered_ep, idx needs no // ep_size,
+        # no ownership mask, no all_reduce.
+        if _USE_FUSED_MOE_KERNEL and hasattr(self.experts, "gate_up_proj_int8"):
+            # Fused-Triton-kernel path -- NANOVLLM_USE_FUSED_MOE_KERNEL=1.
+            # Mirrors _forward_gathered_ep's fused branch: that call never
+            # touches ep_rank/owned_mask/all_reduce internally (those only
+            # apply to the EP combine step below the kernel call, which
+            # doesn't exist at ep_size=1) -- so the kernel itself is already
+            # EP-agnostic, this just wires it up here too, passing `idx`
+            # directly where the EP branch passes `local_slots`. Added
+            # alongside the plain-dequant tp=1 fix below, same "unblock
+            # tp=1, don't touch EP" scoping.
+            fused_out_e = fused_moe_int8_forward(
+                x,
+                self.experts.gate_up_proj_int8, self.experts.gate_up_proj_scale,
+                self.experts.down_proj_int8, self.experts.down_proj_scale,
+                self.experts.moe_w8a8_group_size,
+                idx, TK, self.experts.gate_up_proj_int8.shape[0],
+            )
+            gate_up = down = None  # unused below when this branch is taken
+        elif hasattr(self.experts, "gate_up_proj_int8"):
+            # Plain int8 dequant branch, added to unblock use_moe_w8a8=True
+            # at tensor_parallel_size=1 (previously EP-only, ep_size>1 --
+            # moe_int8_integration.py deletes the bf16 Parameters
+            # unconditionally regardless of ep_size, so this path would
+            # AttributeError on the plain bf16 read below without this
+            # branch). Mirrors _forward_gathered_ep's dequant branch exactly,
+            # minus the ownership mask/all_reduce that ep_size=1 doesn't need.
+            G = self.experts.moe_w8a8_group_size
+            gu_i8 = self.experts.gate_up_proj_int8[idx]            # (N, TK, 2*MI, H) int8
+            gu_sc = self.experts.gate_up_proj_scale[idx]
+            dp_i8 = self.experts.down_proj_int8[idx]               # (N, TK, H, MI) int8
+            dp_sc = self.experts.down_proj_scale[idx]
+            gate_up = dequantize_weight_int8_grouped(gu_i8, gu_sc, G, x.dtype)
+            down = dequantize_weight_int8_grouped(dp_i8, dp_sc, G, x.dtype)
+            fused_out_e = None
+        else:
+            gate_up = self.experts.gate_up_proj[idx]                # (N, TK, 2*MI, H)
+            down = self.experts.down_proj[idx]                      # (N, TK, H, MI)
+            fused_out_e = None
+        if fused_out_e is not None:
+            out_e = fused_out_e
+        else:
+            gw, uw = gate_up.chunk(2, dim=2)                    # each (N, TK, MI, H)
+
+            # Per-token, per-selected-expert projection -- equivalent to the
+            # dispatch loop's `xt @ gw.t()` / `xt @ uw.t()`, just batched
+            # over (N, TK) instead of looped over experts with a token
+            # subset each.
+            h_gate = torch.einsum('nkmh,nh->nkm', gw, x)        # (N, TK, MI)
+            h_up = torch.einsum('nkmh,nh->nkm', uw, x)          # (N, TK, MI)
+            h = F.silu(h_gate) * h_up                            # (N, TK, MI)
+
+            # Equivalent to the dispatch loop's `h @ down_proj[e].t()`.
+            out_e = torch.einsum('nkhm,nkm->nkh', down, h)      # (N, TK, H)
         # NOTE: unlike _forward_dispatch/_forward_dispatch_ep, this combine
         # is NOT promoted to fp32 -- same unpromoted bf16-sum-across-top_k
         # pattern that measurably caused ~1.3% relative error there before
@@ -881,6 +991,58 @@ class Qwen35MoE(nn.Module):
         sg = torch.sigmoid(self.shared_expert_gate(x))
         out = out + sg * self.shared_expert(x)
         return out
+
+    def _forward_gathered_ep_w8a8_hopper(self, x: torch.Tensor, w: torch.Tensor,
+                                          local_slots: torch.Tensor, owned_mask: torch.Tensor) -> torch.Tensor:
+        """True W8A8 Hopper path for _forward_gathered_ep (ep_size>1 decode).
+        UNVALIDATED -- see the import-site comment and the scoping memo.
+
+        fused_moe_w8a8_hopper_forward's internal combine reduce-adds
+        topk_weight-scaled per-(token,k) contributions directly into `out`
+        -- there is no separate (N, TK, H) out_e for this rank's combine
+        step to mask-then-sum the way every other EP branch here does. So
+        the masking has to happen BEFORE the kernel call instead of after:
+        zero this rank's topk weight for every (token,k) pair it does NOT
+        own, so its contribution to the kernel's internal reduce-add is
+        exactly zero (the local_slots gather for those pairs still reads
+        some OTHER expert's weights, same wasted-but-discarded-compute
+        trade-off _forward_gathered_ep's own docstring already accepts --
+        multiplying by a zero weight discards it regardless of what was
+        gathered), then all_reduce (SUM) the per-rank partial result across
+        ranks -- structurally the same zero-then-sum combine every other EP
+        branch uses, just relocated to before the kernel because this
+        kernel owns the reduce-add step internally rather than exposing it.
+
+        Precision caveat, stated plainly because it's new here: every other
+        EP branch promotes the combine to fp32 BEFORE summing top_k
+        contributions (measured to matter -- see _forward_dispatch's own
+        comment on the ~1.3% relative error this fixed). This kernel's
+        `out` is declared __nv_bfloat16 (moe_w8a8.h) with no fp32 output
+        option, so the per-(token,k) reduce-add itself happens in whatever
+        precision the kernel internally accumulates in -- unconfirmed, the
+        kernel has never run. This function casts to fp32 immediately after
+        the kernel call, before all_reduce, matching the existing
+        discipline as closely as the kernel's fixed output dtype allows --
+        but the summation that matters most already happened inside the
+        kernel at bf16-out precision, not fp32, unlike every other branch
+        here. Flag this explicitly in Phase 3's accuracy validation rather
+        than assuming it's equivalent.
+        """
+        n_local_experts = self.experts.gate_up_proj_fp8.shape[0]
+        x_fp8, x_scale = quantize_activation_fp8_dynamic(x)
+        w_masked = w.to(torch.float32) * owned_mask.to(torch.float32)
+        sorted_ids, expert_ids, ntpp = moe_align_block_size(local_slots, _W8A8_HOPPER_BLOCK_M, n_local_experts)
+        local_out = fused_moe_w8a8_hopper_forward(
+            x_fp8, x_scale,
+            self.experts.gate_up_proj_fp8, self.experts.gate_up_proj_scale_fp8,
+            self.experts.down_proj_fp8, self.experts.down_proj_scale_fp8,
+            sorted_ids, expert_ids, ntpp,
+            w_masked, self.top_k, n_local_experts,
+            block_m=_W8A8_HOPPER_BLOCK_M, block_n=_W8A8_HOPPER_BLOCK_N,
+            warp_n=_W8A8_HOPPER_WARP_N, stages=_W8A8_HOPPER_STAGES,
+        ).to(torch.float32)
+        dist.all_reduce(local_out)
+        return local_out.to(x.dtype)
 
     def _forward_gathered_ep(self, x: torch.Tensor) -> torch.Tensor:
         """Expert-parallel, capture-safe MoE forward for decode -- the EP
@@ -934,6 +1096,28 @@ class Qwen35MoE(nn.Module):
 
         local_slots = idx // P                                    # (N, TK) -- always in-bounds, see docstring
         owned_mask = (idx % P) == self.ep_rank                    # (N, TK) bool
+
+        if _USE_MOE_W8A8_HOPPER and hasattr(self.experts, "gate_up_proj_fp8"):
+            # Early return, deliberately not interleaved into the int8/bf16
+            # chain below -- same reasoning as _forward_gathered's identical
+            # early-return: this kernel already produces the final combined,
+            # all_reduce'd output (see helper docstring), and keeping the
+            # existing chain untouched avoids risking a transcription error
+            # in code that was already reasoned through and is not
+            # re-testable on this machine.
+            local_out = self._forward_gathered_ep_w8a8_hopper(x, w, local_slots, owned_mask)
+
+            touched = owned_mask.any(dim=1)                             # (N,) bool
+            token_id_local = torch.where(
+                touched,
+                torch.arange(N, device=x.device, dtype=torch.int64),
+                torch.full((N,), -1, dtype=torch.int64, device=x.device),
+            )
+            dist.all_reduce(token_id_local, op=dist.ReduceOp.MAX)
+            self._last_ep_token_id_roundtrip = token_id_local
+
+            sg = torch.sigmoid(self.shared_expert_gate(x))
+            return local_out + sg * self.shared_expert(x)
 
         if _USE_FUSED_MOE_KERNEL and hasattr(self.experts, "gate_up_proj_int8"):
             # Fused-Triton-kernel path -- NANOVLLM_USE_FUSED_MOE_KERNEL=1.
@@ -1059,9 +1243,30 @@ class Qwen35MoE(nn.Module):
                 continue
             start = expert_offsets[e].item()
             xt = sorted_tokens[start:start + cnt]
-            gw, uw = self.experts.gate_up_proj[e].chunk(2, 0)
+            # int8 branch, added to unblock use_moe_w8a8=True at
+            # tensor_parallel_size=1 -- mirrors _forward_dispatch_ep's
+            # dequant branch exactly (see there for why: moe_int8_integration.py
+            # deletes the bf16 Parameters unconditionally regardless of
+            # ep_size, so the plain bf16 read below would AttributeError
+            # without this branch).
+            if hasattr(self.experts, "gate_up_proj_int8"):
+                G = self.experts.moe_w8a8_group_size
+                gate_up_e = dequantize_weight_int8_grouped(
+                    self.experts.gate_up_proj_int8[e],
+                    self.experts.gate_up_proj_scale[e],
+                    G, x.dtype,
+                )
+                down_e = dequantize_weight_int8_grouped(
+                    self.experts.down_proj_int8[e],
+                    self.experts.down_proj_scale[e],
+                    G, x.dtype,
+                )
+            else:
+                gate_up_e = self.experts.gate_up_proj[e]
+                down_e = self.experts.down_proj[e]
+            gw, uw = gate_up_e.chunk(2, 0)
             h = F.silu(xt @ gw.t()) * (xt @ uw.t())
-            h = h @ self.experts.down_proj[e].t()
+            h = h @ down_e.t()
             w_slice = sorted_weights[start:start + cnt].unsqueeze(-1).to(combine_dtype)
             sorted_out[start:start + cnt] = w_slice * h.to(combine_dtype)
 

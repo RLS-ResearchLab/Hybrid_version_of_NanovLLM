@@ -16,6 +16,28 @@ class Config:
     use_vectorized_moe: bool = False
     use_moe_w8a8: bool = False
     moe_w8a8_weight_group_size: int = 128
+    # True W8A8 Hopper path (moe_w8a8.cu) -- separate scheme from use_moe_w8a8
+    # above (2D-blocked FP8, not 1D-grouped INT8), additive not a replacement.
+    # UNVALIDATED end-to-end -- see w8a8_activation_quant_scoping_memo.md and
+    # models/qwen3_5.py's NANOVLLM_USE_MOE_W8A8_HOPPER import-site comment.
+    # Setting this True quantizes weights to FP8 at load time
+    # (moe_w8a8_hopper_integration.py); the SEPARATE NANOVLLM_USE_MOE_W8A8_HOPPER
+    # env var controls whether the decode forward path actually calls the
+    # Hopper kernel with them (mirrors use_moe_w8a8's own
+    # NANOVLLM_USE_FUSED_MOE_KERNEL split, same reason: two independent
+    # questions -- "are weights quantized" vs. "which kernel reads them").
+    # Do not set True before Phase 0 (kernel compile + isolated smoke test)
+    # has actually run on real Hopper hardware.
+    use_moe_w8a8_hopper: bool = False
+    moe_w8a8_hopper_weight_group_size: int = 128
+    # lm_head INT8 weight-only quantization -- 2026-08-23, see
+    # tests/lm_head_int8_integration.py's module docstring for the real numbers
+    # (~485MiB capacity win) and the honest caveat (NOT a confirmed throughput
+    # win -- lm_head reads its full weight every call, unlike the gathered MoE
+    # experts, so naive dequant-then-matmul is a plausible bandwidth regression
+    # until a fused kernel exists). Off by default, independent of use_moe_w8a8.
+    use_lm_head_int8: bool = False
+    lm_head_int8_group_size: int = 128
     # Debug-only: prints argmax vs sampled token for every prefilled seq on
     # every prefill call. Forces an extra argmax() + host-sync .tolist() in
     # the hot path even when nobody reads the output -- default off so

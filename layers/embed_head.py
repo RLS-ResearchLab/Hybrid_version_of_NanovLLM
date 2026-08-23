@@ -1,9 +1,22 @@
+import os
+import sys
+
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
 from nanovllm.utils.context import get_context
+
+# dequantize_weight_int8_grouped lives under tests/ (moe_int8_quantize.py), not on
+# any production sys.path -- same footgun models/qwen3_5.py already guards against
+# explicitly (see that file's own comment on this exact import). Mirrored here
+# rather than assumed already-on-path, since this module can be imported without
+# models/qwen3_5.py ever having run first.
+_TESTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests")
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+from moe_int8_quantize import dequantize_weight_int8_grouped
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -58,7 +71,20 @@ class ParallelLMHead(VocabParallelEmbedding):
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
-        logits = F.linear(x, self.weight)
+        if hasattr(self, "weight_int8"):
+            # lm_head_int8_integration.py's quantized path. CAPACITY win
+            # (~485MiB less resident VRAM at real checkpoint dims), NOT a
+            # confirmed throughput win -- this dequantizes the FULL weight
+            # matrix fresh every call (unlike the MoE experts' gathered
+            # subset), which is a plausible bandwidth REGRESSION until a
+            # fused kernel exists. See that file's module docstring before
+            # treating use_lm_head_int8=True as a speed flag.
+            weight = dequantize_weight_int8_grouped(
+                self.weight_int8, self.weight_scale, self.lm_head_int8_group_size, x.dtype
+            )
+        else:
+            weight = self.weight
+        logits = F.linear(x, weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)

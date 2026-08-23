@@ -32,11 +32,19 @@ WHAT THIS DOES NOT DO
 ============================================================================
 - Does not touch utils/loader.py, load_model(), or shard_experts_tensor.
   Zero changes to the bf16 loading/sharding path, by design (see Q3).
-- Does not touch the non-EP _forward_gathered() or the prefill
-  _forward_dispatch{,_ep}() paths. Only _forward_gathered_ep's gather is
-  patched to check for the quantized buffers (see the models/qwen3_5.py
-  patch this file ships alongside). Extending to prefill or the non-EP
-  decode path is separate follow-on work, not done here.
+- Does not touch models/qwen3_5.py at all -- this file only quantizes the
+  weights; the four forward paths that read the resulting int8 buffers
+  (_forward_gathered_ep, _forward_dispatch_ep, and -- as of the
+  tensor_parallel_size=1 fix -- _forward_gathered and _forward_dispatch)
+  each check `hasattr(self.experts, "gate_up_proj_int8")` independently in
+  models/qwen3_5.py itself. STALE NOTE, kept for history: this comment
+  originally said only _forward_gathered_ep had been patched and the other
+  three were separate follow-on work -- that was true when this file was
+  first written (Q4), not anymore; all four now support int8, so
+  use_moe_w8a8=True works at any tensor_parallel_size, not EP-only.
+  _forward_gathered_ep's fused-Triton-kernel path
+  (NANOVLLM_USE_FUSED_MOE_KERNEL) remains EP-only, not yet ported to the
+  non-EP decode path -- that piece genuinely is still open.
 - Does not run an accuracy ablation. That is Q6, real weights through the
   engine, same protocol as every other correctness-gate check in this
   project.
@@ -85,11 +93,12 @@ def quantize_experts_module_inplace(experts: nn.Module, group_size: int) -> None
     experts.register_buffer("down_proj_scale", dp_scale)
 
     # The ONLY new piece of state this pass adds beyond the four buffers
-    # above. The forward path (_forward_gathered_ep) reads this directly
-    # off the module -- no config threading needed anywhere else. The
-    # buffers' presence and this one int are the complete, self-contained
-    # state quantization adds; there is no third place that needs to agree
-    # with them.
+    # above. Every forward path that supports int8 (_forward_gathered_ep,
+    # _forward_dispatch_ep, and -- as of the tp=1 fix -- _forward_gathered
+    # and _forward_dispatch too) reads this directly off the module -- no
+    # config threading needed anywhere else. The buffers' presence and this
+    # one int are the complete, self-contained state quantization adds;
+    # there is no third place that needs to agree with them.
     experts.moe_w8a8_group_size = group_size
 
 

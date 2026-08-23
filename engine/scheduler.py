@@ -122,8 +122,6 @@ class Scheduler:
                 self.block_manager.allocate(seq, num_cached_blocks)
                 if self.state_manager is not None:
                     self._allocate_state(seq)
-                    print(f"[REPREFILL DEBUG] seq_id={seq.seq_id} num_tokens={seq.num_tokens} "
-                    f"num_cached_tokens={seq.num_cached_tokens} state_slot={seq.state_slot}")
                 seq.num_cached_tokens = num_cached_blocks * self.block_size
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens

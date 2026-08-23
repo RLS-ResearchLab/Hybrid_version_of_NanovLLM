@@ -103,6 +103,37 @@ class ModelRunner:
             torch.cuda.empty_cache()
             print(f"[MOE W8A8] quantized {n_quantized} Experts module(s) to "
                   f"INT8, group_size={config.moe_w8a8_weight_group_size}")
+        if getattr(config, "use_moe_w8a8_hopper", False):
+            # True W8A8 Hopper path -- separate scheme from use_moe_w8a8 above,
+            # additive (distinct gate_up_proj_fp8/... buffer names), see
+            # config.py's own comment on the two-flag split. UNVALIDATED --
+            # do not set this True before Phase 0 (moe_w8a8.cu compile +
+            # isolated smoke test) has run on real Hopper hardware; see
+            # w8a8_activation_quant_scoping_memo.md.
+            _tests_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests")
+            if _tests_dir not in sys.path:
+                sys.path.insert(0, _tests_dir)
+            from moe_w8a8_hopper_integration import apply_moe_w8a8_hopper_quantization
+            n_quantized_fp8 = apply_moe_w8a8_hopper_quantization(
+                self.model, config.moe_w8a8_hopper_weight_group_size
+            )
+            torch.cuda.empty_cache()
+            print(f"[MOE W8A8 HOPPER] quantized {n_quantized_fp8} Experts module(s) to "
+                  f"FP8, group_size={config.moe_w8a8_hopper_weight_group_size}")
+        if getattr(config, "use_lm_head_int8", False):
+            # lm_head INT8 -- CAPACITY win, NOT a confirmed throughput win.
+            # See tests/lm_head_int8_integration.py's module docstring before
+            # assuming this speeds anything up.
+            _tests_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests")
+            if _tests_dir not in sys.path:
+                sys.path.insert(0, _tests_dir)
+            from lm_head_int8_integration import apply_lm_head_int8_quantization
+            n_quantized_lm_head = apply_lm_head_int8_quantization(
+                self.model, config.lm_head_int8_group_size
+            )
+            torch.cuda.empty_cache()
+            print(f"[LM_HEAD INT8] quantized {n_quantized_lm_head} lm_head module(s) to "
+                  f"INT8, group_size={config.lm_head_int8_group_size}")
         if self._is_hybrid_model:
             num_linear_layers = sum(1 for t in self.model.model.layer_types if t == "linear_attention")
             la0 = next(m for m in self.model.modules() if isinstance(m, Qwen35LinearAttention))

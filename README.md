@@ -84,6 +84,15 @@ derivation — every intermediate fix, root causes, and why each number is trust
   Expected to lift on H200's 141GB.
 - **Prefill** (`_forward_dispatch_ep`) not yet migrated to the fused INT8 kernel — low priority
   (~1 of 1025 forward passes per generation).
+- **INT8 weight-only quantization now works at any `tensor_parallel_size`**, not EP-only —
+  `_forward_gathered`/`_forward_dispatch` (the non-EP paths) gained int8 branches mirroring
+  `_forward_gathered_ep`/`_forward_dispatch_ep`'s existing ones, unblocking `use_moe_w8a8=True` at
+  tp=1 (previously an unconditional `AttributeError`). **The fused Triton kernel path
+  (`NANOVLLM_USE_FUSED_MOE_KERNEL=1`) is now also wired up at tp=1** — `_forward_gathered`'s fused
+  branch mirrors `_forward_gathered_ep`'s exactly (that call never touched `ep_rank`/`owned_mask`/
+  `all_reduce` to begin with, so it was already EP-agnostic under the hood). Prefill has no fused
+  path at tp=1 either, matching `_forward_dispatch_ep`, which never had one. **All of this is
+  unvalidated** — written without GPU access, never run.
 - **True W8A8** (activation quantization, not just weights) and **FP8** — blocked on Ampere having no
   FP8 tensor cores; a real candidate once on H200.
 - **GSM8K answer-termination edge cases** — solves the arithmetic but sometimes doesn't emit a clean,
