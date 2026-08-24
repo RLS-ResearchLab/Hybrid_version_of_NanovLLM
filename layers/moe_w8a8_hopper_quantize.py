@@ -26,37 +26,47 @@ FP8_MAX = 448.0  # e4m3's max representable magnitude -- matches moe_w8a8.cu's
                   # hardcoded fp8_max constant exactly, must stay in sync with it.
 
 
-def quantize_activation_fp8_dynamic(x: torch.Tensor):
-    """Per-token (per-row) dynamic FP8 e4m3 quantization, max-abs scale.
+def quantize_activation_fp8_dynamic(x: torch.Tensor, block_size: int = 128):
+    """Per-token, per-128-K-block dynamic FP8 e4m3 quantization, max-abs scale.
 
-    x: (M, K) any float dtype.
-    Returns: (x_fp8: (M, K) float8_e4m3fn, scale: (M,) float32).
+    x: (M, K) any float dtype, K divisible by block_size.
+    Returns: (x_fp8: (M, K) float8_e4m3fn, scale: (M, K // block_size) float32).
+
+    CORRECTED 2026-08-24: previously computed one scale per WHOLE ROW (shape
+    (M,)), not one per (token, 128-K-block) -- found via a first real-hardware
+    run of moe_w8a8_hopper's smoke test that a "value bug" (cosine~0.01,
+    kernel_out ~227,000x too large on tokens whose index landed the read
+    out-of-bounds) traced all the way back to this function. moe_w8a8.cu:811
+    reads x_scale as `x_scale[token*(K/block_shape[1]) + k_block]` -- the
+    SAME 128x128-block convention already used (and confirmed, per moe_w8a8.h)
+    for w_scale/w2_scale -- so it needs K/block_size values per token, not 1.
+    The old (M,) shape meant every read past token (M*block_size/K rows) or
+    so wrapped into a neighboring token's scale (in-bounds but wrong -- small,
+    plausible-looking, uncorrelated output) or straight past the end of the
+    tensor (out-of-bounds -- picked up whatever GPU memory happened to be
+    adjacent, producing the ~227,000x blowup). This shape is what the kernel
+    has always expected; nothing in moe_w8a8.cu changed.
 
     No calibration data, no offline statistics pass -- computed fresh from
-    the actual activation values every call. This is this project's OWN
-    reference quantization scheme for activations -- moe_w8a8.cu does not
-    quantize its own input (see moe_w8a8.h), so there is no "real" activation
-    quantizer to match against yet. The kernel's own per-token dynamic
-    requantization of the SiLU-gated intermediate (the down_proj input,
-    computed mid-kernel) uses this exact max-abs/448 convention, per its
-    `token_scale[tm][t] = float(token_max[tm].t) / fp8_max` line -- so this
-    mirrors that pattern for the INPUT activation too, as the most consistent
-    assumption available, not because it's been confirmed as what an eventual
-    real quantizer will do.
+    the actual activation values every call, same per-block max-abs
+    convention as quantize_weight_fp8_grouped (weights) and the kernel's own
+    down_proj-input requantization (`token_scale[tm][t] = token_max/fp8_max`).
 
-    Outlier handling: NOT addressed here. This is plain per-token max-abs,
-    the scheme most exposed to a few outlier channels dominating a token's
-    scale and starving the rest of that row's precision -- see
-    w8a8_activation_quant_scoping_memo.md §2c for the open decision on
-    whether this needs SmoothQuant-style offline rebalancing before it's
-    trustworthy on real activations. Shipped as-is here because it's the
-    cheapest starting point and the accuracy validation chain (Phase 3) is
-    what will actually tell us if it's a problem, not speculation now.
+    Outlier handling: NOT addressed here beyond the 128-block granularity
+    itself. See w8a8_activation_quant_scoping_memo.md §2c for the open
+    decision on whether this needs SmoothQuant-style offline rebalancing
+    before it's trustworthy on real activations.
     """
-    amax = x.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+    M, K = x.shape
+    assert K % block_size == 0, (
+        f"K={K} must be divisible by block_size={block_size} -- moe_w8a8.cu's "
+        f"block_shape={{128,128}} is hardcoded, not parameterized."
+    )
+    xb = x.float().view(M, K // block_size, block_size)
+    amax = xb.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
     scale = amax / FP8_MAX
-    x_fp8 = (x.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    return x_fp8, scale.squeeze(-1).contiguous()
+    x_fp8 = (xb / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    return x_fp8.view(M, K).contiguous(), scale.squeeze(-1).contiguous()
 
 
 def quantize_weight_fp8_grouped(weight: torch.Tensor, group_size: int = 128):
