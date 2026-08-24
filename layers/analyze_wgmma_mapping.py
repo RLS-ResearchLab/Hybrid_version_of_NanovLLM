@@ -46,6 +46,51 @@ if not rows:
 # in the real code path -- our probe captures `val` BEFORE requant, so it's
 # already in the same units as the reference `h` tensor. No adjustment needed.
 
+# --- Decode x_row through sorted_ids before trusting it as a h_reference row ---
+#
+# moe_align_block_size groups tokens by EXPERT (stable argsort on expert id),
+# so sorted_token_ids[warpM*BM + x_row] is generally NOT x_row -- it's
+# whichever (token*top_k+slot) flat index landed in that block-local slot
+# after expert-grouping + padding. DEBUGXY only ever fires for blockIdx.y==0
+# (warpM==0), so the decode is sorted_ids[x_row] directly, no block offset
+# needed. Every probe below was treating x_row as if it were already the
+# h_reference row index -- that's only true if sorted_ids happens to be the
+# identity permutation on this block, which a random-routing test has no
+# reason to produce. This is almost certainly why the earlier nearest-neighbor
+# search "found" scattered matches all over the tensor (searching against
+# effectively-random rows will occasionally land close to *some* cell in a
+# tensor full of small, clustered SiLU outputs) and why the direct
+# same-coordinate check came back wildly wrong -- not because the kernel's
+# values are wrong, necessarily, but because we were comparing against the
+# wrong ground-truth row entirely.
+try:
+    sorted_ids = torch.load("sorted_ids_debug.pt")
+    PAD_SENTINEL = int(ref.shape[0])  # moe_align_block_size pads with topk_ids.numel() == M*top_k == ref.shape[0]
+    print(f"Loaded sorted_ids_debug.pt: shape={tuple(sorted_ids.shape)}  "
+          f"block 0 (first {min(64, sorted_ids.shape[0])} slots): "
+          f"{sorted_ids[:min(64, sorted_ids.shape[0])].tolist()}")
+    n_pad = 0
+    for r in rows:
+        if 0 <= r["row"] < sorted_ids.shape[0]:
+            flat_idx = int(sorted_ids[r["row"]].item())
+            if flat_idx == PAD_SENTINEL or flat_idx >= ref.shape[0]:
+                r["true_row"] = None  # this x_row is a padding slot -- no real token here at all
+                n_pad += 1
+            else:
+                r["true_row"] = flat_idx
+        else:
+            r["true_row"] = None
+    print(f"Decoded x_row -> true h_reference row for all probes ({n_pad}/{len(rows)} are padding slots, "
+          f"no real token -- expected to be wrong against ANY reference row).")
+except FileNotFoundError:
+    print("\n*** sorted_ids_debug.pt not found -- re-run smoke_test_moe_w8a8_hopper.py "
+          "with the updated harness that saves it, then re-run this script. Falling back "
+          "to treating x_row as the direct reference row (KNOWN WRONG unless sorted_ids "
+          "happens to be identity on this run -- do not trust the same-coordinate check "
+          "below until this file exists). ***\n")
+    for r in rows:
+        r["true_row"] = r["row"]
+
 flat = ref.reshape(-1)
 results = []
 for r in rows:
@@ -77,16 +122,17 @@ for r in rows:
 # first: does val actually match ref at its own reported (row, col)?
 same_coord = []
 for r in rows:
-    if 0 <= r["row"] < ref.shape[0] and 0 <= r["col"] < ref.shape[1]:
-        ref_val = float(ref[r["row"], r["col"]])
+    if r["true_row"] is not None and 0 <= r["true_row"] < ref.shape[0] and 0 <= r["col"] < ref.shape[1]:
+        ref_val = float(ref[r["true_row"], r["col"]])
         abs_diff = abs(ref_val - r["val"])
         rel = abs_diff / (abs(r["val"]) + 1e-12) * 100
         same_coord.append(dict(**r, ref_val_at_reported=ref_val, same_coord_rel_diff_pct=rel))
 
-print(f"\n--- Direct same-coordinate check (val vs ref[row,col], NO searching) ---")
-print(f"{'(row,col)':<12} {'kernel_val':<14} {'ref_val':<14} {'rel_diff%':<10} {'lane':<5} {'warp':<5} {'tn':<4} {'tm':<4} {'t':<3}")
+print(f"\n--- Direct same-coordinate check (val vs ref[true_row,col], NO searching, "
+      f"x_row decoded through sorted_ids -- padding slots excluded) ---")
+print(f"{'x_row':<6} {'true_row':<9} {'col':<5} {'kernel_val':<14} {'ref_val':<14} {'rel_diff%':<10} {'lane':<5} {'warp':<5} {'tn':<4} {'tm':<4} {'t':<3}")
 for r in sorted(same_coord, key=lambda r: -r["same_coord_rel_diff_pct"])[:60]:
-    print(f"({r['row']:3d},{r['col']:3d}){'':<4} {r['val']:<14.6e} {r['ref_val_at_reported']:<14.6e} "
+    print(f"{r['row']:<6} {r['true_row']:<9} {r['col']:<5} {r['val']:<14.6e} {r['ref_val_at_reported']:<14.6e} "
           f"{r['same_coord_rel_diff_pct']:<10.2f} {r['lane']:<5} {r['warp']:<5} {r['tn']:<4} {r['tm']:<4} {r['t']:<3}")
 
 rels = [r["same_coord_rel_diff_pct"] for r in same_coord]

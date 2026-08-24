@@ -135,6 +135,24 @@ def main():
     local_slots = torch.randint(0, E, (M, top_k), dtype=torch.int32, device=device)
     topk_weights = torch.softmax(torch.randn(M, top_k, device=device), dim=-1)
 
+    # TEMPORARY debug probe, 2026-08-24 -- moe_align_block_size groups tokens
+    # by EXPERT (torch.argsort(flat_ids, stable=True) in moe_align_block_size.py),
+    # so sorted_token_ids[warpM*BM + x_row] is NOT x_row / not sequential --
+    # it's whatever (token*top_k+slot) flat index landed in that sorted/padded
+    # slot after expert-grouping. analyze_wgmma_mapping.py's DEBUGXY probe
+    # reports x_row (a LOCAL position within one block's BM slots), which must
+    # be decoded through sorted_ids before indexing into h_reference.pt's rows
+    # -- comparing ref[x_row, x_col] directly (as the same-coordinate check
+    # first did) silently assumes sorted_ids is the identity permutation,
+    # which moe_align_block_size does not guarantee and this random-routing
+    # test almost certainly violates. Save it so the analysis script can do
+    # the decode instead of guessing. Remove once the bug is found.
+    sorted_ids_probe, _, _ = _align(local_slots, block_m, E)
+    torch.save(sorted_ids_probe.cpu(), "sorted_ids_debug.pt")
+    print(f"Saved sorted_ids_debug.pt, shape={tuple(sorted_ids_probe.shape)}, "
+          f"first block (block 0) local-slot -> flat(token*top_k+slot): "
+          f"{sorted_ids_probe[:block_m].tolist()}")
+
     # ---- Reference path (uses the ORIGINAL bf16 weights/activations, not
     # the fp8-quantized copies, so this check validates the KERNEL's
     # quantized math against a full-precision ground truth -- not just
