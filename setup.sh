@@ -54,7 +54,11 @@ pip install -q transformers xxhash numpy tqdm safetensors fastapi "uvicorn[stand
 # neither is needed for the actual test scripts, both are slow to install)
 
 if [ ! -f qwen35_checkpoint/.download_complete ]; then
-    nohup bash -c "huggingface-cli download Qwen/Qwen3.5-35B-A3B --local-dir ./qwen35_checkpoint && touch qwen35_checkpoint/.download_complete" \
+    # `huggingface-cli download` is deprecated in newer huggingface_hub releases
+    # and silently no-ops (prints a warning, downloads nothing) instead of
+    # erroring -- use `hf download` (the replacement) so this doesn't look like
+    # it started when it didn't.
+    nohup bash -c "hf download Qwen/Qwen3.5-35B-A3B --local-dir ./qwen35_checkpoint && touch qwen35_checkpoint/.download_complete" \
         > checkpoint_download.log 2>&1 &
     disown
     echo "Checkpoint download started in background (PID $!) -> checkpoint_download.log"
