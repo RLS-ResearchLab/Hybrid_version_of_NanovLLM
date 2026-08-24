@@ -141,7 +141,9 @@ def main():
     x_bf16 = torch.randn((M, H), dtype=torch.bfloat16, device=device) * 0.02
     x_fp8, x_scale = quantize_activation_fp8_dynamic(x_bf16)
     torch.save(x_scale.cpu(), "x_scale_debug.pt")
+    torch.save(x_fp8.float().cpu(), "x_fp8_debug.pt")
     print(f"Saved x_scale_debug.pt, shape={tuple(x_scale.shape)}")
+    print(f"Saved x_fp8_debug.pt, shape={tuple(x_fp8.shape)}  x_fp8[0,:8]={x_fp8[0,:8].float().tolist()}")
 
     local_slots = torch.randint(0, E, (M, top_k), dtype=torch.int32, device=device)
     topk_weights = torch.softmax(torch.randn(M, top_k, device=device), dim=-1)

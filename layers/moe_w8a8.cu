@@ -907,10 +907,28 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
             // scale_x directly against the real x_scale[token,k_block] value
             // and scale_w against w_scale[exp_idx,...]. Remove once found.
             if (blockIdx.x == 0 && blockIdx.y == 0 && lane_id == 0 && warp_id == 0)
+            {
                 printf("DEBUGUPSCALE compute_stage=%d smem_stage=%d exp_idx=%d local_pos0=%d "
                        "scale_x0=%.9f scale_w0=%.9f scale_w1=%.9f\n",
                        compute_stage, smem_stage, exp_idx, (lane_id%4)*2,
                        scale_x[0], scale_w[0], scale_w[1]);
+                // TEMPORARY debug probe, 2026-08-24 -- RAW fp8 activation
+                // bytes for local BM-slot 0 (token 0, per sorted_ids), first
+                // 8 elements of this K-block's 128-wide chunk. i=0..7 is
+                // swizzle-transparent for any S_BITS_UP (the swizzle mask
+                // only touches bits >= 7, all zero for i<128), so these
+                // shared-memory values should be directly, exactly
+                // comparable to x_fp8[0, compute_stage*128 : +8] in Python
+                // with zero decoding needed -- checks whether cp.async
+                // loaded the right raw bytes at all, independent of any
+                // scale. Remove once found.
+                printf("DEBUGUPDATA compute_stage=%d s.x[0:8]=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+                       compute_stage,
+                       float(s.x[smem_stage*XS+0]), float(s.x[smem_stage*XS+1]),
+                       float(s.x[smem_stage*XS+2]), float(s.x[smem_stage*XS+3]),
+                       float(s.x[smem_stage*XS+4]), float(s.x[smem_stage*XS+5]),
+                       float(s.x[smem_stage*XS+6]), float(s.x[smem_stage*XS+7]));
+            }
 
             float tile_acc[TN][TM][4];
             memset(tile_acc, 0, sizeof(tile_acc));
