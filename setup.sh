@@ -147,10 +147,18 @@ print('torch/CUDA compatibility confirmed:', torch.cuda.get_device_name(0))
 echo "=== [7/8] flash-attn + triton ==="
 RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
 NPROC=$(nproc)
-FA_MAX_JOBS=$(( RAM_GB / 4 ))
-[ "$FA_MAX_JOBS" -lt 1 ] && FA_MAX_JOBS=1
+# RAM_GB/4 was tried and OOM-killed TWICE (once on ~50GB-class box, once here
+# with 100GB+ RAM giving MAX_JOBS=28) -- flash-attn's largest backward-pass
+# kernels (hdim256 etc.) spike well past 4GB/job regardless of total system
+# RAM, so a RAM-proportional formula isn't safe for this specific package.
+# Cap hard at 4 unless RAM is enormous (500GB+), rather than scaling with it.
+if [ "$RAM_GB" -ge 500 ]; then
+    FA_MAX_JOBS=8
+else
+    FA_MAX_JOBS=4
+fi
 [ "$FA_MAX_JOBS" -gt "$NPROC" ] && FA_MAX_JOBS=$NPROC
-echo "RAM=${RAM_GB}GB nproc=${NPROC} -> MAX_JOBS=${FA_MAX_JOBS} (caps parallel nvcc compiles to avoid the OOM hit on the H100 box)"
+echo "RAM=${RAM_GB}GB nproc=${NPROC} -> MAX_JOBS=${FA_MAX_JOBS} (flat cap, not RAM-proportional -- see comment above)"
 if ! python3 -c "import flash_attn" 2>/dev/null; then
     # NOTE: unresolved as of 2026-08-23 -- flash-attn's bundled cutlass had
     # real compile errors against CUDA 13.0 on the H200 box (not just the
