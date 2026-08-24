@@ -973,8 +973,8 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
             // bookkeeping); if not, isolates it to the weight side. Remove
             // once found.
             if (blockIdx.x == 0 && blockIdx.y == 0 && lane_id == 0 && warp_id == 0)
-                printf("DEBUGRAWACC compute_stage=%d raw_tile_acc[0][0][0]=%.6f\n",
-                       compute_stage, tile_acc[0][0][0]);
+                printf("DEBUGRAWACC compute_stage=%d raw_tile_acc[0][0][0]=%.6f raw_tile_acc[0][0][2]=%.6f\n",
+                       compute_stage, tile_acc[0][0][0], tile_acc[0][0][2]);
 
             for(int tm = 0; tm < TM; tm++)
             {
@@ -998,6 +998,17 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
             smem_stage++;
         }
         consumer_sync();
+        // TEMPORARY debug probe, 2026-08-24 -- f_acc[0][0][0].x (gate) and
+        // f_acc[0][0][1].x (up) for feature-row 0, token 0, AFTER both
+        // compute_stages have been folded in via __hadd2, but BEFORE SwiGLU.
+        // Every ingredient feeding this (scale_x, scale_w, raw_tile_acc, for
+        // both stages) is already independently verified correct -- this
+        // checks whether the __hadd2/bf16-accumulation bookkeeping across
+        // stages reproduces the same hand-computed sum, isolating that step
+        // from SwiGLU (which comes after this point). Remove once found.
+        if (blockIdx.x == 0 && blockIdx.y == 0 && lane_id == 0 && warp_id == 0)
+            printf("DEBUGFACC f_acc_gate=%.9f f_acc_up=%.9f\n",
+                   __bfloat162float(f_acc[0][0][0].x), __bfloat162float(f_acc[0][0][1].x));
         smem_down<STAGES, WN, BM, BK, BN>& s_d = *reinterpret_cast<smem_down<STAGES, WN, BM, BK, BN>*>(sh);
         float4* block_max = reinterpret_cast<float4*>(s_d.out);
         constexpr float EPS = 1e-10;
