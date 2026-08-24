@@ -6,14 +6,21 @@ weights/activations, a plain-PyTorch reference implementation, cosine
 similarity. No real checkpoint, no engine, no CUDA graphs -- this only
 answers "is the kernel's math right in isolation," nothing more.
 
-UNRUN. Written and reasoned through without any CUDA toolchain available (no
-nvcc on this dev machine) -- cannot be compile-tested here. First real run on
-H200 needs to happen before anything below is trusted, including the
-quantization-contract assumptions baked into the reference implementation
-itself (see the docstrings on quantize_weight_fp8_grouped and
-quantize_activation_fp8_dynamic -- both are this test's own best-effort
-interpretation of what moe_w8a8.cu expects, inferred from reading its TMA
-setup and scale-indexing code, not confirmed against it running).
+PASSING as of 2026-08-24 (cosine_similarity=0.998, threshold 0.99) on a real
+H200 run, after three root-cause fixes: quantize_activation_fp8_dynamic's
+scale shape (was per-token, kernel reads per-(token,128-K-block)),
+moe_w8a8.cu's up-proj scale_w indexing (was by register-half, needs to be by
+warpgroup), and the gate/up weight layout (the kernel needs gate/up
+interleaved every 8 physical rows -- see gate_up_interleave_permutation
+below -- not the conventional contiguous halves this file's synthetic
+weights and reference use natively).
+
+IMPORTANT for real integration: gate_up_interleave_permutation's row
+reordering is currently only applied here, to synthetic test weights. Any
+real checkpoint's gate_up_proj weight needs this SAME permutation applied
+before FP8 quantization, or the kernel will silently produce wrong output
+once wired into the real model. Also config-dependent -- only verified for
+(block_n, warp_n)=(32, 8), not the other supported pair (64, 4).
 
 Unlike the Triton kernel's smoke test, this kernel does the FULL weighted
 combine internally (accumulates each (token, k) pair's contribution into
@@ -21,7 +28,7 @@ combine internally (accumulates each (token, k) pair's contribution into
 caller does afterward) -- so the reference implementation below sums over
 top_k directly too, to stay comparable.
 
-Usage (once a CUDA/Hopper environment exists):
+Usage:
     python layers/smoke_test_moe_w8a8_hopper.py
 """
 import os
@@ -116,14 +123,6 @@ def reference_pipeline(x, gu_fp8, gu_scale, dp_fp8, dp_scale, group_size,
     gate_up = torch.einsum('mtnk,mk->mtn', gu_deq, x.float())   # (M, TK, N)
     gw, uw = gate_up.chunk(2, dim=-1)                             # each (M, TK, N/2)
     h = F.silu(gw) * uw                                           # (M, TK, N/2)
-    # TEMPORARY debug probe, 2026-08-24 -- saves the full pre-down-proj reference
-    # tensor so a separate analysis script can match it against moe_w8a8.cu's own
-    # printf dump of its (row,col) values, without needing to decode wgmma's raw
-    # per-thread output-register fragment layout by hand. Remove once bug is found.
-    # sorted_token_ids encodes (token*top_k + slot), so save h flattened the same way.
-    tk = local_slots.shape[1]
-    torch.save(h.reshape(M * tk, -1).cpu(), "h_reference.pt")
-    print(f"Saved h_reference.pt, shape={tuple(h.reshape(M * tk, -1).shape)}")
     down = torch.einsum('mtkh,mth->mtk', dp_deq, h)               # (M, TK, K)
 
     weighted = down * topk_weights.unsqueeze(-1).float() * scaling_factor
@@ -192,48 +191,12 @@ def main():
     gu_fp8_kernel, gu_scale_kernel = quantize_weight_fp8_grouped(gu_bf16[:, gu_perm, :], group_size)
     print(f"gate_up_proj fp8: {tuple(gu_fp8.shape)}  scale: {tuple(gu_scale.shape)}   "
           f"down_proj fp8: {tuple(dp_fp8.shape)}  scale: {tuple(dp_scale.shape)}")
-    torch.save(gu_fp8_kernel[0, 0, :].float().cpu(), "gu_fp8_e0f0_debug.pt")
-    print(f"Saved gu_fp8_e0f0_debug.pt (expert 0, feature 0, all K): "
-          f"{gu_fp8[0, 0, :8].float().tolist()} ...")
 
     x_bf16 = torch.randn((M, H), dtype=torch.bfloat16, device=device) * 0.02
     x_fp8, x_scale = quantize_activation_fp8_dynamic(x_bf16)
-    torch.save(x_scale.cpu(), "x_scale_debug.pt")
-    torch.save(x_fp8.float().cpu(), "x_fp8_debug.pt")
-    print(f"Saved x_scale_debug.pt, shape={tuple(x_scale.shape)}")
-    print(f"Saved x_fp8_debug.pt, shape={tuple(x_fp8.shape)}  x_fp8[0,:8]={x_fp8[0,:8].float().tolist()}")
 
     local_slots = torch.randint(0, E, (M, top_k), dtype=torch.int32, device=device)
     topk_weights = torch.softmax(torch.randn(M, top_k, device=device), dim=-1)
-
-    # TEMPORARY debug probe, 2026-08-24 -- correlate per-token expert routing
-    # against the per-row corruption pattern seen in kernel_out (rows 0-7 fine,
-    # 8-15 all blown up to ~5-7.6 magnitude vs ref's ~1e-5). If every corrupted
-    # row shares a common expert somewhere in its 4 slots, that's routing/expert-
-    # block-specific. If there's no such correlation, the row-8 boundary is
-    # structural (an index/addressing artifact), not content-driven. Remove
-    # once the bug is found.
-    print(f"local_slots (per-token expert routing, {M}x{top_k}):")
-    for m in range(M):
-        print(f"  token {m:2d}: experts={local_slots[m].tolist()}")
-
-    # TEMPORARY debug probe, 2026-08-24 -- moe_align_block_size groups tokens
-    # by EXPERT (torch.argsort(flat_ids, stable=True) in moe_align_block_size.py),
-    # so sorted_token_ids[warpM*BM + x_row] is NOT x_row / not sequential --
-    # it's whatever (token*top_k+slot) flat index landed in that sorted/padded
-    # slot after expert-grouping. analyze_wgmma_mapping.py's DEBUGXY probe
-    # reports x_row (a LOCAL position within one block's BM slots), which must
-    # be decoded through sorted_ids before indexing into h_reference.pt's rows
-    # -- comparing ref[x_row, x_col] directly (as the same-coordinate check
-    # first did) silently assumes sorted_ids is the identity permutation,
-    # which moe_align_block_size does not guarantee and this random-routing
-    # test almost certainly violates. Save it so the analysis script can do
-    # the decode instead of guessing. Remove once the bug is found.
-    sorted_ids_probe, _, _ = _align(local_slots, block_m, E)
-    torch.save(sorted_ids_probe.cpu(), "sorted_ids_debug.pt")
-    print(f"Saved sorted_ids_debug.pt, shape={tuple(sorted_ids_probe.shape)}, "
-          f"first block (block 0) local-slot -> flat(token*top_k+slot): "
-          f"{sorted_ids_probe[:block_m].tolist()}")
 
     # ---- Reference path (uses the ORIGINAL bf16 weights/activations, not
     # the fp8-quantized copies, so this check validates the KERNEL's
@@ -291,27 +254,6 @@ def main():
           f"mean={row_cos.mean().item():.4f}")
     print(f"per-row cosine (all {M} rows): {row_cos.tolist()}")
 
-    # TEMPORARY debug probe, 2026-08-24 -- mean_abs=0.91/max_abs=7.59 are WAY
-    # bigger than what ref_out[0:2, :8] shows (all ~1e-6, same order as ref) --
-    # so the blowup isn't uniform across the tensor, it's concentrated
-    # somewhere else. Locate it: top-K |kernel_out| entries with their
-    # (row,col), plus per-row and per-col max, to see if it's a few scattered
-    # cells, whole rows, or whole columns (a whole-column pattern would point
-    # at a specific out_col / st_matrix_x4_trans address; whole-row would
-    # point at specific tokens/expert-slots; scattered would look more like
-    # uninitialized/aliased shared memory). Remove once the bug is found.
-    flat_abs = ker_f.abs().reshape(-1)
-    topk = torch.topk(flat_abs, k=min(20, flat_abs.numel()))
-    print(f"\nTop-20 |kernel_out| entries (value, row, col):")
-    for v, idx in zip(topk.values.tolist(), topk.indices.tolist()):
-        r, c = idx // ker_f.shape[1], idx % ker_f.shape[1]
-        print(f"  {v:.6f}  (row={r}, col={c})  ref_at_same_coord={ref_f[r, c].item():.6e}")
-    row_max = ker_f.abs().max(dim=1).values
-    col_max = ker_f.abs().max(dim=0).values
-    print(f"per-row max_abs: {row_max.tolist()}")
-    print(f"per-col max_abs (first 32 cols): {col_max[:32].tolist()}")
-    print(f"per-col max_abs: overall min={col_max.min().item():.6f} max={col_max.max().item():.6f} "
-          f"argmax_col={col_max.argmax().item()}")
     # Looser threshold than the INT8 kernel's own smoke test (0.999) -- FP8
     # e4m3 has ~2-3 decimal digits of precision on BOTH weights AND
     # activations (true W8A8, unlike INT8's weight-only scheme), so more

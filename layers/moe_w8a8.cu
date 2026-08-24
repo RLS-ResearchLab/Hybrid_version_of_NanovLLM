@@ -896,40 +896,6 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
             scale_w[0] = sw.x;
             scale_w[1] = sw.y;
 
-            // TEMPORARY debug probe, 2026-08-24 -- the down-proj combine
-            // checked out clean twice (s_w/token_scale both sane, internally
-            // consistent), so the remaining ~145% same-coordinate error must
-            // be upstream: either the up-proj's OWN scale read-back (this
-            // shared-memory round-trip for scale_x_up/scale_w_up) or the raw
-            // wgmma K-reduction itself. Dumps local BM-position (decode via
-            // sorted_ids_debug.pt, same technique as DEBUGXY), smem_stage
-            // (the K-block index), and both scales, so Python can cross-check
-            // scale_x directly against the real x_scale[token,k_block] value
-            // and scale_w against w_scale[exp_idx,...]. Remove once found.
-            if (blockIdx.x == 0 && blockIdx.y == 0 && lane_id == 0 && warp_id == 0)
-            {
-                printf("DEBUGUPSCALE compute_stage=%d smem_stage=%d exp_idx=%d local_pos0=%d "
-                       "scale_x0=%.9f scale_w0=%.9f scale_w1=%.9f\n",
-                       compute_stage, smem_stage, exp_idx, (lane_id%4)*2,
-                       scale_x[0], scale_w[0], scale_w[1]);
-                // TEMPORARY debug probe, 2026-08-24 -- RAW fp8 activation
-                // bytes for local BM-slot 0 (token 0, per sorted_ids), first
-                // 8 elements of this K-block's 128-wide chunk. i=0..7 is
-                // swizzle-transparent for any S_BITS_UP (the swizzle mask
-                // only touches bits >= 7, all zero for i<128), so these
-                // shared-memory values should be directly, exactly
-                // comparable to x_fp8[0, compute_stage*128 : +8] in Python
-                // with zero decoding needed -- checks whether cp.async
-                // loaded the right raw bytes at all, independent of any
-                // scale. Remove once found.
-                printf("DEBUGUPDATA compute_stage=%d s.x[0:8]=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
-                       compute_stage,
-                       float(s.x[smem_stage*XS+0]), float(s.x[smem_stage*XS+1]),
-                       float(s.x[smem_stage*XS+2]), float(s.x[smem_stage*XS+3]),
-                       float(s.x[smem_stage*XS+4]), float(s.x[smem_stage*XS+5]),
-                       float(s.x[smem_stage*XS+6]), float(s.x[smem_stage*XS+7]));
-            }
-
             float tile_acc[TN][TM][4];
             memset(tile_acc, 0, sizeof(tile_acc));
             for (int tn = 0; tn < TN; tn++)
@@ -958,41 +924,15 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
             warpgroup_wait();
             arrive(bar + STAGES + smem_stage);
 
-            // TEMPORARY debug probe, 2026-08-24 -- raw, UNSCALED wgmma
-            // accumulator for (tn=0,tm=0,lane=0,warp=0) = feature-row 0,
-            // token col0=0 (local BM-slot 0 -> token 0, per sorted_ids),
-            // reduced over this compute_stage's 128-wide K-chunk. Both
-            // activation data (s.x) and its scale round-tripped byte-exact
-            // already, so this checks the one remaining unverified piece:
-            // does the weight data (TMA-loaded, hardware-swizzled -- can't
-            // be read back as a plain linear index the way s.x could) times
-            // the verified-correct activation actually reduce to what an
-            // independent Python dot product over gu_fp8[0,0,k0:k0+128] @
-            // x_fp8[0,k0:k0+128] gives? If they match, weights + wgmma are
-            // BOTH cleared and the bug is elsewhere (SiLU combine, f_acc
-            // bookkeeping); if not, isolates it to the weight side. Remove
-            // once found.
-            if (blockIdx.x == 0 && blockIdx.y == 0 && lane_id == 0 && warp_id == 0)
-                printf("DEBUGRAWACC compute_stage=%d raw_tile_acc[0][0][0]=%.6f raw_tile_acc[0][0][2]=%.6f\n",
-                       compute_stage, tile_acc[0][0][0], tile_acc[0][0][2]);
-
-            // FIXED 2026-08-24 -- scale_w[0]/scale_w[1] are the block's two
-            // 128-row scale blocks (physical N-rows [blockIdx.x*256,+128) and
-            // [+128,+256)). Both wgmma fragment halves a thread owns (row0
-            // and row0+8, 8 rows apart) always land in the SAME 128-row half
-            // -- which half is determined by warpgroup (warp_id/4), not by
-            // which register pair (0,1 vs 2,3) this is. The old code applied
-            // scale_w[0] to the first pair and scale_w[1] to the second
-            // unconditionally, which is only correct for warpgroup 0; for
-            // warpgroup 1 (warp_id/4==1) BOTH pairs physically belong to
-            // scale_w[1], not one from each. The down-proj's analogous scale
-            // load (s_w[...] a few hundred lines down) already indexes by
-            // (warp_id/4) correctly -- this brings the up-proj side in line
-            // with it. Found via direct hand-verification against
-            // independently-computed reference values (see conversation) --
-            // confirmed by every OTHER input to this formula (scale_x,
-            // tile_acc, the two-stage accumulation) matching hand-computed
-            // expectations first, isolating this as the remaining error.
+            // scale_w[0]/scale_w[1] are the block's two 128-row scale blocks
+            // (physical N-rows [blockIdx.x*256,+128) and [+128,+256)). Both
+            // wgmma fragment halves a thread owns (row0 and row0+8, 8 rows
+            // apart) always land in the SAME 128-row half -- which half is
+            // determined by warpgroup (warp_id/4), not by which register
+            // pair (0,1 vs 2,3) this is, so index by warpgroup rather than
+            // splitting scale_w[0]/[1] across the two register pairs. The
+            // down-proj's analogous scale load (s_w[...] below) already
+            // indexes by (warp_id/4).
             const float scale_w_local = scale_w[warp_id/4];
             for(int tm = 0; tm < TM; tm++)
             {
@@ -1016,17 +956,6 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
             smem_stage++;
         }
         consumer_sync();
-        // TEMPORARY debug probe, 2026-08-24 -- f_acc[0][0][0].x (gate) and
-        // f_acc[0][0][1].x (up) for feature-row 0, token 0, AFTER both
-        // compute_stages have been folded in via __hadd2, but BEFORE SwiGLU.
-        // Every ingredient feeding this (scale_x, scale_w, raw_tile_acc, for
-        // both stages) is already independently verified correct -- this
-        // checks whether the __hadd2/bf16-accumulation bookkeeping across
-        // stages reproduces the same hand-computed sum, isolating that step
-        // from SwiGLU (which comes after this point). Remove once found.
-        if (blockIdx.x == 0 && blockIdx.y == 0 && lane_id == 0 && warp_id == 0)
-            printf("DEBUGFACC f_acc_gate=%.9f f_acc_up=%.9f\n",
-                   __bfloat162float(f_acc[0][0][0].x), __bfloat162float(f_acc[0][0][1].x));
         smem_down<STAGES, WN, BM, BK, BN>& s_d = *reinterpret_cast<smem_down<STAGES, WN, BM, BK, BN>*>(sh);
         float4* block_max = reinterpret_cast<float4*>(s_d.out);
         constexpr float EPS = 1e-10;
@@ -1077,14 +1006,6 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
                     int x_row = tm*8 + (lane_id%4)*2 + t;
                     int x_col = (warp_id/4)*(TN*32) + tn*32 + (warp_id%4)*8 + lane_id/4;
                     float val = __bfloat162float(t == 0 ? f_acc[tn][tm][0].x : f_acc[tn][tm][0].y);
-                    // TEMPORARY debug probe, 2026-08-24 -- dumps the correctly-laid-out
-                    // (already un-swizzled, human/Python-readable) pre-down-proj SiLU-gated
-                    // activation at one known coordinate, to compare directly against
-                    // reference_pipeline's `h[0,0]` without needing to decode wgmma's raw
-                    // per-thread output-register fragment layout. Remove once the bug is found.
-                    if (blockIdx.x == 0 && blockIdx.y == 0 && (x_row == 0 || x_col == 0))
-                        printf("DEBUGXY row=%d col=%d val=%.9f lane=%d warp=%d tm=%d tn=%d t=%d scale=%.9f\n",
-                               x_row, x_col, val, lane_id, warp_id, tm, tn, t, token_scale[tm][t]);
                     float q = val / token_scale[tm][t];
                     val = fminf(fmaxf(q, fp8_min), fp8_max);
                     int i = x_row*BK2 + x_col;
@@ -1159,24 +1080,6 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
                     {
                         int s = t%2;
                         out_tile[tn2/2][tm][t] = __float2bfloat16_rn(token_scale[tm][s]*tile_acc[tn2 + t/4][tm][t%4]*s_w[tn2/2]);
-                        // TEMPORARY debug probe, 2026-08-24 -- breaks down the
-                        // down-proj output combine (out = token_scale * raw_wgmma
-                        // * s_w) into its 3 factors for one fixed coordinate, to
-                        // find which factor is responsible for the ~227,000x
-                        // final-output magnitude blowup seen even at
-                        // n_stages_down=1 (so it's not a multi-stage bug -- the
-                        // single-stage case is already wrong). Compare s_w against
-                        // dp_scale's expected magnitude and token_scale against
-                        // what quantize_activation_fp8_dynamic-style scales should
-                        // look like (both should be small, roughly weight/activation
-                        // std over 448, NOT anywhere near 1.0). Remove once found.
-                        if (blockIdx.x == 0 && blockIdx.y == 0 && lane_id == 0 && warp_id == 0
-                            && tn2 == 0 && tm == 0 && t == 0)
-                            printf("DEBUGDOWN compute_stage=%d s_w=%.9f token_scale=%.9f "
-                                   "raw_tile_acc=%.9f out=%.9f\n",
-                                   compute_stage, s_w[tn2/2], token_scale[tm][s],
-                                   tile_acc[tn2 + t/4][tm][t%4],
-                                   __bfloat162float(out_tile[tn2/2][tm][t]));
                     }
                 }
             }
@@ -1200,20 +1103,6 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
                 if (token_src < M)
                 {
                     int row = threadIdx.x - PRODUCER_THREADS;
-                    // TEMPORARY debug probe, 2026-08-24 -- every VALID
-                    // (non-padding) final add into `out`, with which block/
-                    // expert produced it and a sample of what's about to be
-                    // added, to find why tokens 8-15 end up ~5-7.6 magnitude
-                    // (vs ref's ~1e-5) while 0-7 don't -- routing content
-                    // (local_slots) showed no clean single-expert
-                    // correlation, so this checks whether it's block-
-                    // specific, a double-add (same token_src from multiple
-                    // blocks/stages unexpectedly), or bad values already in
-                    // s_d.out before the add. Remove once found.
-                    printf("DEBUGOUT blockIdx.x=%d blockIdx.y=%d exp_idx=%d compute_stage=%d "
-                           "row=%d token_src=%d s_d.out[row*PAD]=%.6f s_d.out[row*PAD+1]=%.6f\n",
-                           blockIdx.x, blockIdx.y, exp_idx, compute_stage, row, token_src,
-                           __bfloat162float(s_d.out[row*PAD]), __bfloat162float(s_d.out[row*PAD+1]));
                     cuda::ptx::cp_reduce_async_bulk(
                             cuda::ptx::space_global,
                             cuda::ptx::space_shared,

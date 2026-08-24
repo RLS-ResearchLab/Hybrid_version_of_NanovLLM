@@ -22,6 +22,20 @@
 //     (K2, N2*num_experts) with K2=N/2, N2=K, same convention. Getting this
 //     layout wrong does not crash -- it silently reads the wrong bytes.
 //
+//   - `w`'s N axis (the fused gate_up_proj output, 2*moe_intermediate_size)
+//     is NOT the conventional contiguous gate=[0,N/2)/up=[N/2,N) layout.
+//     The up-proj's SwiGLU combine pairs wgmma accumulator register c0
+//     (physical weight-row r) with c2 (row r+8) as (gate, up) for the same
+//     logical down-proj-input feature, so gate and up must be interleaved
+//     every 8 physical rows -- a config-dependent permutation (see
+//     layers/smoke_test_moe_w8a8_hopper.py's gate_up_interleave_permutation,
+//     verified for block_n/warp_n=(32,8) only). Confirmed 2026-08-24: a
+//     contiguous-layout weight silently produces plausible-magnitude but
+//     wrong (near-zero cosine similarity) output, no crash, no error --
+//     REAL checkpoints must have this permutation applied to gate_up_proj
+//     before FP8 quantization, or this kernel will be silently wrong once
+//     wired into the real model.
+//
 //   - `w_scale`/`w2_scale` are per-128x128-block scales (block_shape={128,128}
 //     is hardcoded in the kernel), consistent with this project's existing
 //     group_size=128 INT8 scheme on Ampere -- NOT vLLM's original whole-row
@@ -44,11 +58,22 @@
 //     tensors, same dtypes, same semantics), so that piece should be
 //     reusable as-is once this is wired up.
 //
-//   - Never validated against a reference. Do not trust output correctness
-//     until it's been checked in isolation (see H200_test_day_checklist.md /
-//     the smoke-test pattern layers/smoke_test_fused_moe_triton.py already
-//     established for the Ampere kernel) -- this header documents the
-//     intended contract, not a verified one.
+//   - `x_scale` is per-(token, 128-K-block), shape (M, K/128) -- the SAME
+//     128-block convention as w_scale/w2_scale, not a single per-token
+//     scalar. Getting this wrong doesn't crash either: for tokens whose
+//     stride*token_id lands past the tensor's actual size it reads
+//     out-of-bounds global memory silently (confirmed 2026-08-24 -- this was
+//     the cause of a ~227,000x output magnitude blowup before being fixed
+//     in layers/moe_w8a8_hopper_quantize.py's quantize_activation_fp8_dynamic).
+//
+//   - Validated in isolation 2026-08-24 (layers/smoke_test_moe_w8a8_hopper.py,
+//     cosine_similarity=0.998, compute-sanitizer memcheck clean) for
+//     block_n/warp_n=(32,8), M=16, top_k=4, E=8, H=MI=256 -- small synthetic
+//     dims, not production scale, and NOT yet run through GSM8K
+//     non-regression or wired into the real model. Still worth treating with
+//     real skepticism outside that specific validated configuration,
+//     especially block_n/warp_n=(64,4) (never exercised) and the gate/up
+//     permutation above (config-dependent, only derived/checked for (32,8)).
 
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
