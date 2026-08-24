@@ -976,21 +976,39 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
                 printf("DEBUGRAWACC compute_stage=%d raw_tile_acc[0][0][0]=%.6f raw_tile_acc[0][0][2]=%.6f\n",
                        compute_stage, tile_acc[0][0][0], tile_acc[0][0][2]);
 
+            // FIXED 2026-08-24 -- scale_w[0]/scale_w[1] are the block's two
+            // 128-row scale blocks (physical N-rows [blockIdx.x*256,+128) and
+            // [+128,+256)). Both wgmma fragment halves a thread owns (row0
+            // and row0+8, 8 rows apart) always land in the SAME 128-row half
+            // -- which half is determined by warpgroup (warp_id/4), not by
+            // which register pair (0,1 vs 2,3) this is. The old code applied
+            // scale_w[0] to the first pair and scale_w[1] to the second
+            // unconditionally, which is only correct for warpgroup 0; for
+            // warpgroup 1 (warp_id/4==1) BOTH pairs physically belong to
+            // scale_w[1], not one from each. The down-proj's analogous scale
+            // load (s_w[...] a few hundred lines down) already indexes by
+            // (warp_id/4) correctly -- this brings the up-proj side in line
+            // with it. Found via direct hand-verification against
+            // independently-computed reference values (see conversation) --
+            // confirmed by every OTHER input to this formula (scale_x,
+            // tile_acc, the two-stage accumulation) matching hand-computed
+            // expectations first, isolating this as the remaining error.
+            const float scale_w_local = scale_w[warp_id/4];
             for(int tm = 0; tm < TM; tm++)
             {
                 for(int tn = 0; tn < TN; tn++)
                 {
                     f_acc[tn][tm][0] = __hadd2(f_acc[tn][tm][0],
                             __floats2bfloat162_rn(
-                                scale_w[0] * scale_x[tm*2] * tile_acc[tn][tm][0],
-                                scale_w[0] * scale_x[tm*2 + 1] * tile_acc[tn][tm][1]
+                                scale_w_local * scale_x[tm*2] * tile_acc[tn][tm][0],
+                                scale_w_local * scale_x[tm*2 + 1] * tile_acc[tn][tm][1]
                                 )
                             );
 
                     f_acc[tn][tm][1] = __hadd2(f_acc[tn][tm][1],
                             __floats2bfloat162_rn(
-                                scale_w[1] * scale_x[tm*2] * tile_acc[tn][tm][2],
-                                scale_w[1] * scale_x[tm*2 + 1] * tile_acc[tn][tm][3]
+                                scale_w_local * scale_x[tm*2] * tile_acc[tn][tm][2],
+                                scale_w_local * scale_x[tm*2 + 1] * tile_acc[tn][tm][3]
                                 )
                             );
                 }

@@ -44,6 +44,59 @@ from moe_w8a8_hopper_quantize import (                          # noqa: E402
 )
 
 
+def gate_up_interleave_permutation(MI, block_n=32, warp_n=8):
+    """Row-permutation for moe_w8a8.cu's up-proj wgmma, found 2026-08-24.
+
+    The kernel's SwiGLU combine pairs wgmma accumulator register c0
+    (physical gate_up_proj weight-row r) with c2 (row r+8) as (gate, up) for
+    the SAME logical down-proj-input feature -- derived from the Hopper
+    wgmma m64nNk32 F32-accumulator fragment layout (thread 0 owns
+    (0,0),(0,1),(8,0),(8,1), repeating every 8 N-columns) combined with this
+    kernel's own warpgroup/tn/warp_local tiling of the N axis. That means
+    the kernel needs gate and up interleaved every 8 physical rows, NOT laid
+    out as the conventional contiguous halves (gate=[0,MI), up=[MI,2*MI))
+    that both this test's naive synthetic weights and any standard
+    gate_up_proj checkpoint use. Confirmed empirically: hand-computing
+    SwiGLU from the kernel's own (independently verified-correct) gate/up
+    f_acc values under the contiguous assumption gave a value ~59x off and
+    opposite-signed from the reference at the matching coordinate.
+
+    Returns a LongTensor `perm` of length 2*MI such that indexing a
+    contiguous-layout (2*MI, ...) weight as `w[perm]` produces the
+    interleaved layout the kernel needs. CONFIG-DEPENDENT: this permutation
+    is only valid for the (block_n, warp_n) pair the kernel is actually
+    launched with -- recompute it if those change.
+    """
+    rows_per_block = block_n * warp_n
+    rows_per_warpgroup = block_n * 4
+    rows_per_tn = 64
+    logical_per_block = rows_per_block // 2
+    logical_per_warpgroup = logical_per_block // 2
+    N = 2 * MI
+    assert N % rows_per_block == 0, (
+        f"2*MI={N} must be divisible by block_n*warp_n={rows_per_block}"
+    )
+    num_blocks = N // rows_per_block
+
+    perm = torch.empty(N, dtype=torch.long)
+    for block in range(num_blocks):
+        for p_local in range(rows_per_block):
+            warpgroup = p_local // rows_per_warpgroup
+            p_in_wg = p_local % rows_per_warpgroup
+            tn = p_in_wg // rows_per_tn
+            p_in_tn = p_in_wg % rows_per_tn
+            band = p_in_tn // 16       # warp_local, 0-3
+            offset = p_in_tn % 16      # 0-15
+            is_gate = offset < 8
+            lane4 = offset % 8
+            logical_in_tn = band * 8 + lane4   # 0-31 (within this tn)
+            logical_feature = (block * logical_per_block + warpgroup * logical_per_warpgroup
+                                + tn * 32 + logical_in_tn)
+            p_global = block * rows_per_block + p_local
+            perm[p_global] = logical_feature if is_gate else (MI + logical_feature)
+    return perm
+
+
 def reference_pipeline(x, gu_fp8, gu_scale, dp_fp8, dp_scale, group_size,
                         local_slots, topk_weights, scaling_factor):
     """Plain PyTorch reference: dequantize the gathered per-(token,k) expert
@@ -117,27 +170,29 @@ def main():
     M = 16               # concurrency / token count
     group_size = 128
     scaling_factor = 1.0
-    block_m, block_n, warp_n, stages = 32, 32, 8, 1
-    # TEMPORARY, 2026-08-24 -- stages dropped from 2 to 1 to cleanly isolate the
-    # up-proj pipelining theory: at H=256 (n_stages_up=2, n_stages_down=1),
-    # STAGES=2 made the up-proj loop degenerate (STAGES == n_stages_up, buffer
-    # never wraps around). STAGES=1 forces a real wraparound in the up-proj
-    # loop (n_stages_up=2 > STAGES=1) while leaving n_stages_down=1 untouched
-    # -- unlike the H=512 test, which moved BOTH n_stages_up and n_stages_down
-    # at once (both are pure functions of H) and produced a confounded result
-    # (a ~227,000x-too-large output, likely a SEPARATE bug only reachable once
-    # n_stages_down>1). Revert to 2 once this specific theory is settled.
+    block_m, block_n, warp_n, stages = 32, 32, 8, 2
+    # Pipelining-depth theory (STAGES vs n_stages_up) tested and settled
+    # 2026-08-24 -- dropping stages to 1 didn't move cosine at all, so it
+    # wasn't the cause. Reverted to the default stages=2 here.
 
     print(f"Config: E={E} H={H} MI={MI} top_k={top_k} M={M} group_size={group_size} "
           f"block_m={block_m} block_n={block_n} warp_n={warp_n} stages={stages}")
 
     gu_bf16 = torch.randn((E, 2 * MI, H), dtype=torch.bfloat16, device=device) * 0.02
     dp_bf16 = torch.randn((E, H, MI), dtype=torch.bfloat16, device=device) * 0.02
+    # gu_fp8/gu_scale (CONTIGUOUS gate=[0,MI)/up=[MI,2*MI) layout) is what the
+    # reference pipeline's gate_up.chunk(2, dim=-1) expects. The kernel needs
+    # a SEPARATE, differently-laid-out quantization of the SAME logical
+    # weight -- see gate_up_interleave_permutation's docstring. Same values,
+    # different physical row order; dp_fp8/dp_scale need no such split since
+    # down_proj isn't a fused gate+up projection.
     gu_fp8, gu_scale = quantize_weight_fp8_grouped(gu_bf16, group_size)
     dp_fp8, dp_scale = quantize_weight_fp8_grouped(dp_bf16, group_size)
+    gu_perm = gate_up_interleave_permutation(MI, block_n, warp_n).to(device)
+    gu_fp8_kernel, gu_scale_kernel = quantize_weight_fp8_grouped(gu_bf16[:, gu_perm, :], group_size)
     print(f"gate_up_proj fp8: {tuple(gu_fp8.shape)}  scale: {tuple(gu_scale.shape)}   "
           f"down_proj fp8: {tuple(dp_fp8.shape)}  scale: {tuple(dp_scale.shape)}")
-    torch.save(gu_fp8[0, 0, :].float().cpu(), "gu_fp8_e0f0_debug.pt")
+    torch.save(gu_fp8_kernel[0, 0, :].float().cpu(), "gu_fp8_e0f0_debug.pt")
     print(f"Saved gu_fp8_e0f0_debug.pt (expert 0, feature 0, all K): "
           f"{gu_fp8[0, 0, :8].float().tolist()} ...")
 
@@ -195,14 +250,14 @@ def main():
     # ---- Kernel path ----
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    kernel_out = kernel_pipeline(x_fp8, x_scale, gu_fp8, gu_scale, dp_fp8, dp_scale,
+    kernel_out = kernel_pipeline(x_fp8, x_scale, gu_fp8_kernel, gu_scale_kernel, dp_fp8, dp_scale,
                                   local_slots, topk_weights, top_k, E, scaling_factor,
                                   block_m, block_n, warp_n, stages)
     torch.cuda.synchronize()
     kernel_s = time.perf_counter() - t0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    kernel_out = kernel_pipeline(x_fp8, x_scale, gu_fp8, gu_scale, dp_fp8, dp_scale,
+    kernel_out = kernel_pipeline(x_fp8, x_scale, gu_fp8_kernel, gu_scale_kernel, dp_fp8, dp_scale,
                                   local_slots, topk_weights, top_k, E, scaling_factor,
                                   block_m, block_n, warp_n, stages)
     torch.cuda.synchronize()
