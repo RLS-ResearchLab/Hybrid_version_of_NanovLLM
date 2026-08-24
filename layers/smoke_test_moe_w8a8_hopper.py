@@ -161,6 +161,27 @@ def main():
     max_abs_err = (ref_out.float() - kernel_out.float()).abs().max().item()
     print(f"\nCorrectness (kernel vs. bf16-ground-truth reference): "
           f"cosine_similarity={cos:.6f}  max_abs_err={max_abs_err:.6f}")
+
+    # ---- Failure-mode diagnostics (added after first real-hardware FAIL,
+    # 2026-08-24) -- magnitude/NaN/sample-value evidence to distinguish
+    # "garbage/uninitialized read" vs "scale bug" vs "all-zero (silent
+    # dispatch no-op)" vs "NaN propagation" without tracing the whole kernel
+    # blind. Cheap, keep even after this bug is found. ----
+    ref_f, ker_f = ref_out.float(), kernel_out.float()
+    print(f"ref_out:    mean_abs={ref_f.abs().mean().item():.6f}  max_abs={ref_f.abs().max().item():.6f}  "
+          f"has_nan={torch.isnan(ref_f).any().item()}  has_inf={torch.isinf(ref_f).any().item()}")
+    print(f"kernel_out: mean_abs={ker_f.abs().mean().item():.6f}  max_abs={ker_f.abs().max().item():.6f}  "
+          f"has_nan={torch.isnan(ker_f).any().item()}  has_inf={torch.isinf(ker_f).any().item()}  "
+          f"all_zero={(ker_f == 0).all().item()}  frac_zero={(ker_f == 0).float().mean().item():.4f}")
+    print(f"ref_out[0, :8]    = {ref_f[0, :8].tolist()}")
+    print(f"kernel_out[0, :8] = {ker_f[0, :8].tolist()}")
+    print(f"ref_out[1, :8]    = {ref_f[1, :8].tolist()}")
+    print(f"kernel_out[1, :8] = {ker_f[1, :8].tolist()}")
+    # per-row cosine, to see if it's uniformly bad or only some rows/tokens
+    row_cos = F.cosine_similarity(ref_f, ker_f, dim=1)
+    print(f"per-row cosine: min={row_cos.min().item():.4f} max={row_cos.max().item():.4f} "
+          f"mean={row_cos.mean().item():.4f}")
+    print(f"per-row cosine (all {M} rows): {row_cos.tolist()}")
     # Looser threshold than the INT8 kernel's own smoke test (0.999) -- FP8
     # e4m3 has ~2-3 decimal digits of precision on BOTH weights AND
     # activations (true W8A8, unlike INT8's weight-only scheme), so more
