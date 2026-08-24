@@ -67,7 +67,8 @@ def reference_pipeline(x, gu_fp8, gu_scale, dp_fp8, dp_scale, group_size,
     # same coordinate (token=0, k=0) right before down-proj, to directly compare
     # against the kernel's pre-down-proj intermediate without decoding wgmma's raw
     # register layout. Remove once the bug is found.
-    print(f"DEBUG reference pre-down-proj h[token=0,k=0] = {h[0, 0, 0].item():.9f}")
+    print(f"DEBUG reference pre-down-proj h[token=0,k=0:4] = {h[0, 0, :4].tolist()}")
+    print(f"DEBUG reference pre-down-proj h[token=0,:] full row = {h[0, 0, :].tolist()}")
     down = torch.einsum('mtkh,mth->mtk', dp_deq, h)               # (M, TK, K)
 
     weighted = down * topk_weights.unsqueeze(-1).float() * scaling_factor

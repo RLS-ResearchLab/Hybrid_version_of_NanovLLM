@@ -1001,9 +1001,9 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
                     // activation at one known coordinate, to compare directly against
                     // reference_pipeline's `h[0,0]` without needing to decode wgmma's raw
                     // per-thread output-register fragment layout. Remove once the bug is found.
-                    if (blockIdx.x == 0 && blockIdx.y == 0 && x_row == 0 && x_col == 0)
-                        printf("DEBUG pre-down-proj h[token=0,k=0] = %.9f  (token_scale[%d][%d]=%.9f)\n",
-                               val, tm, t, token_scale[tm][t]);
+                    if (blockIdx.x == 0 && blockIdx.y == 0 && x_row == 0 && x_col < 4)
+                        printf("DEBUG pre-down-proj h[token=0,k=%d] = %.9f  (token_scale[%d][%d]=%.9f)\n",
+                               x_col, val, tm, t, token_scale[tm][t]);
                     float q = val / token_scale[tm][t];
                     val = fminf(fmaxf(q, fp8_min), fp8_max);
                     int i = x_row*BK2 + x_col;
