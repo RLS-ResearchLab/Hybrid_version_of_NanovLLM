@@ -993,11 +993,19 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
             {
                 for(int tn = 0; tn < TN; tn++)
                 {
-                    float val = __bfloat162float(t == 0 ? f_acc[tn][tm][0].x : f_acc[tn][tm][0].y);
-                    float q = val / token_scale[tm][t];
-                    val = fminf(fmaxf(q, fp8_min), fp8_max);
                     int x_row = tm*8 + (lane_id%4)*2 + t;
                     int x_col = (warp_id/4)*(TN*32) + tn*32 + (warp_id%4)*8 + lane_id/4;
+                    float val = __bfloat162float(t == 0 ? f_acc[tn][tm][0].x : f_acc[tn][tm][0].y);
+                    // TEMPORARY debug probe, 2026-08-24 -- dumps the correctly-laid-out
+                    // (already un-swizzled, human/Python-readable) pre-down-proj SiLU-gated
+                    // activation at one known coordinate, to compare directly against
+                    // reference_pipeline's `h[0,0]` without needing to decode wgmma's raw
+                    // per-thread output-register fragment layout. Remove once the bug is found.
+                    if (blockIdx.x == 0 && blockIdx.y == 0 && x_row == 0 && x_col == 0)
+                        printf("DEBUG pre-down-proj h[token=0,k=0] = %.9f  (token_scale[%d][%d]=%.9f)\n",
+                               val, tm, t, token_scale[tm][t]);
+                    float q = val / token_scale[tm][t];
+                    val = fminf(fmaxf(q, fp8_min), fp8_max);
                     int i = x_row*BK2 + x_col;
                     int swizzled = swizzle<S_BITS_DOWN>(i);
                     s_d.x[swizzled] = fp8(val);

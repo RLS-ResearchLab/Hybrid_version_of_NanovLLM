@@ -63,6 +63,11 @@ def reference_pipeline(x, gu_fp8, gu_scale, dp_fp8, dp_scale, group_size,
     gate_up = torch.einsum('mtnk,mk->mtn', gu_deq, x.float())   # (M, TK, N)
     gw, uw = gate_up.chunk(2, dim=-1)                             # each (M, TK, N/2)
     h = F.silu(gw) * uw                                           # (M, TK, N/2)
+    # TEMPORARY debug probe, 2026-08-24 -- matches moe_w8a8.cu's own printf of the
+    # same coordinate (token=0, k=0) right before down-proj, to directly compare
+    # against the kernel's pre-down-proj intermediate without decoding wgmma's raw
+    # register layout. Remove once the bug is found.
+    print(f"DEBUG reference pre-down-proj h[token=0,k=0] = {h[0, 0, 0].item():.9f}")
     down = torch.einsum('mtkh,mth->mtk', dp_deq, h)               # (M, TK, K)
 
     weighted = down * topk_weights.unsqueeze(-1).float() * scaling_factor
