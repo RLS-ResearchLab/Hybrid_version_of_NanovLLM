@@ -117,7 +117,16 @@ def main():
     M = 16               # concurrency / token count
     group_size = 128
     scaling_factor = 1.0
-    block_m, block_n, warp_n, stages = 32, 32, 8, 2
+    block_m, block_n, warp_n, stages = 32, 32, 8, 1
+    # TEMPORARY, 2026-08-24 -- stages dropped from 2 to 1 to cleanly isolate the
+    # up-proj pipelining theory: at H=256 (n_stages_up=2, n_stages_down=1),
+    # STAGES=2 made the up-proj loop degenerate (STAGES == n_stages_up, buffer
+    # never wraps around). STAGES=1 forces a real wraparound in the up-proj
+    # loop (n_stages_up=2 > STAGES=1) while leaving n_stages_down=1 untouched
+    # -- unlike the H=512 test, which moved BOTH n_stages_up and n_stages_down
+    # at once (both are pure functions of H) and produced a confounded result
+    # (a ~227,000x-too-large output, likely a SEPARATE bug only reachable once
+    # n_stages_down>1). Revert to 2 once this specific theory is settled.
 
     print(f"Config: E={E} H={H} MI={MI} top_k={top_k} M={M} group_size={group_size} "
           f"block_m={block_m} block_n={block_n} warp_n={warp_n} stages={stages}")
