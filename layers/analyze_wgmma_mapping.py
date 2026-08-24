@@ -50,23 +50,30 @@ flat = ref.reshape(-1)
 results = []
 for r in rows:
     diffs = (flat - r["val"]).abs()
-    best_idx = int(diffs.argmin())
+    sorted_idx = diffs.argsort()
+    best_idx = int(sorted_idx[0])
+    runner_up_idx = int(sorted_idx[1])
     best_val = float(flat[best_idx])
     abs_diff = float(diffs[best_idx])
     rel_diff = abs_diff / (abs(r["val"]) + 1e-12) * 100
+    runner_up_rel_diff = float(diffs[runner_up_idx]) / (abs(r["val"]) + 1e-12) * 100
     matched_row = best_idx // ref.shape[1]
     matched_col = best_idx % ref.shape[1]
     results.append(dict(
         **r,
         matched_flat_idx=best_idx, matched_row=matched_row, matched_col=matched_col,
-        matched_val=best_val, rel_diff_pct=rel_diff,
+        matched_val=best_val, rel_diff_pct=rel_diff, runner_up_rel_diff_pct=runner_up_rel_diff,
     ))
 
-# Only trust matches with small relative error -- large-error ones are noise
-# (a thread whose value happens to be closest to some unrelated element by
-# chance), not real matches.
-good = [r for r in results if r["rel_diff_pct"] < 5.0]
-print(f"\n{len(good)}/{len(results)} probes matched within 5% relative error.\n")
+# Only trust matches that are both very close in absolute terms AND clearly
+# distinct from the second-best candidate -- a small rel_diff alone isn't
+# enough proof in a large search space (16384 candidates here), since many
+# SiLU outputs cluster near similar small magnitudes. Requiring the runner-up
+# to be at least 3x farther away rules out coincidental near-ties.
+good = [r for r in results
+        if r["rel_diff_pct"] < 1.0 and r["runner_up_rel_diff_pct"] > 3 * max(r["rel_diff_pct"], 0.01)]
+print(f"\n{len(good)}/{len(results)} probes matched within 1% relative error AND "
+      f"clearly distinct from the runner-up (>3x farther).\n")
 
 print(f"{'reported(row,col)':<20} {'matched(row,col)':<20} {'lane':<5} {'warp':<5} {'tm':<4} {'tn':<4} {'t':<3} {'rel_diff%':<10}")
 for r in sorted(good, key=lambda r: (r["row"], r["col"])):
