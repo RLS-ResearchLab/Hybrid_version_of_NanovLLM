@@ -63,12 +63,14 @@ def reference_pipeline(x, gu_fp8, gu_scale, dp_fp8, dp_scale, group_size,
     gate_up = torch.einsum('mtnk,mk->mtn', gu_deq, x.float())   # (M, TK, N)
     gw, uw = gate_up.chunk(2, dim=-1)                             # each (M, TK, N/2)
     h = F.silu(gw) * uw                                           # (M, TK, N/2)
-    # TEMPORARY debug probe, 2026-08-24 -- matches moe_w8a8.cu's own printf of the
-    # same coordinate (token=0, k=0) right before down-proj, to directly compare
-    # against the kernel's pre-down-proj intermediate without decoding wgmma's raw
-    # register layout. Remove once the bug is found.
-    print(f"DEBUG reference pre-down-proj h[token=0,k=0:4] = {h[0, 0, :4].tolist()}")
-    print(f"DEBUG reference pre-down-proj h[token=0,:] full row = {h[0, 0, :].tolist()}")
+    # TEMPORARY debug probe, 2026-08-24 -- saves the full pre-down-proj reference
+    # tensor so a separate analysis script can match it against moe_w8a8.cu's own
+    # printf dump of its (row,col) values, without needing to decode wgmma's raw
+    # per-thread output-register fragment layout by hand. Remove once bug is found.
+    # sorted_token_ids encodes (token*top_k + slot), so save h flattened the same way.
+    tk = local_slots.shape[1]
+    torch.save(h.reshape(M * tk, -1).cpu(), "h_reference.pt")
+    print(f"Saved h_reference.pt, shape={tuple(h.reshape(M * tk, -1).shape)}")
     down = torch.einsum('mtkh,mth->mtk', dp_deq, h)               # (M, TK, K)
 
     weighted = down * topk_weights.unsqueeze(-1).float() * scaling_factor
