@@ -43,6 +43,15 @@ class Config:
     # the hot path even when nobody reads the output -- default off so
     # normal runs (including anything being benchmarked) don't pay for it.
     debug_print_prefill_samples: bool = False
+    # Debug-only: prints seq_id/token counts/state_slot on every scheduler
+    # preemption. Off by default -- under real memory pressure (e.g. a
+    # concurrency sweep past KV-cache capacity) preemptions can fire in a
+    # tight burst, and this print previously ran unconditionally inside
+    # Scheduler.preempt(), which BatchedEngine's background loop calls while
+    # holding its request-admission lock -- turning a burst of preemptions
+    # into a burst of serialized stdout syscalls at exactly the moment
+    # things are already degrading.
+    debug_print_preemptions: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256

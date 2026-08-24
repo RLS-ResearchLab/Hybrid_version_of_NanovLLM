@@ -20,6 +20,7 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
+        self.debug_print_preemptions = config.debug_print_preemptions
         self.block_size = config.kvcache_block_size
         # Only needed for stop-string checking (_check_stop_string decodes a
         # trailing window of completion tokens back to text). Optional, like
@@ -160,9 +161,10 @@ class Scheduler:
             self._free_state(seq)
         seq.num_cached_tokens = 0
 
-        print(f"[PREEMPT DEBUG] seq_id={seq.seq_id} num_tokens={seq.num_tokens} "
-          f"num_prompt_tokens={seq.num_prompt_tokens} token_ids_len={len(seq.token_ids)} "
-          f"state_slot={seq.state_slot}")
+        if self.debug_print_preemptions:
+            print(f"[PREEMPT DEBUG] seq_id={seq.seq_id} num_tokens={seq.num_tokens} "
+              f"num_prompt_tokens={seq.num_prompt_tokens} token_ids_len={len(seq.token_ids)} "
+              f"state_slot={seq.state_slot}")
 
         self.waiting.appendleft(seq)
 
