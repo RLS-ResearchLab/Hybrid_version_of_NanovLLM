@@ -83,42 +83,65 @@ fi
 nvcc --version
 
 echo "=== [6/8] torch (cu${CUDA_TAG} index) ==="
-NEED_TORCH=1
-if python3 -c "import torch" 2>/dev/null; then
-    if python3 -c "
+
+# torch built for a HIGHER CUDA than the driver supports will fail at runtime
+# ('CUDA driver too old' on the first torch.cuda call). Lower is fine
+# (backward compatible); higher is not. Checked via static attributes only
+# (torch.__version__/torch.version.cuda) -- NOT torch.cuda.is_available() or
+# get_device_name(), which both trigger cuInit() and crash with an ugly raw
+# traceback exactly when this check would otherwise catch the problem.
+check_torch() {
+    python3 -c "
 import torch, sys
 drv = tuple(int(x) for x in '${CUDA_VER}'.split('.'))
 got = tuple(int(x) for x in torch.version.cuda.split('.')[:2])
-sys.exit(0 if got <= drv and torch.cuda.is_available() else 1)
-" 2>/dev/null; then
-        NEED_TORCH=0
-        echo "torch already installed and compatible, skipping."
+sys.exit(0 if got <= drv else 1)
+" 2>/dev/null
+}
+
+NEED_TORCH=1
+if python3 -c "import torch" 2>/dev/null && check_torch; then
+    NEED_TORCH=0
+    echo "torch already installed and compatible, skipping."
+fi
+
+if [ "$NEED_TORCH" = "1" ]; then
+    echo "Installing torch from cu${CUDA_TAG} index (unpinned)..."
+    pip install torch --index-url "https://download.pytorch.org/whl/cu${CUDA_TAG}" --no-cache-dir -q
+
+    if ! check_torch; then
+        # Confirmed twice now (H100 box: cu124 index -> resolved 2.13.0+cu130;
+        # this box: cu128 index -> also resolved 2.13.0+cu130) -- unpinned
+        # "latest" resolution against these older CUDA-tagged pytorch.org
+        # indices is not reliable. Self-heal by pinning to whatever version
+        # is ACTUALLY hosted under this tag instead of trusting resolution.
+        echo "WARNING: unpinned torch resolved to an incompatible CUDA build (seen before)." >&2
+        echo "Retrying pinned to whatever version pip index versions actually lists under cu${CUDA_TAG}..." >&2
+        PINNED_VER=$(pip index versions torch --index-url "https://download.pytorch.org/whl/cu${CUDA_TAG}" 2>/dev/null \
+            | grep -oP '^torch \(\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [ -z "$PINNED_VER" ]; then
+            echo "FATAL: could not determine any torch version hosted under cu${CUDA_TAG}. Manual intervention needed." >&2
+            exit 1
+        fi
+        echo "Pinning torch==${PINNED_VER} (cu${CUDA_TAG})"
+        pip uninstall -y torch -q
+        pip cache remove torch -q 2>/dev/null || true
+        pip install "torch==${PINNED_VER}" --index-url "https://download.pytorch.org/whl/cu${CUDA_TAG}" --no-cache-dir -q
     fi
 fi
-if [ "$NEED_TORCH" = "1" ]; then
-    pip install torch --index-url "https://download.pytorch.org/whl/cu${CUDA_TAG}" --no-cache-dir -q
-fi
+
 python3 -c "
 import torch, sys
-# Check the version FIRST using only static attributes (no CUDA init) --
-# torch.cuda.is_available()/get_device_name() both trigger cuInit() and crash
-# with an ugly raw traceback if torch's compiled CUDA version exceeds the
-# driver's ceiling, which is exactly the failure mode we're checking for.
-# Printing/calling those before this check defeats the whole point of it.
 print('torch', torch.__version__, 'compiled for cuda', torch.version.cuda)
 drv = tuple(int(x) for x in '${CUDA_VER}'.split('.'))
 got = tuple(int(x) for x in torch.version.cuda.split('.')[:2])
-# torch built for a HIGHER CUDA than the driver supports will fail at runtime
-# (this is exactly what happened on the H100 box: driver 12.8, torch cu130 ->
-# 'CUDA driver too old' on the very first torch.cuda call). Lower is fine
-# (backward compatible); higher is not -- fail loudly here instead of an
-# hour later mid-test.
 if got > drv:
-    print(f'FATAL: torch built for CUDA {torch.version.cuda} > driver ceiling ${CUDA_VER}. Re-run with a lower --index-url (e.g. cu${CUDA_TAG} explicitly, or pin an exact older torch version).')
+    print(f'FATAL: torch built for CUDA {torch.version.cuda} > driver ceiling ${CUDA_VER} even after the pinned retry. Manual intervention needed.')
     sys.exit(1)
 if not torch.cuda.is_available():
     print('FATAL: torch.cuda.is_available() is False. Investigate directly, do not proceed.')
     sys.exit(1)
+print('torch/CUDA compatibility confirmed:', torch.cuda.get_device_name(0))
 "
 
 echo "=== [7/8] flash-attn + triton ==="
