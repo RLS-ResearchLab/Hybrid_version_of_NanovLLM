@@ -1078,6 +1078,24 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
                     {
                         int s = t%2;
                         out_tile[tn2/2][tm][t] = __float2bfloat16_rn(token_scale[tm][s]*tile_acc[tn2 + t/4][tm][t%4]*s_w[tn2/2]);
+                        // TEMPORARY debug probe, 2026-08-24 -- breaks down the
+                        // down-proj output combine (out = token_scale * raw_wgmma
+                        // * s_w) into its 3 factors for one fixed coordinate, to
+                        // find which factor is responsible for the ~227,000x
+                        // final-output magnitude blowup seen even at
+                        // n_stages_down=1 (so it's not a multi-stage bug -- the
+                        // single-stage case is already wrong). Compare s_w against
+                        // dp_scale's expected magnitude and token_scale against
+                        // what quantize_activation_fp8_dynamic-style scales should
+                        // look like (both should be small, roughly weight/activation
+                        // std over 448, NOT anywhere near 1.0). Remove once found.
+                        if (blockIdx.x == 0 && blockIdx.y == 0 && lane_id == 0 && warp_id == 0
+                            && tn2 == 0 && tm == 0 && t == 0)
+                            printf("DEBUGDOWN compute_stage=%d s_w=%.9f token_scale=%.9f "
+                                   "raw_tile_acc=%.9f out=%.9f\n",
+                                   compute_stage, s_w[tn2/2], token_scale[tm][s],
+                                   tile_acc[tn2 + t/4][tm][t%4],
+                                   __bfloat162float(out_tile[tn2/2][tm][t]));
                     }
                 }
             }
