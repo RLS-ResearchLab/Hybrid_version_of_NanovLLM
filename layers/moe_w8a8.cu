@@ -896,6 +896,22 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
             scale_w[0] = sw.x;
             scale_w[1] = sw.y;
 
+            // TEMPORARY debug probe, 2026-08-24 -- the down-proj combine
+            // checked out clean twice (s_w/token_scale both sane, internally
+            // consistent), so the remaining ~145% same-coordinate error must
+            // be upstream: either the up-proj's OWN scale read-back (this
+            // shared-memory round-trip for scale_x_up/scale_w_up) or the raw
+            // wgmma K-reduction itself. Dumps local BM-position (decode via
+            // sorted_ids_debug.pt, same technique as DEBUGXY), smem_stage
+            // (the K-block index), and both scales, so Python can cross-check
+            // scale_x directly against the real x_scale[token,k_block] value
+            // and scale_w against w_scale[exp_idx,...]. Remove once found.
+            if (blockIdx.x == 0 && blockIdx.y == 0 && lane_id == 0 && warp_id == 0)
+                printf("DEBUGUPSCALE compute_stage=%d smem_stage=%d exp_idx=%d local_pos0=%d "
+                       "scale_x0=%.9f scale_w0=%.9f scale_w1=%.9f\n",
+                       compute_stage, smem_stage, exp_idx, (lane_id%4)*2,
+                       scale_x[0], scale_w[0], scale_w[1]);
+
             float tile_acc[TN][TM][4];
             memset(tile_acc, 0, sizeof(tile_acc));
             for (int tn = 0; tn < TN; tn++)
