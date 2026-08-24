@@ -217,6 +217,28 @@ def main():
     print(f"per-row cosine: min={row_cos.min().item():.4f} max={row_cos.max().item():.4f} "
           f"mean={row_cos.mean().item():.4f}")
     print(f"per-row cosine (all {M} rows): {row_cos.tolist()}")
+
+    # TEMPORARY debug probe, 2026-08-24 -- mean_abs=0.91/max_abs=7.59 are WAY
+    # bigger than what ref_out[0:2, :8] shows (all ~1e-6, same order as ref) --
+    # so the blowup isn't uniform across the tensor, it's concentrated
+    # somewhere else. Locate it: top-K |kernel_out| entries with their
+    # (row,col), plus per-row and per-col max, to see if it's a few scattered
+    # cells, whole rows, or whole columns (a whole-column pattern would point
+    # at a specific out_col / st_matrix_x4_trans address; whole-row would
+    # point at specific tokens/expert-slots; scattered would look more like
+    # uninitialized/aliased shared memory). Remove once the bug is found.
+    flat_abs = ker_f.abs().reshape(-1)
+    topk = torch.topk(flat_abs, k=min(20, flat_abs.numel()))
+    print(f"\nTop-20 |kernel_out| entries (value, row, col):")
+    for v, idx in zip(topk.values.tolist(), topk.indices.tolist()):
+        r, c = idx // ker_f.shape[1], idx % ker_f.shape[1]
+        print(f"  {v:.6f}  (row={r}, col={c})  ref_at_same_coord={ref_f[r, c].item():.6e}")
+    row_max = ker_f.abs().max(dim=1).values
+    col_max = ker_f.abs().max(dim=0).values
+    print(f"per-row max_abs: {row_max.tolist()}")
+    print(f"per-col max_abs (first 32 cols): {col_max[:32].tolist()}")
+    print(f"per-col max_abs: overall min={col_max.min().item():.6f} max={col_max.max().item():.6f} "
+          f"argmax_col={col_max.argmax().item()}")
     # Looser threshold than the INT8 kernel's own smoke test (0.999) -- FP8
     # e4m3 has ~2-3 decimal digits of precision on BOTH weights AND
     # activations (true W8A8, unlike INT8's weight-only scheme), so more
