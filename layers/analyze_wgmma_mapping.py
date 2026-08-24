@@ -94,3 +94,38 @@ for r in sorted([r for r in good if r["col"] == 0], key=lambda r: r["row"]):
     print(f"reported row={r['row']:3d} -> matched token*top_k+slot={r['matched_row']:3d}  "
           f"(lane={r['lane']:2d} lane%4={r['lane']%4} lane/4={r['lane']//4} "
           f"warp={r['warp']} tm={r['tm']} t={r['t']})")
+
+# --- Closed-form check, replacing the GF(2)/XOR fit ---------------------
+#
+# The GF(2) linear fit over (lane_id/4, warp_id, tn) never found a
+# consistent 8-bit XOR solution. That's expected if the true relationship
+# is ordinary arithmetic (multiply/add), not a bitwise swizzle -- swizzle()
+# in moe_w8a8.cu is a *separate* bank-conflict transform applied only to
+# the physical shared-memory address, not to the logical (row,col) label
+# that DEBUGXY prints (which is captured pre-swizzle). An XOR fit was
+# never going to find an arithmetic function.
+#
+# This block instead evaluates the kernel's *actual* x_col formula
+# (moe_w8a8.cu, down-proj input-prep loop) directly against each probe's
+# own (lane, warp, tn), derived from the documented Hopper wgmma
+# m64nNk32 F32-accumulator fragment layout (thread 0 owns (0,0),(0,1),
+# (8,0),(8,1), repeating every 8 N-columns; M=64 split into 4x16-row
+# warp bands, each band split into lane/4 and lane/4+8). If this matches
+# matched_col exactly, the bug is NOT in this formula and the search
+# should move elsewhere. If it diverges, the per-term breakdown below
+# shows exactly which piece (tn stride, warp/4 stride, warp%4 stride,
+# or lane/4) is wrong.
+TN_CONST = 2  # smoke_test_moe_w8a8_hopper.py uses block_n=32 -> TN = BN/16 = 32/16 = 2
+if TN_CONST is not None:
+    print("\n--- Closed-form x_col check (formula from moe_w8a8.cu:997) ---")
+    for r in sorted(good, key=lambda r: (r["row"], r["col"])):
+        predicted = ((r["warp"] // 4) * (TN_CONST * 32) + r["tn"] * 32
+                     + (r["warp"] % 4) * 8 + r["lane"] // 4)
+        diff = r["matched_col"] - predicted
+        flag = "" if predicted == r["matched_col"] else "  <-- MISMATCH"
+        print(f"lane={r['lane']:2d} warp={r['warp']} tn={r['tn']} tm={r['tm']} t={r['t']}  "
+              f"predicted={predicted:3d} matched={r['matched_col']:3d} diff={diff:+d}{flag}")
+else:
+    print("\n--- Closed-form x_col check SKIPPED: set TN_CONST at the top of this "
+          "block to BN/16 for the launch config actually used (check the "
+          "dispatch_bn_wn call / BN template arg in the smoke test). ---")
