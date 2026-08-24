@@ -100,7 +100,12 @@ if [ "$NEED_TORCH" = "1" ]; then
 fi
 python3 -c "
 import torch, sys
-print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0))
+# Check the version FIRST using only static attributes (no CUDA init) --
+# torch.cuda.is_available()/get_device_name() both trigger cuInit() and crash
+# with an ugly raw traceback if torch's compiled CUDA version exceeds the
+# driver's ceiling, which is exactly the failure mode we're checking for.
+# Printing/calling those before this check defeats the whole point of it.
+print('torch', torch.__version__, 'compiled for cuda', torch.version.cuda)
 drv = tuple(int(x) for x in '${CUDA_VER}'.split('.'))
 got = tuple(int(x) for x in torch.version.cuda.split('.')[:2])
 # torch built for a HIGHER CUDA than the driver supports will fail at runtime
