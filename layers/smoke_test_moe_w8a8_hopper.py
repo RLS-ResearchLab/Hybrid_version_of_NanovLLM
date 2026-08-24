@@ -137,6 +137,9 @@ def main():
     dp_fp8, dp_scale = quantize_weight_fp8_grouped(dp_bf16, group_size)
     print(f"gate_up_proj fp8: {tuple(gu_fp8.shape)}  scale: {tuple(gu_scale.shape)}   "
           f"down_proj fp8: {tuple(dp_fp8.shape)}  scale: {tuple(dp_scale.shape)}")
+    torch.save(gu_fp8[0, 0, :].float().cpu(), "gu_fp8_e0f0_debug.pt")
+    print(f"Saved gu_fp8_e0f0_debug.pt (expert 0, feature 0, all K): "
+          f"{gu_fp8[0, 0, :8].float().tolist()} ...")
 
     x_bf16 = torch.randn((M, H), dtype=torch.bfloat16, device=device) * 0.02
     x_fp8, x_scale = quantize_activation_fp8_dynamic(x_bf16)

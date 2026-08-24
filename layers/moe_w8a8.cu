@@ -958,6 +958,24 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
             warpgroup_wait();
             arrive(bar + STAGES + smem_stage);
 
+            // TEMPORARY debug probe, 2026-08-24 -- raw, UNSCALED wgmma
+            // accumulator for (tn=0,tm=0,lane=0,warp=0) = feature-row 0,
+            // token col0=0 (local BM-slot 0 -> token 0, per sorted_ids),
+            // reduced over this compute_stage's 128-wide K-chunk. Both
+            // activation data (s.x) and its scale round-tripped byte-exact
+            // already, so this checks the one remaining unverified piece:
+            // does the weight data (TMA-loaded, hardware-swizzled -- can't
+            // be read back as a plain linear index the way s.x could) times
+            // the verified-correct activation actually reduce to what an
+            // independent Python dot product over gu_fp8[0,0,k0:k0+128] @
+            // x_fp8[0,k0:k0+128] gives? If they match, weights + wgmma are
+            // BOTH cleared and the bug is elsewhere (SiLU combine, f_acc
+            // bookkeeping); if not, isolates it to the weight side. Remove
+            // once found.
+            if (blockIdx.x == 0 && blockIdx.y == 0 && lane_id == 0 && warp_id == 0)
+                printf("DEBUGRAWACC compute_stage=%d raw_tile_acc[0][0][0]=%.6f\n",
+                       compute_stage, tile_acc[0][0][0]);
+
             for(int tm = 0; tm < TM; tm++)
             {
                 for(int tn = 0; tn < TN; tn++)
