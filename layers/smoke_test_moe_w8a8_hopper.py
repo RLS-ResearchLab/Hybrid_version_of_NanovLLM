@@ -144,6 +144,17 @@ def main():
     local_slots = torch.randint(0, E, (M, top_k), dtype=torch.int32, device=device)
     topk_weights = torch.softmax(torch.randn(M, top_k, device=device), dim=-1)
 
+    # TEMPORARY debug probe, 2026-08-24 -- correlate per-token expert routing
+    # against the per-row corruption pattern seen in kernel_out (rows 0-7 fine,
+    # 8-15 all blown up to ~5-7.6 magnitude vs ref's ~1e-5). If every corrupted
+    # row shares a common expert somewhere in its 4 slots, that's routing/expert-
+    # block-specific. If there's no such correlation, the row-8 boundary is
+    # structural (an index/addressing artifact), not content-driven. Remove
+    # once the bug is found.
+    print(f"local_slots (per-token expert routing, {M}x{top_k}):")
+    for m in range(M):
+        print(f"  token {m:2d}: experts={local_slots[m].tolist()}")
+
     # TEMPORARY debug probe, 2026-08-24 -- moe_align_block_size groups tokens
     # by EXPERT (torch.argsort(flat_ids, stable=True) in moe_align_block_size.py),
     # so sorted_token_ids[warpM*BM + x_row] is NOT x_row / not sequential --
