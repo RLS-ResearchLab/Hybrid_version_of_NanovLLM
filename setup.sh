@@ -54,11 +54,22 @@ pip install -q transformers xxhash numpy tqdm safetensors fastapi "uvicorn[stand
 # neither is needed for the actual test scripts, both are slow to install)
 
 if [ ! -f qwen35_checkpoint/.download_complete ]; then
+    # The checkpoint is ~67GB. GPU rental boxes on this provider have been seen
+    # with a small (~100GB) root disk that's already 90%+ full from the CUDA
+    # toolkit/venv/build artifacts, plus a much larger, empty /ephemeral data
+    # volume -- prefer that if it exists, rather than filling the root disk and
+    # failing mid-download with "No space left on device".
+    CKPT_DIR="$REPO_DIR/qwen35_checkpoint"
+    if [ -d /ephemeral ] && [ "$(df --output=avail /ephemeral 2>/dev/null | tail -1)" -gt "$(df --output=avail "$REPO_DIR" | tail -1)" ]; then
+        mkdir -p /ephemeral/qwen35_checkpoint
+        ln -sfn /ephemeral/qwen35_checkpoint "$CKPT_DIR"
+        echo "Using /ephemeral for the checkpoint (more free space than the root disk)."
+    fi
     # `huggingface-cli download` is deprecated in newer huggingface_hub releases
     # and silently no-ops (prints a warning, downloads nothing) instead of
     # erroring -- use `hf download` (the replacement) so this doesn't look like
     # it started when it didn't.
-    nohup bash -c "hf download Qwen/Qwen3.5-35B-A3B --local-dir ./qwen35_checkpoint && touch qwen35_checkpoint/.download_complete" \
+    nohup bash -c "hf download Qwen/Qwen3.5-35B-A3B --local-dir '$CKPT_DIR' && touch '$CKPT_DIR'/.download_complete" \
         > checkpoint_download.log 2>&1 &
     disown
     echo "Checkpoint download started in background (PID $!) -> checkpoint_download.log"
