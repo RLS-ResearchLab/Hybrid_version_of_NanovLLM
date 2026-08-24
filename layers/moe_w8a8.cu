@@ -754,7 +754,7 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
     };
 
     int n_stages_up = K/block_shape[0];
-    int n_stages_down = N2/BN2;
+    int n_stages_down = (N2 + BN2 - 1)/BN2;
 
     constexpr int TM = BM/8;
     constexpr int TN = BN/16;
