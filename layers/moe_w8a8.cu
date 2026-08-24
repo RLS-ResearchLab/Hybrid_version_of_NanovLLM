@@ -1119,6 +1119,20 @@ __global__ __launch_bounds__(WN*32 + PRODUCER_THREADS) void fused_moe_w8a8_wgmma
                 if (token_src < M)
                 {
                     int row = threadIdx.x - PRODUCER_THREADS;
+                    // TEMPORARY debug probe, 2026-08-24 -- every VALID
+                    // (non-padding) final add into `out`, with which block/
+                    // expert produced it and a sample of what's about to be
+                    // added, to find why tokens 8-15 end up ~5-7.6 magnitude
+                    // (vs ref's ~1e-5) while 0-7 don't -- routing content
+                    // (local_slots) showed no clean single-expert
+                    // correlation, so this checks whether it's block-
+                    // specific, a double-add (same token_src from multiple
+                    // blocks/stages unexpectedly), or bad values already in
+                    // s_d.out before the add. Remove once found.
+                    printf("DEBUGOUT blockIdx.x=%d blockIdx.y=%d exp_idx=%d compute_stage=%d "
+                           "row=%d token_src=%d s_d.out[row*PAD]=%.6f s_d.out[row*PAD+1]=%.6f\n",
+                           blockIdx.x, blockIdx.y, exp_idx, compute_stage, row, token_src,
+                           __bfloat162float(s_d.out[row*PAD]), __bfloat162float(s_d.out[row*PAD+1]));
                     cuda::ptx::cp_reduce_async_bulk(
                             cuda::ptx::space_global,
                             cuda::ptx::space_shared,
