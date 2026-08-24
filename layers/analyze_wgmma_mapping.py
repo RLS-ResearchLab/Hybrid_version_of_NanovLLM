@@ -65,6 +65,45 @@ for r in rows:
         matched_val=best_val, rel_diff_pct=rel_diff, runner_up_rel_diff_pct=runner_up_rel_diff,
     ))
 
+# --- Direct same-coordinate check: is `val` even close to ref[row,col]? ---
+#
+# The nearest-neighbor search above answers "does this value appear
+# *somewhere* in the reference tensor". That is NOT the same question as
+# "is the kernel's value correct for the coordinate it claims to be at",
+# and in a tensor with many near-zero / clustered SiLU outputs, a
+# genuinely wrong kernel value can spuriously pass a <1%-and-3x-margin
+# nearest-neighbor filter by pure chance. Before trusting the
+# "value is right, position is wrong" story, check the boring thing
+# first: does val actually match ref at its own reported (row, col)?
+same_coord = []
+for r in rows:
+    if 0 <= r["row"] < ref.shape[0] and 0 <= r["col"] < ref.shape[1]:
+        ref_val = float(ref[r["row"], r["col"]])
+        abs_diff = abs(ref_val - r["val"])
+        rel = abs_diff / (abs(r["val"]) + 1e-12) * 100
+        same_coord.append(dict(**r, ref_val_at_reported=ref_val, same_coord_rel_diff_pct=rel))
+
+print(f"\n--- Direct same-coordinate check (val vs ref[row,col], NO searching) ---")
+print(f"{'(row,col)':<12} {'kernel_val':<14} {'ref_val':<14} {'rel_diff%':<10} {'lane':<5} {'warp':<5} {'tn':<4} {'tm':<4} {'t':<3}")
+for r in sorted(same_coord, key=lambda r: -r["same_coord_rel_diff_pct"])[:60]:
+    print(f"({r['row']:3d},{r['col']:3d}){'':<4} {r['val']:<14.6e} {r['ref_val_at_reported']:<14.6e} "
+          f"{r['same_coord_rel_diff_pct']:<10.2f} {r['lane']:<5} {r['warp']:<5} {r['tn']:<4} {r['tm']:<4} {r['t']:<3}")
+
+rels = [r["same_coord_rel_diff_pct"] for r in same_coord]
+close = [x for x in rels if x < 1.0]
+print(f"\nsame-coordinate rel_diff%: n={len(rels)}  "
+      f"median={sorted(rels)[len(rels)//2]:.2f}  min={min(rels):.2f}  max={max(rels):.2f}  "
+      f"fraction <1%: {len(close)}/{len(rels)} ({100*len(close)/len(rels):.1f}%)")
+print("If most of these are already close to 0% (values match at their OWN reported"
+      "\ncoordinate), the position-swap story is confirmed and the closed-form formula"
+      "\nabove is what's wrong. If most are large (tens/hundreds of percent off, same"
+      "\norder as the near-zero cosine similarity), the kernel's VALUES are simply wrong"
+      "\nat the source -- the earlier nearest-neighbor 'matches elsewhere in the row'"
+      "\nfinding was very likely a false positive from matching against a tensor with"
+      "\nmany near-duplicate/clustered entries, and the search should move to tile_acc's"
+      "\nactual arithmetic (scale pairing, K-reduction, tensor map data) instead of any"
+      "\ncoordinate-relabeling theory.")
+
 # Only trust matches that are both very close in absolute terms AND clearly
 # distinct from the second-best candidate -- a small rel_diff alone isn't
 # enough proof in a large search space (16384 candidates here), since many
