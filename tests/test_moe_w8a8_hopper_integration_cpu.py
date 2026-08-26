@@ -156,7 +156,36 @@ def main():
     assert cos_cross > 0.99, "contiguous and interleaved buffers disagree on the underlying weight"
     ok &= cos_cross > 0.99
 
-    # ---- 7. apply_moe_w8a8_hopper_quantization's per-module count is
+    # ---- 7. The OTHER supported kernel config, (block_n, warp_n)=(64, 4) --
+    # moe_w8a8_hopper_integration.py's _KERNEL_BLOCK_N/_KERNEL_WARP_N are
+    # hardcoded to (32, 8) (matching models/qwen3_5.py's production launch
+    # config), so this exercises gate_up_interleave_permutation and
+    # quantize_weight_fp8_grouped directly at (64, 4) instead -- the same
+    # round-trip check as [6]/[6b], for the config nothing else here uses.
+    # This does NOT prove the kernel itself is correct at (64, 4) (needs
+    # real Hopper hardware, see layers/smoke_test_moe_w8a8_hopper.py's
+    # --block-n/--warp-n flags for that) -- it proves the PERMUTATION
+    # formula stays a valid, balanced, self-consistent bijection at the
+    # config nothing here had tested before 2026-08-26. ----
+    from moe_w8a8_hopper_quantize import quantize_weight_fp8_grouped as _qwfg
+    perm_64_4 = gate_up_interleave_permutation(MI, 64, 4)
+    assert perm_64_4.shape == (N,)
+    assert torch.equal(torch.sort(perm_64_4).values, torch.arange(N)), (
+        "gate_up_interleave_permutation(MI, 64, 4) must also be a bijection -- "
+        "(64, 4) is a real dispatched kernel config (moe_w8a8.cu:dispatch_bn_wn), "
+        "not a hypothetical one"
+    )
+    n_gate_64_4 = int((perm_64_4 < MI).sum())
+    assert n_gate_64_4 == MI, f"expected exactly MI={MI} gate rows, got {n_gate_64_4}"
+    gu_fp8_64_4, gu_scale_64_4 = _qwfg(gu_before[:, perm_64_4, :], group_size)
+    gu_deq_64_4 = dequantize_weight_fp8_grouped_gathered(gu_fp8_64_4, gu_scale_64_4, group_size, torch.float32)
+    cos_64_4 = torch.nn.functional.cosine_similarity(
+        gu_before[:, perm_64_4, :].reshape(-1), gu_deq_64_4.reshape(-1), dim=0).item()
+    print(f"[7] (block_n,warp_n)=(64,4) permutation dequant-vs-permuted-original cosine={cos_64_4:.6f}")
+    assert cos_64_4 > 0.99
+    ok &= cos_64_4 > 0.99
+
+    # ---- 8. apply_moe_w8a8_hopper_quantization's per-module count is
     # exercised separately (it imports the real Experts class, which cannot
     # be imported on this machine) -- explicitly out of scope here, not
     # silently skipped. ----

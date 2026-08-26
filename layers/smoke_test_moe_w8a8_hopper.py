@@ -16,11 +16,29 @@ below -- not the conventional contiguous halves this file's synthetic
 weights and reference use natively).
 
 IMPORTANT for real integration: gate_up_interleave_permutation's row
-reordering is currently only applied here, to synthetic test weights. Any
-real checkpoint's gate_up_proj weight needs this SAME permutation applied
-before FP8 quantization, or the kernel will silently produce wrong output
-once wired into the real model. Also config-dependent -- only verified for
-(block_n, warp_n)=(32, 8), not the other supported pair (64, 4).
+reordering is applied for real checkpoints too now (see
+tests/moe_w8a8_hopper_integration.py's quantize_experts_module_fp8_inplace,
+2026-08-26) -- but only end-to-end HARDWARE-validated for
+(block_n, warp_n)=(32, 8). (64, 4) support: --block-n 64 --warp-n 4 below
+runs the exact same check at that config -- do this FIRST on the next
+Hopper window, before assuming (64,4) needs fresh derivation work. Read-
+through analysis (2026-08-26, CPU-only, no hardware access) against
+moe_w8a8.cu found the permutation's row-tiling math (rows_per_tn=64,
+TN=BN/16, WARPGROUPS=WN/4, 4 constituent warps per warpgroup) derives
+algebraically to the same rows_per_tn=64 for ANY block_n, confirmed
+directly against the kernel's own `sw = ... + tn*64*BK` stride and TN loop
+bound for both (32,8) and (64,4); and the fine-grained "gate/up interleaved
+every 8 rows" logic (offset<8) comes from the wgmma m64nNk32 instruction's
+OWN fixed per-thread accumulator fragment shape (SM_90 ISA-level, not a
+kernel tuning parameter) -- both dispatched configs read gate/up out of the
+SAME 4-register-per-thread tile_acc via the identical f_acc[...][0]/[1]
+split (moe_w8a8.cu:941-953), regardless of BN/WN. Numerically, both configs
+already produce valid bijections with balanced gate/up counts at several MI
+values (verified here on CPU). None of this is proof -- this exact codebase
+has been wrong about wgmma layout theories that looked equally sound before
+(the "coordinate/register-mapping" and "pipelining-depth" dead ends
+documented in the postmortem artifact) -- but it's a real, source-level
+reason to expect --block-n 64 --warp-n 4 to just work, not a blind guess.
 
 Unlike the Triton kernel's smoke test, this kernel does the FULL weighted
 combine internally (accumulates each (token, k) pair's contribution into
@@ -30,7 +48,9 @@ top_k directly too, to stay comparable.
 
 Usage:
     python layers/smoke_test_moe_w8a8_hopper.py
+    python layers/smoke_test_moe_w8a8_hopper.py --block-n 64 --warp-n 4  # the OTHER supported config
 """
+import argparse
 import os
 import sys
 import time
@@ -96,6 +116,19 @@ def _align(local_slots, block_m, num_experts):
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--block-n", type=int, default=32, dest="block_n",
+                     help="Kernel BN. Only (32,8) and (64,4) are dispatched by "
+                          "moe_w8a8.cu:dispatch_bn_wn -- anything else fails to launch "
+                          "on the real kernel (prints to stderr, silently returns zeros) "
+                          "even though this Python-side smoke test won't itself complain.")
+    ap.add_argument("--warp-n", type=int, default=8, dest="warp_n")
+    ap.add_argument("--stages", type=int, default=2,
+                     help="Pipelining-depth theory (STAGES vs n_stages_up) tested and "
+                          "settled 2026-08-24 -- dropping to 1 didn't move cosine at all, "
+                          "so it wasn't the cause of that session's bug. Default 2.")
+    cli = ap.parse_args()
+
     if not torch.cuda.is_available():
         print("CUDA required for this smoke test.")
         return
@@ -117,10 +150,7 @@ def main():
     M = 16               # concurrency / token count
     group_size = 128
     scaling_factor = 1.0
-    block_m, block_n, warp_n, stages = 32, 32, 8, 2
-    # Pipelining-depth theory (STAGES vs n_stages_up) tested and settled
-    # 2026-08-24 -- dropping stages to 1 didn't move cosine at all, so it
-    # wasn't the cause. Reverted to the default stages=2 here.
+    block_m, block_n, warp_n, stages = 32, cli.block_n, cli.warp_n, cli.stages
 
     print(f"Config: E={E} H={H} MI={MI} top_k={top_k} M={M} group_size={group_size} "
           f"block_m={block_m} block_n={block_n} warp_n={warp_n} stages={stages}")

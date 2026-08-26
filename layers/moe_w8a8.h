@@ -72,8 +72,28 @@
 //     dims, not production scale, and NOT yet run through GSM8K
 //     non-regression or wired into the real model. Still worth treating with
 //     real skepticism outside that specific validated configuration,
-//     especially block_n/warp_n=(64,4) (never exercised) and the gate/up
-//     permutation above (config-dependent, only derived/checked for (32,8)).
+//     especially block_n/warp_n=(64,4) (never run on real hardware) and the
+//     gate/up permutation above (only HARDWARE-confirmed for (32,8)).
+//
+//   - (64,4) specifically: read-through analysis 2026-08-26 (CPU-only, no
+//     hardware access) found real, source-level reason to expect the
+//     EXISTING gate_up_interleave_permutation to already be correct at
+//     (64,4), not needing fresh derivation -- rows_per_tn=64 in that
+//     function derives algebraically to 64 for ANY block_n (confirmed
+//     against this file's own `sw = ... + tn*64*BK` stride and TN=BN/16
+//     loop bound at both dispatched configs), and the fine-grained
+//     "interleave every 8 rows" logic comes from wgmma m64nNk32's fixed
+//     per-thread accumulator fragment shape (an SM_90 ISA property, not a
+//     BN/WN-dependent one) -- both configs read gate/up out of the SAME
+//     4-register tile_acc via the identical f_acc[...][0]/[1] split (see
+//     the up-proj consumer loop above). Numerically confirmed as a valid,
+//     balanced bijection at (64,4) too (tests/test_moe_w8a8_hopper_
+//     integration_cpu.py check [7]). NOT proof -- this exact kernel has
+//     had equally-plausible-looking wgmma layout theories turn out wrong
+//     before (see the postmortem artifact linked in
+//     H200_test_day_checklist.md) -- but real reason to try
+//     `--block-n 64 --warp-n 4` on the smoke test FIRST on the next Hopper
+//     window, before assuming (64,4) needs its own derivation pass.
 
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
