@@ -141,14 +141,17 @@ def main():
     # isinstance-based norm override only matches nanovllm's own layernorm
     # classes, not the reference's).
     #
-    # 17 files under tests/ reference "fake_qwen35_small" (grep-confirmed):
-    # this file and test_qwen35_full_model.py (the ones that construct this
-    # checkpoint), plus test_loader_shard_merge.py, test_qwen35_preemption.py,
+    # 17 files under tests/ referenced "fake_qwen35_small" at the time of this
+    # fix (grep-confirmed then; two of them, debug_warmup_state.py and
+    # debug_kvcache.py, were later deleted as dead duplicates of
+    # run_small_model_smoke_test.py -- 2026-08-26 audit): this file and
+    # test_qwen35_full_model.py (the ones that construct this checkpoint),
+    # plus test_loader_shard_merge.py, test_qwen35_preemption.py,
     # test_qwen35_preemption_state.py, test_state_slot_reuse.py,
     # test_qwen35_multiblock.py, cuda_graph_consistency_test.py,
     # run_small_model_smoke_test.py, decode_stagger_contamination_check.py,
-    # gsm8k_fused_gdr_check.py, debug_warmup_state.py, debug_kvcache.py,
-    # test_qwen34_model_runner.py, plus the fixture-generation scripts
+    # gsm8k_fused_gdr_check.py, test_qwen34_model_runner.py, plus the
+    # fixture-generation scripts
     # (make_fake_hf_config.py, make_fake_tokenizer.py,
     # add_fake_chat_template.py). Per-file check now done (see the intervention
     # that added this fix): most of the ModelRunner/LLMEngine-based ones

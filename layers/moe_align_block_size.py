@@ -25,9 +25,16 @@ if this file is read out of context) and would break graph capture. Used
 instead -- same output shape (max_num_m_blocks,) every call, regardless of
 the actual routing.
 
-NOT yet validated on GPU. Written and self-tested on CPU only (see
-test_moe_align_block_size.py) -- the Triton kernel side of this integration
-still needs real hardware before any of this is trusted in production.
+VALIDATED on real GPU hardware (2026-08-21 A6000 session, updated
+2026-08-26 -- this docstring previously said "not yet," stale after that
+session landed): this is the alignment step inside the fused Triton MoE
+kernel path (fused_moe_int8.py's fused_moe_int8_forward,
+NANOVLLM_USE_FUSED_MOE_KERNEL=1), which reached cosine=0.999988 against a
+trusted reference, real-checkpoint GSM8K non-regression (8/8, then 40/40
+under CUDA graphs), and the production 172.7->204.1 tok/s numbers in
+README.md and moe_quantization_memo.md. Also still covered by the
+CPU-only unit test below (test_moe_align_block_size.py), unaffected by
+this update.
 """
 import torch
 

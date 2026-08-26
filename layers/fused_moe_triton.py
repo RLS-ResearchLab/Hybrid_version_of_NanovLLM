@@ -27,10 +27,16 @@ layers/moe_align_block_size.py, CPU-tested separately
 (layers/test_moe_align_block_size.py) -- not needed here since this file
 only carries the kernel + launcher, not the alignment step.
 
-NOT yet validated on GPU as of this writing. Kernel logic is vLLM's own,
-battle-tested code, unmodified -- risk here is in the adaptation (stripped
-imports, calling convention) and in this project's own integration around
-it, not in the GEMM math itself.
+VALIDATED on real GPU hardware (2026-08-21 A6000 session, updated
+2026-08-26 -- this docstring previously said "not yet," stale after that
+session landed). invoke_fused_moe_kernel is the actual kernel launcher
+behind the validated fused-kernel path: cosine=0.999988 against a trusted
+reference, real-checkpoint GSM8K non-regression (8/8, then 40/40 under CUDA
+graphs), and the production 172.7->204.1 tok/s numbers in README.md and
+moe_quantization_memo.md. Kernel logic is vLLM's own, battle-tested code,
+unmodified -- the adaptation risk this docstring originally flagged
+(stripped imports, calling convention, this project's own integration
+around it) is exactly what that validation exercised.
 """
 from typing import Any, Dict, Optional
 
