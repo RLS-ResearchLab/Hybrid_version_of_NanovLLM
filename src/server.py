@@ -296,10 +296,26 @@ class BatchedEngine:
 
 app  = FastAPI()
 _engine: Optional[Engine] = None
+# Populated in main() right after argparse, read-only afterward -- exists so
+# /health can report the actual admission-control config a running server
+# was launched with. Added 2026-08-26: a real concurrency=64 sweep session
+# found what looked like scheduler "starvation" (a specific subset of
+# requests never progressing) that CPU-only simulation of the real
+# Scheduler/BlockManager logic (tests/diag_scheduler_starvation_cpu.py)
+# could NOT reproduce via eviction/thrashing, but COULD reproduce cleanly
+# via an undersized --max-num-seqs simply queuing the tail of a wide wave
+# behind a much smaller real batch cap -- i.e. not a bug, just a client
+# sweeping past a cap it had no way to see. Exposing the cap here lets a
+# client (bench_http_concurrency.py) catch that mismatch BEFORE spending a
+# GPU window on a misleading run, instead of discovering it after the fact.
+_server_config: Optional[dict] = None
 
 @app.get("/health")
 def health():
-    return JSONResponse({"status": "ok"})
+    body = {"status": "ok"}
+    if _server_config is not None:
+        body["config"] = _server_config
+    return JSONResponse(body)
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest):
@@ -360,7 +376,7 @@ async def chat_completions(req: ChatRequest):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    global _engine
+    global _engine, _server_config
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True,
@@ -439,6 +455,13 @@ def main():
                              "hidden_size=2048 and moe_intermediate_size=512 exactly on the "
                              "real checkpoint (Q0). Only used when --moe-w8a8 is set.")
     args = parser.parse_args()
+
+    _server_config = {
+        "max_num_seqs": args.max_num_seqs,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "concurrency_mode": args.concurrency_mode,
+        "tensor_parallel_size": args.tensor_parallel_size,
+    }
 
     if args.fake_config_loader:
         import nanovllm.config as config_mod

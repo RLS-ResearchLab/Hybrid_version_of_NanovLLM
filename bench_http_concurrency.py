@@ -169,10 +169,45 @@ def main():
     # Health check before burning any wave on a server that isn't up.
     try:
         with urllib.request.urlopen(f"{args.base_url}/health", timeout=10) as resp:
-            print(f"Server health: {resp.read().decode('utf-8')}")
+            health_body = resp.read().decode("utf-8")
+            print(f"Server health: {health_body}")
     except Exception as e:
         print(f"[FATAL] server not reachable at {args.base_url}: {e!r}")
         sys.exit(1)
+
+    # Added 2026-08-26, after a real concurrency=8/16/32 sweep produced a
+    # near-flat tok/s curve (88.1/93.1/117.7) and a separate concurrency=64
+    # run showed 12/64 requests never progressing -- CPU-only simulation of
+    # the real Scheduler (tests/diag_scheduler_starvation_cpu.py) could NOT
+    # reproduce that via eviction/thrashing, but reproduced the EXACT same
+    # shape (a clean tail of later-arriving requests queued, not a bug) from
+    # an undersized --max-num-seqs relative to the swept concurrency. This
+    # script has no way to see that cap on its own (it's a server-launch
+    # flag, not something the concurrency level implies) -- src/server.py's
+    # /health now reports it, so check it here instead of silently sweeping
+    # past a ceiling this script can't otherwise know about.
+    try:
+        health = json.loads(health_body)
+        server_cfg = health.get("config")
+    except (ValueError, NameError):
+        server_cfg = None
+    if server_cfg is not None:
+        max_num_seqs = server_cfg.get("max_num_seqs")
+        concurrency_mode = server_cfg.get("concurrency_mode")
+        if concurrency_mode == "fcfs":
+            print(f"[WARNING] server is running --concurrency-mode fcfs -- every request is fully "
+                  f"serialized regardless of --levels here (see src/server.py's Engine docstring). "
+                  f"tok/s will NOT scale with concurrency at all. Restart with --concurrency-mode "
+                  f"batched to measure real continuous-batching throughput.")
+        if max_num_seqs is not None and max(args.levels) > max_num_seqs:
+            print(f"[WARNING] server's --max-num-seqs={max_num_seqs} is BELOW the highest "
+                  f"--levels value requested here ({max(args.levels)}). Requests beyond "
+                  f"{max_num_seqs} in a wave will queue instead of batching -- this produces a "
+                  f"flatter-than-real tok/s curve at levels above {max_num_seqs}, and at high "
+                  f"enough concurrency can leave a tail of requests still queued when --timeout "
+                  f"fires, which looks like scheduler starvation but is really just this cap. "
+                  f"Restart the server with --max-num-seqs >= {max(args.levels)} for a result "
+                  f"that reflects the engine's real batching capability.")
 
     fieldnames = [
         "level", "trial_index", "n_requests", "n_success", "n_failure",
