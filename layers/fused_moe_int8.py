@@ -36,7 +36,7 @@ from nanovllm.layers.fused_moe_triton import invoke_fused_moe_kernel
 # own, not meant to stay on once the bottleneck is identified.
 _PROFILE = os.environ.get("NANOVLLM_PROFILE_FUSED_MOE", "0") == "1"
 _PRINT_EVERY = 200
-_timing_acc = {"align1": 0.0, "kernel1": 0.0, "silu": 0.0, "align2": 0.0, "kernel2": 0.0, "calls": 0}
+_timing_acc = {"align1": 0.0, "kernel1": 0.0, "silu": 0.0, "kernel2": 0.0, "calls": 0}
 
 
 def _tick():
@@ -50,7 +50,7 @@ def _maybe_print_timing():
         total = sum(v for k, v in _timing_acc.items() if k != "calls")
         print(f"[FUSED MOE PROFILE] after {c} calls, avg per call (ms), "
               f"total_avg={total/c*1000:.3f}ms:")
-        for stage in ("align1", "kernel1", "silu", "align2", "kernel2"):
+        for stage in ("align1", "kernel1", "silu", "kernel2"):
             v = _timing_acc[stage]
             print(f"    {stage:8s}: {v/c*1000:7.3f} ms/call  "
                   f"({v/total*100:5.1f}% of this function's own time)")
@@ -170,23 +170,24 @@ def fused_moe_int8_forward(
 
     # ---- GEMM 2: down_proj -- each (token, k) pair is its own "virtual
     # token" with top_k=1, since h's rows are already expert-specific (see
-    # module docstring) ----
+    # module docstring). Reuses GEMM 1's sorted_ids1/expert_ids1/ntpp1
+    # as-is, does NOT recompute them: moe_align_block_size only depends on
+    # topk_ids.reshape(-1)'s VALUES, and local_slots.reshape(-1) is
+    # bit-identical to local_slots.reshape(N*top_k, 1).reshape(-1) -- same
+    # values, same block_size, same local_num_experts, so a second call
+    # here was a full argsort+scatter_add+cumsum+searchsorted spent
+    # reproducing a result already sitting in sorted_ids1/expert_ids1/ntpp1.
+    # Same reasoning covers local_slots vs. the old local_slots_flat as the
+    # topk_ids arg below -- invoke_fused_moe_kernel only reads .numel() off
+    # it (both are N*top_k), never the tensor's values or declared shape. ----
     h_flat = h.reshape(N * top_k, MI)
-    local_slots_flat = local_slots.reshape(N * top_k, 1)
-    sorted_ids2, expert_ids2, ntpp2 = moe_align_block_size(
-        local_slots_flat, config["BLOCK_SIZE_M"], local_num_experts
-    )
-    if _PROFILE:
-        t1 = _tick()
-        _timing_acc["align2"] += t1 - t0
-        t0 = t1
     down_out = torch.empty((N * top_k, 1, H), dtype=dtype, device=device)
     dummy_w2 = torch.ones((N * top_k, 1), dtype=torch.float32, device=device)
     invoke_fused_moe_kernel(
         h_flat, down_proj_int8, down_out,
         None, down_proj_scale,
-        dummy_w2, local_slots_flat,
-        sorted_ids2, expert_ids2, ntpp2,
+        dummy_w2, local_slots,
+        sorted_ids1, expert_ids1, ntpp1,
         False, 1, config, compute_type,
         use_fp8_w8a8=False, use_int8_w8a16=True,
         quant_group_size=group_size,
