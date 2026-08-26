@@ -283,6 +283,7 @@ class Qwen35LinearAttention(nn.Module):
         conv_kernel_size: int,       # CK
         rms_norm_eps: float,
         use_fused_gdr_kernel: bool = False,
+        use_fused_gdr_decode_kernel: bool = False,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -308,6 +309,32 @@ class Qwen35LinearAttention(nn.Module):
                     "existing sequential GDR scan."
                 ) from e
             self._fla_chunk_gated_delta_rule = chunk_gated_delta_rule
+
+        # Decode-side counterpart to the above -- see config.py's
+        # use_fused_gdr_decode_kernel docstring before ever setting this
+        # True. UNVALIDATED on any hardware as of 2026-08-26 (no
+        # triton/CUDA on this dev machine); correctness only established by
+        # hand-tracing + a CPU-only reference comparison
+        # (layers/smoke_test_fused_recurrent_gdr.py), never run against the
+        # actual kernels. Written now so the integration exists and is
+        # ready to validate the moment GPU access resumes, same phased
+        # discipline as moe_w8a8_hopper_integration.py's Phase 1/2 split.
+        self.use_fused_gdr_decode_kernel = use_fused_gdr_decode_kernel
+        self._fused_recurrent_gated_delta_rule = None
+        self._causal_conv1d_decode_triton = None
+        if use_fused_gdr_decode_kernel:
+            try:
+                from nanovllm.layers.fused_recurrent import fused_recurrent_gated_delta_rule
+                from nanovllm.layers.gated_delta_net import causal_conv1d_decode_triton
+            except ImportError as e:
+                raise ImportError(
+                    "use_fused_gdr_decode_kernel=True requires triton and a CUDA GPU "
+                    "(layers/fused_recurrent.py, layers/gated_delta_net.py). Install "
+                    "triton or leave use_fused_gdr_decode_kernel=False to use the "
+                    "existing sequential GDR decode scan."
+                ) from e
+            self._fused_recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
+            self._causal_conv1d_decode_triton = causal_conv1d_decode_triton
 
         assert linear_attn_kq_heads % tp_size == 0
         assert linear_attn_v_heads % tp_size == 0
@@ -461,6 +488,16 @@ class Qwen35LinearAttention(nn.Module):
 
         is_decode_shape = (num_segments == N)
 
+        # Early, mutually-exclusive branch -- UNVALIDATED (see
+        # use_fused_gdr_decode_kernel's docstring in config.py). Deliberately
+        # placed before this function does ANY of its own work (projections
+        # included) so the two paths share nothing and the existing
+        # sequential-scan path below is completely unaffected when this flag
+        # is off (the default). _forward_decode_fused_gdr redoes the
+        # projections itself.
+        if is_decode_shape and self.use_fused_gdr_decode_kernel:
+            return self._forward_decode_fused_gdr(hidden_states, states, conv_states)
+
         # ── Project once over the whole packed N — pure per-token ops ──
         z = self.in_proj_z(hidden_states)        # (N, LVH*LHD)
         a = self.in_proj_a(hidden_states)        # (N, LVH)
@@ -489,6 +526,15 @@ class Qwen35LinearAttention(nn.Module):
         # first re-confirming this constraint against whatever fla version is
         # installed at the time -- it may have been fixed upstream, but it is
         # not safe to assume so.
+        #
+        # use_fused_gdr_decode_kernel (the early-return branch above, taken
+        # BEFORE this point whenever it's on) is a SEPARATE, independently-
+        # gated path for decode specifically -- it does not weaken the
+        # guarantee above (this line's `not is_decode_shape` still means
+        # THIS branch, the fla prefill kernel, never runs during decode,
+        # regardless of the other flag). But do not assume the new decode
+        # kernel inherits fla's capture problem OR is safe from it -- that
+        # question is separately open, see config.py's docstring on it.
         use_fused = self.use_fused_gdr_kernel and not is_decode_shape
 
         y_chunks, new_states, new_conv_states = [], [], []
@@ -605,6 +651,88 @@ class Qwen35LinearAttention(nn.Module):
         y = torch.cat(y_chunks, dim=0)               # (N, LVH*LHD)
         new_states = torch.stack(new_states, dim=0)          # (num_segments, LVH, LHD, LHD)
         new_conv_states = torch.stack(new_conv_states, dim=0)  # (num_segments, QKV, CK-1)
+
+        return self.out_proj(y), new_states, new_conv_states
+
+    def _forward_decode_fused_gdr(self, hidden_states, states, conv_states):
+        """UNVALIDATED, off by default -- see use_fused_gdr_decode_kernel's
+        docstring in config.py before ever enabling this. Never run against
+        the real kernels on any hardware (no triton/CUDA on the machine this
+        was written on); correctness only established by hand-tracing this
+        function's math against forward()'s sequential-scan decode branch
+        and a CPU-only plain-PyTorch reference comparison
+        (layers/smoke_test_fused_recurrent_gdr.py).
+
+        Replaces forward()'s `for i in range(num_segments):` Python loop --
+        one iteration per request currently in the batch, every decode step,
+        every layer -- with ONE batched call each to
+        layers/gated_delta_net.py's causal_conv1d_decode_triton and
+        layers/fused_recurrent.py's fused_recurrent_gated_delta_rule. At
+        decode every segment has exactly one token and no cross-segment
+        interaction, so this is a straightforward batch-of-independent-
+        recurrences problem -- no cu_seqlens/varlen packing needed, unlike
+        _fused_gdr_scan's prefill case.
+
+        Deliberately does NOT reuse the head-expand-then-L2-norm-then-scale
+        sequence forward()'s sequential path applies explicitly
+        (q.repeat_interleave(...); l2norm(q)*scale) -- the kernel takes q/k
+        at their ORIGINAL (un-expanded) lkh head count and does the head
+        mapping internally via its H/HV grid parameters (i_h = i_hv //
+        (HV//H), verified by reading fused_recurrent_gated_delta_rule_fwd_
+        kernel directly -- this is the same mapping repeat_interleave
+        produces, just without materializing the expanded tensor) and does
+        L2-norm + scale internally too (use_qk_l2norm_in_kernel=True,
+        scale=lhd**-0.5 passed as a kernel argument, applied in the same
+        normalize-then-scale order the sequential path uses). Passes RAW
+        `a`/`b` (pre-softplus, pre-sigmoid) as g/beta -- the kernel applies
+        -A_log.exp()*softplus(...) and sigmoid(...) internally
+        (use_beta_sigmoid_in_kernel=True); do NOT pre-transform them the way
+        forward()'s sequential path does before its loop, that would apply
+        the transform twice.
+        """
+        N, _ = hidden_states.shape
+        lkh, lvh, lhd = self.lkh, self.lvh, self.lhd
+        dt = hidden_states.dtype
+
+        z = self.in_proj_z(hidden_states)        # (N, LVH*LHD)
+        a = self.in_proj_a(hidden_states)        # (N, LVH)
+        b = self.in_proj_b(hidden_states)        # (N, LVH)
+        qkv = self.in_proj_qkv(hidden_states)    # (N, QKV)
+
+        qkv_conv, new_conv_states = self._causal_conv1d_decode_triton(
+            qkv.unsqueeze(-1), self.conv1d.weight, conv_states,
+        )
+        qkv_conv = qkv_conv.squeeze(-1)  # (N, QKV) -- SiLU already applied inside the kernel
+
+        q = qkv_conv[:, :lkh * lhd].view(N, 1, lkh, lhd)
+        k = qkv_conv[:, lkh * lhd:2 * lkh * lhd].view(N, 1, lkh, lhd)
+        v = qkv_conv[:, 2 * lkh * lhd:].view(N, 1, lvh, lhd)
+        g_raw = a.view(N, 1, lvh)
+        beta_raw = b.view(N, 1, lvh)
+
+        initial_state = states.to(torch.float32) if states is not None else None
+
+        out, new_states = self._fused_recurrent_gated_delta_rule(
+            q, k, v,
+            g=g_raw,
+            beta=beta_raw,
+            scale=lhd ** -0.5,
+            initial_state=initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            use_beta_sigmoid_in_kernel=True,
+        )
+        # out: (N, 1, LVH, LHD) float, dtype matches v (bf16/fp16).
+        # new_states: (N, LVH, LHD, LHD) float32 -- matches the states
+        # buffer contract the rest of this class (and StateManager) expects,
+        # same as _fused_gdr_scan's own output.
+
+        out_flat = out.reshape(N * lvh, lhd).to(dt)
+        z_flat = z.reshape(N * lvh, lhd)
+        normed = self.norm(out_flat, z_flat)
+        y = normed.reshape(N, lvh * lhd)
 
         return self.out_proj(y), new_states, new_conv_states
 
@@ -1601,6 +1729,7 @@ class Qwen35DecoderLayer(nn.Module):
                 ),
                 rms_norm_eps=rms_norm_eps,
                 use_fused_gdr_kernel=getattr(config, "use_fused_gdr_kernel", False),
+                use_fused_gdr_decode_kernel=getattr(config, "use_fused_gdr_decode_kernel", False),
             )
 
         # MoE FFN

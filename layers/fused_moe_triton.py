@@ -1,43 +1,3 @@
-"""Fused MoE Triton kernel -- adapted from layers/fused_moe_triton_raw.py
-(vLLM's real production kernel, copied in 2026-07-27, never wired up -- see
-that file's own docstring). This file strips the vLLM-package dependency:
-the original's module-level `import vllm.envs`, `from vllm import
-_custom_ops`, `from vllm.logger import init_logger`, `from vllm.platforms
-import current_platform` execute just by importing the file, whether or not
-the vLLM-dependent functions are ever called -- pulling in real vLLM as a
-dependency for that alone is backwards for a project whose whole point is
-being a lightweight, from-scratch alternative to vLLM.
-
-Only fused_moe_kernel (the actual @triton.jit kernel) and
-invoke_fused_moe_kernel (its launcher) are carried over. Both are already
-vLLM-op-free for the use_int8_w8a16 path this project needs -- the ONLY
-vLLM op invoke_fused_moe_kernel calls (ops.scaled_fp8_quant) is gated behind
-`if use_fp8_w8a8:`, which this project never sets (weight-only INT8, no FP8
--- A6000 has no FP8 tensor cores anyway, see moe_quantization_memo.md).
-Everything else vLLM's original module provided (get_moe_configs, the
-top-level fused_moe() orchestration, topk_softmax/silu_and_mul fused ops) is
-NOT carried over -- this project has its own topk/softmax/silu-mul logic
-already in models/qwen3_5.py's Qwen35MoE.forward(), and its own EP-sharded,
-quantized Experts data layout that needs custom orchestration around this
-kernel, not vLLM's.
-
-moe_align_block_size (the other real dependency, a compiled CUDA extension
-in vLLM) has its own pure-PyTorch replacement in
-layers/moe_align_block_size.py, CPU-tested separately
-(layers/test_moe_align_block_size.py) -- not needed here since this file
-only carries the kernel + launcher, not the alignment step.
-
-VALIDATED on real GPU hardware (2026-08-21 A6000 session, updated
-2026-08-26 -- this docstring previously said "not yet," stale after that
-session landed). invoke_fused_moe_kernel is the actual kernel launcher
-behind the validated fused-kernel path: cosine=0.999988 against a trusted
-reference, real-checkpoint GSM8K non-regression (8/8, then 40/40 under CUDA
-graphs), and the production 172.7->204.1 tok/s numbers in README.md and
-moe_quantization_memo.md. Kernel logic is vLLM's own, battle-tested code,
-unmodified -- the adaptation risk this docstring originally flagged
-(stripped imports, calling convention, this project's own integration
-around it) is exactly what that validation exercised.
-"""
 from typing import Any, Dict, Optional
 
 import torch
@@ -87,51 +47,6 @@ def fused_moe_kernel(
         compute_type: tl.constexpr,
         use_fp8_w8a8: tl.constexpr,
         use_int8_w8a16: tl.constexpr):
-    """
-    Implements the fused computation for a Mixture of Experts (MOE) using
-    token and expert matrices.
-
-    Key Parameters:
-    - A: The input tensor representing tokens with shape (*, K), where '*' can
-        be any shape representing batches and K is the feature dimension of
-        each token.
-    - B: The stacked MOE weight tensor with shape (E, N, K), where E is
-        the number of experts, K is the input feature dimension, and N is
-        the output feature dimension.
-    - C: The output cache tensor with shape (M, topk, N), where M is the
-        total number of tokens post padding, topk is the number of times
-        each token is repeated, and N is the output feature dimension.
-    - sorted_token_ids: A tensor containing the sorted indices of tokens,
-        repeated topk times and arranged by the expert index they are
-        assigned to.
-    - expert_ids: A tensor containing the indices of the expert for each
-        block. It determines which expert matrix from B should be used for
-        each block in A.
-    This kernel performs the multiplication of a token by its corresponding
-    expert matrix as determined by `expert_ids`. The sorting of
-    `sorted_token_ids` by expert index and padding ensures divisibility by
-    BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
-    multiplication across different blocks processed by the same expert.
-
-    use_int8_w8a16 GROUPED-SCALE CHANGE (2026-08-21): vLLM's original here
-    applied b_scale ONCE, after the full K-reduction loop -- correct only for
-    one scale per (expert, output_channel) covering the WHOLE row. This
-    project's actual quantization (tests/moe_int8_quantize.py) is grouped
-    along K (group_size=128, one scale per (expert, output_channel, group)),
-    which is finer-grained and is what the already-validated accuracy numbers
-    (reconstruction error, GSM8K non-regression) were measured against --
-    switching to whole-row scale would be a real accuracy change requiring
-    re-validation, not just a kernel-integration detail. Instead, b_scale is
-    now looked up and applied ONCE PER K-ITERATION inside the loop, using
-    whichever quantization group that iteration's BLOCK_SIZE_K-wide chunk
-    falls in. This is exact, not an approximation, ONLY IF QUANT_GROUP_SIZE
-    is a multiple of BLOCK_SIZE_K -- enforced by an assert in
-    invoke_fused_moe_kernel below, not just assumed here. If BLOCK_SIZE_K
-    didn't divide QUANT_GROUP_SIZE evenly, a single loaded chunk could span
-    two different scale groups and there would be no single correct scale to
-    apply to it -- the assert exists specifically to make that config
-    impossible to reach silently.
-    """
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.

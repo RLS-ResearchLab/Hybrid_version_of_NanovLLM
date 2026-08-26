@@ -10,30 +10,6 @@ def divide(numerator, denominator):
 
 
 def local_num_kv_heads(total_num_kv_heads: int, tp_size: int) -> int:
-    """Per-rank kv-head count for GQA-aware tensor parallelism. Single
-    source of truth for this computation -- used by both
-    models/qwen3_5.py's Qwen35FullAttention (module construction) and
-    engine/model_runner.py's allocate_kv_cache (KV-cache tensor sizing), so
-    the two can't independently drift the way in_proj_qkv/conv1d once did
-    (see Qwen35LinearAttention's __init__ comments for that incident).
-
-    Two regimes:
-      - total_num_kv_heads >= tp_size: shard normally, every rank owns a
-        distinct, evenly-divided slice (unchanged behavior from before this
-        function existed).
-      - total_num_kv_heads < tp_size: too few physical kv heads to give
-        every rank a whole one -- replicate a full kv head onto multiple
-        ranks instead of splitting one across them (splitting would hand a
-        rank a fraction of a head's channels, which is not a meaningful
-        attention head). Requires tp_size % total_num_kv_heads == 0 (e.g. 2
-        kv heads over 4 ranks: each head replicated to 2 ranks) -- a
-        combination with no clean mapping (e.g. 3 kv heads over 4 ranks)
-        raises rather than silently producing a wrong shard.
-
-    Returns the per-rank kv-head count -- always >= 1, unlike the plain
-    `total_num_kv_heads // tp_size` this replaces, which silently returned 0
-    whenever tp_size > total_num_kv_heads (a zero-sized KV-cache dimension
-    at the model_runner.py call site, with nothing to catch it)."""
     if total_num_kv_heads >= tp_size:
         assert total_num_kv_heads % tp_size == 0, (
             f"num_key_value_heads={total_num_kv_heads} is not evenly divisible by "
@@ -53,16 +29,6 @@ def local_num_kv_heads(total_num_kv_heads: int, tp_size: int) -> int:
 
 
 def kv_head_replica_source(total_num_kv_heads: int, tp_size: int, tp_rank: int) -> int:
-    """Which of the total_num_kv_heads physical kv heads this rank replicates,
-    only meaningful when total_num_kv_heads < tp_size (see local_num_kv_heads
-    above -- at total_num_kv_heads >= tp_size, shard normally instead, there
-    is nothing to replicate). Groups of (tp_size // total_num_kv_heads)
-    consecutive ranks share the same source head -- this lines up exactly
-    with HF's own contiguous query-head-to-kv-head grouping (kv head h
-    serves query heads [h * group_size : (h+1) * group_size]) and
-    ColumnParallelLinear's contiguous per-rank query-head slice
-    ([r * per_rank : (r+1) * per_rank]), since tp_size % total_num_kv_heads
-    == 0 is already required by local_num_kv_heads before this is called."""
     assert total_num_kv_heads < tp_size, (
         f"kv_head_replica_source is only meaningful in the replication regime "
         f"(total_num_kv_heads={total_num_kv_heads} < tp_size={tp_size}); at "

@@ -13,6 +13,30 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     use_fused_gdr_kernel: bool = False
+    # Decode-side counterpart to use_fused_gdr_kernel above -- that flag only
+    # ever affects PREFILL (models/qwen3_5.py's is_decode_shape check forces
+    # decode onto the sequential per-segment scan unconditionally, regardless
+    # of this flag). This one instead batches the per-segment Python loop in
+    # the DECODE branch into a single call to layers/fused_recurrent.py's
+    # Triton kernel (plus layers/gated_delta_net.py's causal-conv1d-decode
+    # kernel). Added 2026-08-26, candidate kernels only -- CORRECTNESS
+    # verified against a plain-PyTorch reference by hand-tracing the math
+    # (layers/smoke_test_fused_recurrent_gdr.py) but NEVER RUN on any
+    # hardware (no triton/CUDA on this dev machine). Do not set True before
+    # that smoke test has actually passed on a real GPU AND
+    # tests/profile_decode_launch_overhead.py (or equivalent) has confirmed
+    # the sequential loop this replaces is a measurable cost in the first
+    # place -- the one real profiling data point that exists
+    # (moe_quantization_memo.md's nsys trace) attributed eager-mode small-
+    # kernel overhead to PREFILL's _forward_dispatch_ep, not decode, and
+    # decode already runs under CUDA graph capture in production, which that
+    # same profile found eliminates most of this class of overhead for
+    # whatever it captures. ALSO UNCONFIRMED: whether this Triton kernel is
+    # capturable inside torch.cuda.graph() at all -- the reason decode never
+    # takes ANY fused path today is that the fla prefill kernel was found
+    # NOT to be capturable; that question is open, not assumed-safe, for
+    # this kernel too.
+    use_fused_gdr_decode_kernel: bool = False
     use_vectorized_moe: bool = False
     use_moe_w8a8: bool = False
     moe_w8a8_weight_group_size: int = 128
@@ -106,6 +130,7 @@ class Config:
         # from hf_config, not this Config object -- see Qwen35DecoderLayer's
         # getattr(config, "use_fused_gdr_kernel", False) read.
         self.hf_config.use_fused_gdr_kernel = self.use_fused_gdr_kernel
+        self.hf_config.use_fused_gdr_decode_kernel = self.use_fused_gdr_decode_kernel
         self.hf_config.use_vectorized_moe = self.use_vectorized_moe
         # NOTE: use_moe_w8a8 / moe_w8a8_weight_group_size deliberately do NOT
         # mirror onto hf_config like the two lines above -- unlike
