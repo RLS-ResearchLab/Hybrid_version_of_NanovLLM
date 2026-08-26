@@ -956,11 +956,19 @@ class Qwen35MoE(nn.Module):
         num_experts: int,
         top_k: int,
         use_vectorized_moe: bool = False,
+        debug_ep_token_roundtrip: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.top_k = top_k
+
+        # See config.py's debug_ep_token_roundtrip docstring -- gates a
+        # debug-only all_reduce in the EP forward paths. None (not a
+        # tensor) when the flag is off or before the first EP forward call,
+        # so callers must check for that rather than assuming a tensor.
+        self.debug_ep_token_roundtrip = debug_ep_token_roundtrip
+        self._last_ep_token_id_roundtrip = None
 
         # QLLM Stage 2 intervention: replace _forward_dispatch's per-expert
         # Python loop with two torch._grouped_mm calls (grouped/batched GEMM)
@@ -1249,14 +1257,15 @@ class Qwen35MoE(nn.Module):
             # re-testable on this machine.
             local_out = self._forward_gathered_ep_w8a8_hopper(x, w, local_slots, owned_mask)
 
-            touched = owned_mask.any(dim=1)                             # (N,) bool
-            token_id_local = torch.where(
-                touched,
-                torch.arange(N, device=x.device, dtype=torch.int64),
-                torch.full((N,), -1, dtype=torch.int64, device=x.device),
-            )
-            dist.all_reduce(token_id_local, op=dist.ReduceOp.MAX)
-            self._last_ep_token_id_roundtrip = token_id_local
+            if self.debug_ep_token_roundtrip:
+                touched = owned_mask.any(dim=1)                             # (N,) bool
+                token_id_local = torch.where(
+                    touched,
+                    torch.arange(N, device=x.device, dtype=torch.int64),
+                    torch.full((N,), -1, dtype=torch.int64, device=x.device),
+                )
+                dist.all_reduce(token_id_local, op=dist.ReduceOp.MAX)
+                self._last_ep_token_id_roundtrip = token_id_local
 
             sg = torch.sigmoid(self.shared_expert_gate(x))
             return local_out + sg * self.shared_expert(x)
@@ -1320,14 +1329,15 @@ class Qwen35MoE(nn.Module):
         # top_k>=1 pairs, each assigned to exactly one rank, so every token
         # is touched by exactly one rank for each of its pairs -- MAX-combine
         # across ranks recovers arange(N) with no leftover -1 sentinels.
-        touched = owned_mask.any(dim=1)                             # (N,) bool
-        token_id_local = torch.where(
-            touched,
-            torch.arange(N, device=x.device, dtype=torch.int64),
-            torch.full((N,), -1, dtype=torch.int64, device=x.device),
-        )
-        dist.all_reduce(token_id_local, op=dist.ReduceOp.MAX)
-        self._last_ep_token_id_roundtrip = token_id_local
+        if self.debug_ep_token_roundtrip:
+            touched = owned_mask.any(dim=1)                             # (N,) bool
+            token_id_local = torch.where(
+                touched,
+                torch.arange(N, device=x.device, dtype=torch.int64),
+                torch.full((N,), -1, dtype=torch.int64, device=x.device),
+            )
+            dist.all_reduce(token_id_local, op=dist.ReduceOp.MAX)
+            self._last_ep_token_id_roundtrip = token_id_local
 
         sg = torch.sigmoid(self.shared_expert_gate(x))
         out = local_out + sg * self.shared_expert(x)
@@ -1659,10 +1669,11 @@ class Qwen35MoE(nn.Module):
         dist.all_reduce(local_out)
         local_out = local_out.to(x.dtype)
 
-        token_id_local = torch.full((N,), -1, dtype=torch.int64, device=x.device)
-        token_id_local[owned_token_idx] = owned_token_idx
-        dist.all_reduce(token_id_local, op=dist.ReduceOp.MAX)
-        self._last_ep_token_id_roundtrip = token_id_local
+        if self.debug_ep_token_roundtrip:
+            token_id_local = torch.full((N,), -1, dtype=torch.int64, device=x.device)
+            token_id_local[owned_token_idx] = owned_token_idx
+            dist.all_reduce(token_id_local, op=dist.ReduceOp.MAX)
+            self._last_ep_token_id_roundtrip = token_id_local
 
         sg = torch.sigmoid(self.shared_expert_gate(xf))
         out = local_out + sg * self.shared_expert(xf)
@@ -1740,6 +1751,7 @@ class Qwen35DecoderLayer(nn.Module):
             num_experts=getattr(config, "num_experts", 256),
             top_k=getattr(config, "num_experts_per_tok", 8),
             use_vectorized_moe=getattr(config, "use_vectorized_moe", False),
+            debug_ep_token_roundtrip=getattr(config, "debug_ep_token_roundtrip", False),
         )
 
     def forward(

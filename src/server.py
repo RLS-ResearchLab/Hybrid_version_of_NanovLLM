@@ -109,8 +109,14 @@ if os.path.basename(ROOT) != "nanovllm":
     nanovllm_pkg.__file__ = os.path.join(ROOT, "__init__.py")
     sys.modules["nanovllm"] = nanovllm_pkg
 
-from nanovllm.llm import LLM
 from nanovllm.sampling_params import SamplingParams
+# `from nanovllm.llm import LLM` is deliberately NOT imported at module level
+# here -- LLM transitively imports models/qwen3_5.py, which reads
+# NANOVLLM_USE_FUSED_MOE_KERNEL from os.environ at MODULE IMPORT time (a
+# one-shot global, not re-read per call). Importing LLM before main() has
+# parsed --fused-moe-kernel and set that env var would freeze the flag off
+# regardless of what's passed on the command line. See main()'s local
+# import of LLM, right after the env var is set, for the fix.
 
 # ── Fake-config-loader shim (small fixture smoke-testing only) ────────────────
 #
@@ -188,7 +194,7 @@ class Engine:
     resulting methodological caveat (FCFS here vs. token-level
     round-robin in the basic engine).
     """
-    def __init__(self, llm: LLM):
+    def __init__(self, llm: "LLM"):  # noqa: F821 -- LLM is imported locally in main(), not at module level; see that import's comment.
         self.llm = llm
         self.tok = llm.tokenizer
         self.eos_id = self.tok.eos_token_id
@@ -206,10 +212,11 @@ class Engine:
 
 
 class BatchedEngine:
-    """Real continuous batching across concurrent requests, gated behind
-    --concurrency-mode batched (see main()'s argparse setup) so FCFS
-    (the `Engine` class above, still the default) stays available to
-    toggle back to without reverting any code.
+    """Real continuous batching across concurrent requests. This is the
+    default --concurrency-mode as of 2026-08-26 (see main()'s argparse
+    setup) -- FCFS (the `Engine` class above) stays available as an
+    explicit opt-in, e.g. for a controlled comparison against a simpler
+    engine that structurally cannot batch, without reverting any code.
 
     IMPORTANT -- this is NOT "Engine with the lock deleted". Naively
     removing `_gen_lock` and letting multiple threads each call
@@ -238,7 +245,7 @@ class BatchedEngine:
     concurrent requests beyond that count will simply queue in
     Scheduler.waiting rather than batch, same as today.
     """
-    def __init__(self, llm: LLM):
+    def __init__(self, llm: "LLM"):  # noqa: F821 -- LLM is imported locally in main(), not at module level; see that import's comment.
         self.llm = llm
         self.tok = llm.tokenizer
         self.eos_id = self.tok.eos_token_id
@@ -418,25 +425,34 @@ def main():
                              "StateManager (engine/state_manager.py) pre-allocates a "
                              "fixed-size recurrent-state slot pool sized at max_num_seqs "
                              "-- memory scales linearly with it regardless of actual "
-                             "load. This server's Engine._gen_lock (see its docstring) "
-                             "means at most ONE sequence is ever in flight at a time, so "
-                             "512 slots wastes GBs of VRAM for headroom this server never "
-                             "uses (confirmed: 512 needed 15GB here, on a checkpoint whose "
+                             "load, so this stays conservative rather than defaulting to "
+                             "512 (confirmed: 512 needed 15GB here, on a checkpoint whose "
                              "weights already consumed most of a 48GB A6000 under TP=2, "
-                             "and OOM'd by ~180MB). A small default is deliberate, not a "
-                             "placeholder -- raise it only if the lock is ever relaxed to "
-                             "allow real concurrent in-flight sequences.")
+                             "and OOM'd by ~180MB). IMPORTANT with the default "
+                             "--concurrency-mode batched: this caps how many requests can "
+                             "actually batch together -- anything beyond it queues instead "
+                             "of batching, which produces a flatter-than-real tok/s curve "
+                             "at higher concurrency (see SESSION_HANDOFF_2026-08-26.md's "
+                             "scheduler-starvation finding). Raise this to at least your "
+                             "highest tested concurrency level before a throughput sweep; "
+                             "the 4 default only made sense back when --concurrency-mode "
+                             "fcfs (at most one sequence ever in flight) was the default.")
     parser.add_argument("--concurrency-mode", dest="concurrency_mode",
-                        choices=["fcfs", "batched"], default="fcfs",
-                        help="Default 'fcfs': Engine._gen_lock serialises whole requests "
-                             "(see Engine's docstring) -- unchanged existing behavior. "
-                             "'batched': BatchedEngine (see its docstring), real continuous "
-                             "batching across concurrent requests via nanovllm's Scheduler. "
-                             "Toggle to compare both without reverting code -- e.g. for "
-                             "today's decode-time contamination check, only trust 'batched' "
-                             "numbers/output after tests/decode_stagger_contamination_check.py "
-                             "passes. Raise --max-num-seqs when using 'batched' -- see that "
-                             "flag's help text.")
+                        choices=["fcfs", "batched"], default="batched",
+                        help="Default 'batched' (flipped 2026-08-26 -- was 'fcfs'; see "
+                             "SESSION_HANDOFF_2026-08-26.md): BatchedEngine (see its "
+                             "docstring), real continuous batching across concurrent "
+                             "requests via nanovllm's Scheduler -- the mode every "
+                             "concurrency-sweep throughput number in this project's docs "
+                             "(204.1 tok/s etc.) is meant to reflect. 'fcfs': Engine._gen_lock "
+                             "serialises whole requests (see Engine's docstring) -- a forward "
+                             "pass never contains more than one request's tokens, so tok/s "
+                             "will NOT scale with concurrency at all. Kept as an explicit opt-in "
+                             "for the specific case this was built for -- an apples-to-apples "
+                             "comparison against a simpler engine that structurally cannot batch "
+                             "(see the module docstring's Concurrency section) -- not as a "
+                             "default anyone should hit by omitting this flag. Raise "
+                             "--max-num-seqs when using 'batched' -- see that flag's help text.")
     parser.add_argument("--moe-w8a8", dest="use_moe_w8a8", action="store_true", default=False,
                         help="Quantize MoE expert weights to INT8 after loading (Q4/Q6 -- "
                              "correctness- and accuracy-validated, 40/40 GSM8K non-regression "
@@ -454,14 +470,58 @@ def main():
                         help="Group size for INT8 grouped quantization. 128 divides both "
                              "hidden_size=2048 and moe_intermediate_size=512 exactly on the "
                              "real checkpoint (Q0). Only used when --moe-w8a8 is set.")
+    parser.add_argument("--fused-moe-kernel", dest="fused_moe_kernel", action="store_true", default=False,
+                        help="Sets NANOVLLM_USE_FUSED_MOE_KERNEL=1 before the model is built. "
+                             "This is the flag that made the validated 204.1 tok/s A6000 result "
+                             "possible -- without it, use_moe_w8a8=True still runs, but through "
+                             "the much slower plain gather+dequant+einsum path, not the fused "
+                             "Triton kernel. Only takes effect together with --moe-w8a8. "
+                             "Previously only settable by exporting the env var by hand before "
+                             "launching this script -- easy to forget, and forgetting it silently "
+                             "produces a real but much slower number with no warning.")
+    parser.add_argument("--vectorized-moe", dest="vectorized_moe", action="store_true", default=False,
+                        help="Enables Qwen35MoE's grouped-GEMM prefill dispatch "
+                             "(_forward_dispatch_vectorized, torch._grouped_mm) instead of the "
+                             "default per-expert Python loop (_forward_dispatch) -- the loop "
+                             "does an .item()-based host sync for every one of num_experts "
+                             "(256 on the real checkpoint), every prefill call. Only takes "
+                             "effect at --tensor-parallel-size 1 (ep_size>1 always uses the "
+                             "separate EP dispatch path, which this flag does not touch -- see "
+                             "Qwen35MoE.forward()'s branch order). See "
+                             "tests/test_qwen35_vectorized_moe.py / tests/bench_vectorized_moe.py.")
     args = parser.parse_args()
+
+    # Must happen before the LLM import a few lines down -- see that
+    # import's own comment for why NANOVLLM_USE_FUSED_MOE_KERNEL has to be
+    # set before models/qwen3_5.py is first imported, not just before the
+    # model is constructed.
+    if args.fused_moe_kernel:
+        os.environ["NANOVLLM_USE_FUSED_MOE_KERNEL"] = "1"
+    from nanovllm.llm import LLM
 
     _server_config = {
         "max_num_seqs": args.max_num_seqs,
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "concurrency_mode": args.concurrency_mode,
         "tensor_parallel_size": args.tensor_parallel_size,
+        "fused_moe_kernel": args.fused_moe_kernel,
+        "vectorized_moe": args.vectorized_moe,
     }
+
+    # Loud, launch-time version of the same check bench_http_concurrency.py
+    # does against /health -- catch a likely-flat-throughput misconfig
+    # before anyone spends a GPU window sweeping concurrency against it,
+    # not just after the fact from a client script.
+    if args.concurrency_mode == "batched" and args.max_num_seqs <= 4:
+        print(f"[WARNING] --concurrency-mode batched with --max-num-seqs={args.max_num_seqs} -- "
+              f"requests beyond {args.max_num_seqs} in a wave will queue instead of batching. "
+              f"Raise --max-num-seqs to at least your highest planned concurrency level for a "
+              f"real throughput sweep (see that flag's help text).")
+    if args.use_moe_w8a8 and not args.fused_moe_kernel:
+        print(f"[WARNING] --moe-w8a8 without --fused-moe-kernel -- running the slower plain "
+              f"gather+dequant+einsum path, not the fused Triton kernel. This is NOT the "
+              f"204.1 tok/s A6000 configuration. Pass --fused-moe-kernel too unless the "
+              f"dequant-only path is deliberately what's being measured.")
 
     if args.fake_config_loader:
         import nanovllm.config as config_mod
@@ -479,6 +539,7 @@ def main():
         enforce_eager=args.enforce_eager,
         use_moe_w8a8=args.use_moe_w8a8,
         moe_w8a8_weight_group_size=args.moe_w8a8_weight_group_size,
+        use_vectorized_moe=args.vectorized_moe,
     )
 
     print(f"Starting engine (concurrency_mode={args.concurrency_mode})...")

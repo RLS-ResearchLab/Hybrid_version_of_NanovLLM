@@ -126,7 +126,8 @@ def worker(rank: int, tmp_path: str):
     reference_out = payload["reference_out"]
     reference_routed_only = payload["reference_routed_only"]
 
-    moe_local = Qwen35MoE(HIDDEN, INTERMEDIATE, SHARED_INTERMEDIATE, NUM_EXPERTS, TOP_K)
+    moe_local = Qwen35MoE(HIDDEN, INTERMEDIATE, SHARED_INTERMEDIATE, NUM_EXPERTS, TOP_K,
+                          debug_ep_token_roundtrip=True)
     assert moe_local.ep_size == EP_SIZE
     assert moe_local.ep_rank == rank
     assert moe_local.experts.num_experts == NUM_EXPERTS // EP_SIZE

@@ -76,6 +76,18 @@ class Config:
     # into a burst of serialized stdout syscalls at exactly the moment
     # things are already degrading.
     debug_print_preemptions: bool = False
+    # Debug-only: gates the EP forward paths' (_forward_dispatch_ep,
+    # _forward_gathered_ep, _forward_gathered_ep_w8a8_hopper) independent
+    # token-id round-trip check, which costs a real extra dist.all_reduce
+    # on every single EP forward call (prefill AND decode) purely to
+    # populate self._last_ep_token_id_roundtrip for test verification --
+    # never read by the numeric output. Off by default so production/
+    # benchmarked runs don't pay for a second collective on top of the
+    # functionally-necessary one. tests/moe_ep_dispatch_core.py,
+    # tests/test_moe_ep_dispatch_decode.py, and
+    # tests/test_moe_ep_dispatch_edge_cases.py construct Qwen35MoE directly
+    # with this flag explicitly True, bypassing this Config default.
+    debug_ep_token_roundtrip: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -132,6 +144,7 @@ class Config:
         self.hf_config.use_fused_gdr_kernel = self.use_fused_gdr_kernel
         self.hf_config.use_fused_gdr_decode_kernel = self.use_fused_gdr_decode_kernel
         self.hf_config.use_vectorized_moe = self.use_vectorized_moe
+        self.hf_config.debug_ep_token_roundtrip = self.debug_ep_token_roundtrip
         # NOTE: use_moe_w8a8 / moe_w8a8_weight_group_size deliberately do NOT
         # mirror onto hf_config like the two lines above -- unlike
         # use_fused_gdr_kernel/use_vectorized_moe (read via

@@ -685,26 +685,7 @@ class ModelRunner:
             num_layers = len(self.model.model.layers)
             linear_idx = self.model.model.linear_layer_indices
             sm = self.state_manager
- 
-            # Static output buffers for the recurrent state — one per
-            # linear-attention layer, sized like StateManager's own
-            # per-layer slices. No longer read by anything (state
-            # write-back now happens in-graph -- see _step() below) --
-            # left in place so this change stays additive rather than
-            # touching capture's buffer bookkeeping further.
-            state_out_bufs = [
-                torch.zeros(max_bs, sm.states.shape[2], sm.states.shape[3], sm.states.shape[4],
-                            dtype=torch.float32)
-                for _ in range(sm.num_linear_layers)
-            ]
-            conv_out_bufs = [
-                torch.zeros(max_bs, sm.conv_states.shape[2], sm.conv_states.shape[3],
-                            dtype=sm.conv_states.dtype)
-                for _ in range(sm.num_linear_layers)
-            ]
-            graph_vars["state_out_bufs"] = state_out_bufs
-            graph_vars["conv_out_bufs"] = conv_out_bufs
- 
+
             # Sanity check on the "fixed address" assumption this design
             # depends on — verify it, don't just assert it from reasoning.
             state_ptr_before = sm.states.data_ptr()
@@ -731,8 +712,6 @@ class ModelRunner:
                     )
                     outputs[:bs] = hidden
                     for compact_idx, full_idx in enumerate(linear_idx):
-                        state_out_bufs[compact_idx][:bs] = new_states[full_idx]
-                        conv_out_bufs[compact_idx][:bs] = new_conv_states[full_idx]
                         # Write the new recurrent/conv state directly back
                         # into StateManager's real buffers, INSIDE the
                         # captured graph -- eliminates the 64 index_copy_

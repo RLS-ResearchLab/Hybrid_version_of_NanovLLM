@@ -79,15 +79,11 @@ def _decode_logits_no_sample(runner, seqs, force_eager: bool):
 
             graph.replay()
 
+            # State write-back happens INSIDE the captured graph (the
+            # in-graph index_copy_ in capture_cudagraph()'s _step()) --
+            # runner.state_manager's real buffers are already correct by
+            # the time replay() returns, matching production ModelRunner.run().
             hidden = gv["outputs"][:bs]
-            num_layers = len(runner.model.model.layers)
-            linear_idx = runner.model.model.linear_layer_indices
-            new_states = [None] * num_layers
-            new_conv_states = [None] * num_layers
-            for compact_idx, full_idx in enumerate(linear_idx):
-                new_states[full_idx] = gv["state_out_bufs"][compact_idx][:bs]
-                new_conv_states[full_idx] = gv["conv_out_bufs"][compact_idx][:bs]
-            runner.state_manager.set_all(context.state_slot_ids, new_states, new_conv_states, linear_idx)
             logits = runner.model.compute_logits(hidden)
     else:
         num_layers = len(runner.model.model.layers)

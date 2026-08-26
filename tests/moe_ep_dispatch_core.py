@@ -227,7 +227,8 @@ def worker(rank: int, scale: MoEScale, tmp_path: str):
     reference_routed_only = payload["reference_routed_only"]
 
     moe_local = Qwen35MoE(scale.hidden, scale.intermediate, scale.shared_intermediate,
-                           scale.num_experts, scale.top_k)
+                           scale.num_experts, scale.top_k,
+                           debug_ep_token_roundtrip=True)
     moe_local = moe_local.to(scale.dtype)  # before loading weights, so param dtype matches ref_state's
     assert moe_local.ep_size == scale.ep_size
     assert moe_local.ep_rank == rank
