@@ -28,7 +28,13 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from moe_w8a8_hopper_integration import quantize_experts_module_fp8_inplace  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "layers"))
+from moe_w8a8_hopper_integration import (               # noqa: E402
+    quantize_experts_module_fp8_inplace,
+    _KERNEL_BLOCK_N,
+    _KERNEL_WARP_N,
+)
+from moe_w8a8_hopper_quantize import gate_up_interleave_permutation  # noqa: E402
 
 
 class _FakeExperts(nn.Module):
@@ -101,7 +107,56 @@ def main():
     assert cos > 0.99, "dequantized weights should closely match the original bf16 values"
     ok &= cos > 0.99
 
-    # ---- 6. apply_moe_w8a8_hopper_quantization's per-module count is
+    # ---- 6. gate_up_proj_fp8_KERNEL: shape checks, plus the correctness
+    # property the whole real-checkpoint fix (2026-08-26) rests on -- that
+    # the interleaved buffer is the SAME logical weight as the contiguous
+    # one, just with rows reordered by gate_up_interleave_permutation, not
+    # some other accidental transformation. Checked two ways: (a) the
+    # permutation is a genuine bijection of range(N), not e.g. a
+    # many-to-one bug that would silently drop rows; (b) dequantizing the
+    # kernel buffer and comparing it to the ORIGINAL bf16 weights permuted
+    # by that same perm agrees closely (cosine > 0.99, same bar as check
+    # [5]'s round-trip). This is exactly the kind of per-stage exact-value
+    # check that found the original interleave bug on real hardware --
+    # doing it here, on CPU, against synthetic weights, is what makes the
+    # eventual real-Hopper validation a confirmation rather than a first
+    # look. ----
+    assert hasattr(experts, "gate_up_proj_fp8_kernel")
+    assert experts.gate_up_proj_fp8_kernel.dtype == torch.float8_e4m3fn
+    assert experts.gate_up_proj_fp8_kernel.shape == (E, N, K)
+    assert experts.gate_up_proj_scale_fp8_kernel.shape == (E, N // group_size, K // group_size)
+
+    MI = N // 2
+    perm = gate_up_interleave_permutation(MI, _KERNEL_BLOCK_N, _KERNEL_WARP_N)
+    assert perm.shape == (N,)
+    assert torch.equal(torch.sort(perm).values, torch.arange(N)), (
+        "gate_up_interleave_permutation must be a bijection of range(N) -- "
+        "a duplicate or missing index here would mean some physical rows are "
+        "silently dropped or double-counted when the kernel reads this buffer"
+    )
+
+    gu_deq_kernel = dequantize_weight_fp8_grouped_gathered(
+        experts.gate_up_proj_fp8_kernel, experts.gate_up_proj_scale_fp8_kernel, group_size, torch.float32)
+    gu_before_permuted = gu_before[:, perm, :]
+    cos_kernel = torch.nn.functional.cosine_similarity(
+        gu_before_permuted.reshape(-1), gu_deq_kernel.reshape(-1), dim=0).item()
+    print(f"[6] gate_up_proj_fp8_kernel dequant-vs-permuted-original cosine={cos_kernel:.6f}")
+    assert cos_kernel > 0.99, "interleaved buffer should decode back to the permuted original weights"
+    ok &= cos_kernel > 0.99
+
+    # Cross-check in the OTHER direction too: un-permuting the kernel
+    # buffer's dequant via the inverse permutation should recover the same
+    # values as the plain contiguous buffer's own dequant (gu_deq from
+    # check [5]) -- confirms the two registered buffers really are two
+    # views of the same logical weight, not independently-drifted copies.
+    inv_perm = torch.argsort(perm)
+    cos_cross = torch.nn.functional.cosine_similarity(
+        gu_deq.reshape(-1), gu_deq_kernel[:, inv_perm, :].reshape(-1), dim=0).item()
+    print(f"[6b] contiguous vs. un-permuted-kernel cross-check cosine={cos_cross:.6f}")
+    assert cos_cross > 0.99, "contiguous and interleaved buffers disagree on the underlying weight"
+    ok &= cos_cross > 0.99
+
+    # ---- 7. apply_moe_w8a8_hopper_quantization's per-module count is
     # exercised separately (it imports the real Experts class, which cannot
     # be imported on this machine) -- explicitly out of scope here, not
     # silently skipped. ----

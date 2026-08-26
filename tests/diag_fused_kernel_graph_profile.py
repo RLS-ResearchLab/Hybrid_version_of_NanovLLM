@@ -99,6 +99,55 @@ def _bucket(kernel_name: str) -> str:
     return "other"
 
 
+class _AggregatedKernel:
+    __slots__ = ("key", "self_cuda_time_total", "count")
+
+    def __init__(self, key):
+        self.key = key
+        self.self_cuda_time_total = 0.0
+        self.count = 0
+
+
+def _aggregate_by_key(events) -> list["_AggregatedKernel"]:
+    """Manual replacement for prof.key_averages(), which was found
+    (tests/diag_profiler_key_averages_hang_cpu.py, 2026-08-26, CPU-only, no
+    CUDA involved) to scale severely superlinearly with raw event count --
+    112s just for the aggregation step at ~128k synthetic CPU events, with
+    the per-doubling cost growing worse as event count increases, not
+    better. That's the same event-count regime a real 64-decode-step graph
+    trace plausibly lands in (this file's own --output-len docstring:
+    "~20 kernels just from alignment+GEMM" per layer x 40 layers x 64 steps
+    is tens of thousands of launches before CPU/CUDA pairing even doubles
+    it), and lines up with this project's own observation that the
+    profiled trial itself completes fine but "bucketing... afterward hangs
+    indefinitely" -- not an infinite hang, a pathological aggregation that
+    looks like one. Reducing --output-len 64->16 only helping ~16x on a
+    curve this steep would still leave a very long wait if the original
+    was already large, which matches that 4x-smaller-trace fix attempt
+    having "not resolved it".
+
+    This groups prof.events() (the raw, UNAGGREGATED per-call event list --
+    confirmed to carry the same .key/.self_cuda_time_total/.count fields
+    key_averages()'s FunctionEventAvg objects do) by kernel name with a
+    single O(n) dict pass instead, producing the identical (key, summed
+    self_cuda_time_total, summed count) shape the rest of this script
+    already consumes -- same output, without whatever key_averages()
+    internally does that scales this badly on this PyTorch version.
+    """
+    by_key: dict[str, _AggregatedKernel] = {}
+    for e in events:
+        cuda_t = getattr(e, "self_cuda_time_total", 0)
+        if cuda_t <= 0:
+            continue
+        agg = by_key.get(e.key)
+        if agg is None:
+            agg = _AggregatedKernel(e.key)
+            by_key[e.key] = agg
+        agg.self_cuda_time_total += cuda_t
+        agg.count += e.count
+    return list(by_key.values())
+
+
 class _Args:
     pass
 
@@ -179,8 +228,13 @@ def main():
             print(f"Chrome trace written to {cli.trace_out} (open in chrome://tracing or "
                   f"https://ui.perfetto.dev for a visual timeline)")
 
-        events = prof.key_averages()
-        cuda_events = [e for e in events if getattr(e, "self_cuda_time_total", 0) > 0]
+        # NOT prof.key_averages() -- see _aggregate_by_key's docstring for why
+        # (found 2026-08-26 to hang/scale severely superlinearly on this
+        # PyTorch version at realistic event counts, CPU-reproducible,
+        # unrelated to CUDA graphs specifically). prof.events() is the raw,
+        # unaggregated per-call list; _aggregate_by_key does the same
+        # group-by-kernel-name reduction key_averages() used to, in O(n).
+        cuda_events = _aggregate_by_key(prof.events())
         if not cuda_events:
             print("\nNo CUDA kernel events with nonzero self time found in the trace.")
             print("This usually means this PyTorch/CUPTI/driver combination is not exposing "

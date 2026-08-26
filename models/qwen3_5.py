@@ -888,13 +888,20 @@ class Qwen35MoE(nn.Module):
         equivalent call: at ep_size=1, self.experts holds ALL experts, so a
         global expert id IS already a valid local slot -- same reasoning
         this function's INT8 siblings already rely on.
+
+        Reads gate_up_proj_fp8_KERNEL, not gate_up_proj_fp8 -- this kernel
+        needs gate/up interleaved every 8 physical rows (found 2026-08-24),
+        not the contiguous layout the plain FP8 dequant branches elsewhere
+        in this file use. See moe_w8a8_hopper_integration.py's
+        quantize_experts_module_fp8_inplace for where the two buffers are
+        produced.
         """
-        n_local_experts = self.experts.gate_up_proj_fp8.shape[0]
+        n_local_experts = self.experts.gate_up_proj_fp8_kernel.shape[0]
         x_fp8, x_scale = quantize_activation_fp8_dynamic(x)
         sorted_ids, expert_ids, ntpp = moe_align_block_size(idx, _W8A8_HOPPER_BLOCK_M, n_local_experts)
         out = fused_moe_w8a8_hopper_forward(
             x_fp8, x_scale,
-            self.experts.gate_up_proj_fp8, self.experts.gate_up_proj_scale_fp8,
+            self.experts.gate_up_proj_fp8_kernel, self.experts.gate_up_proj_scale_fp8_kernel,
             self.experts.down_proj_fp8, self.experts.down_proj_scale_fp8,
             sorted_ids, expert_ids, ntpp,
             w.to(torch.float32), self.top_k, n_local_experts,
@@ -1030,14 +1037,18 @@ class Qwen35MoE(nn.Module):
         kernel at bf16-out precision, not fp32, unlike every other branch
         here. Flag this explicitly in Phase 3's accuracy validation rather
         than assuming it's equivalent.
+
+        Reads gate_up_proj_fp8_KERNEL (interleaved), not gate_up_proj_fp8
+        (contiguous) -- same reasoning as _forward_gathered_w8a8_hopper's
+        docstring.
         """
-        n_local_experts = self.experts.gate_up_proj_fp8.shape[0]
+        n_local_experts = self.experts.gate_up_proj_fp8_kernel.shape[0]
         x_fp8, x_scale = quantize_activation_fp8_dynamic(x)
         w_masked = w.to(torch.float32) * owned_mask.to(torch.float32)
         sorted_ids, expert_ids, ntpp = moe_align_block_size(local_slots, _W8A8_HOPPER_BLOCK_M, n_local_experts)
         local_out = fused_moe_w8a8_hopper_forward(
             x_fp8, x_scale,
-            self.experts.gate_up_proj_fp8, self.experts.gate_up_proj_scale_fp8,
+            self.experts.gate_up_proj_fp8_kernel, self.experts.gate_up_proj_scale_fp8_kernel,
             self.experts.down_proj_fp8, self.experts.down_proj_scale_fp8,
             sorted_ids, expert_ids, ntpp,
             w_masked, self.top_k, n_local_experts,

@@ -9,19 +9,39 @@ warmup_model()/allocate_kv_cache() ordering, which applies identically here.
 ============================================================================
 STATUS -- read before assuming this is wired up
 ============================================================================
-This is Phase 1 of w8a8_activation_quant_scoping_memo.md: the WEIGHT side of
-true W8A8, written and CPU-tested, matching the discipline the tp=1 INT8 fix
-used (write blind, CPU-validate what's CPU-validatable, GPU-validate when
-hardware exists). NOT wired into ModelRunner.__init__ or any Config field --
-unlike apply_moe_int8_quantization, nothing calls
-apply_moe_w8a8_hopper_quantization anywhere yet. That's deliberate: doing so
-requires the forward-path integration (Phase 2/4 of the scoping memo,
-activation quantization + the actual moe_w8a8_hopper_forward call sites in
-models/qwen3_5.py) to exist first, and requires moe_w8a8.cu to have compiled
-and passed its own isolated smoke test (Phase 0) before any of this touches
-a real forward pass. Wiring this in ahead of those would let
-`use_moe_w8a8_hopper=True` construct successfully and then produce silently
-wrong output -- exactly the failure shape this project avoids by design.
+UPDATED 2026-08-26 (CPU-only session, no GPU access this window): this
+docstring described an earlier, unwired state of this file (Phase 1 written
+in isolation, nothing called it). That has since changed --
+engine/model_runner.py's __init__ DOES call
+apply_moe_w8a8_hopper_quantization when config.use_moe_w8a8_hopper is set,
+and models/qwen3_5.py's _forward_gathered_w8a8_hopper /
+_forward_gathered_ep_w8a8_hopper (decode) and the FP8 elif branches in
+_forward_dispatch / _forward_dispatch_ep (prefill) all read the buffers this
+function registers. That part of the integration predates this session
+(2026-08-23's "add True W8A8 (Hopper FP8)" commit) and is not new here.
+
+What WAS still missing, and is what this session's edit fixes: the fused
+kernel needs gate_up_proj's rows interleaved every 8 physically (see
+gate_up_interleave_permutation's docstring in
+layers/moe_w8a8_hopper_quantize.py), a requirement discovered 2026-08-24 via
+the isolated smoke test, AFTER this file was originally written -- so this
+function was quantizing the checkpoint's natural contiguous row order only,
+which is correct for the prefill dequant branches but WRONG for the fused
+kernel branches, which would have silently read a mismatched layout the
+first time `use_moe_w8a8_hopper=True` ran end to end on real weights. Fixed
+by registering a SECOND, permuted quantization (gate_up_proj_fp8_kernel /
+gate_up_proj_scale_fp8_kernel) alongside the original, and repointing the
+two fused-kernel call sites in models/qwen3_5.py at it. See
+quantize_experts_module_fp8_inplace's docstring for the full reasoning.
+
+**Still NOT validated**: this fix is CPU-only (permutation math + shape/
+round-trip checks in tests/test_moe_w8a8_hopper_integration_cpu.py) --
+nothing here has run against the actual compiled moe_w8a8.cu kernel with
+these buffers plugged into a real engine. That needs a real Hopper GPU
+(compile + either the isolated smoke test with a real checkpoint's dims, or
+a full engine construction with use_moe_w8a8_hopper=True) before trusting
+this in production, exactly the blocking item SESSION_HANDOFF_2026-08-25.md
+flagged.
 
 Storage-layout decision (memo §2a / "Decisions I'd like from you" #3) is
 still open: whether these FP8 buffers live ADDITIVELY alongside the INT8
@@ -34,17 +54,18 @@ either answer.
 WHAT THIS DOES NOT DO
 ============================================================================
 - Does not touch utils/loader.py, load_model(), or shard_experts_tensor --
-  same zero-changes-to-the-loading-path design as the INT8 version, now
-  proven safe for THIS (2D-block) scale layout too by
-  tests/test_moe_w8a8_hopper_tp_ep_sharding_cpu.py, not just assumed to
-  transfer from the INT8 case.
-- Does not touch models/qwen3_5.py. No forward path reads
-  gate_up_proj_fp8/down_proj_fp8 yet.
-- Does not run an accuracy ablation -- needs the full Phase 0-4 chain first.
+  same zero-changes-to-the-loading-path design as the INT8 version, proven
+  safe for the 2D-block scale layout by
+  tests/test_moe_w8a8_hopper_tp_ep_sharding_cpu.py. That test predates the
+  permuted gate_up_proj_fp8_kernel buffer added this session and hasn't been
+  re-run against it -- the underlying claim (quantize commutes with
+  shard_experts_tensor's dim-0-only indexing) should still hold since
+  permutation only reorders dim 1, but this is reasoned, not re-confirmed.
+- Does not run an accuracy ablation against the real kernel -- needs real
+  Hopper hardware, see STATUS above.
 - Does not compute activation scales -- that's
   layers/moe_w8a8_hopper_quantize.py's quantize_activation_fp8_dynamic,
-  called per-token in the decode hot path once Phase 2 wires it in, not a
-  load-time concern at all.
+  called per-token in the decode hot path, not a load-time concern at all.
 """
 import os
 import sys
@@ -54,7 +75,21 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "layers"))
-from moe_w8a8_hopper_quantize import quantize_weight_fp8_grouped  # noqa: E402
+from moe_w8a8_hopper_quantize import (          # noqa: E402
+    quantize_weight_fp8_grouped,
+    gate_up_interleave_permutation,
+)
+
+# Must match models/qwen3_5.py's _W8A8_HOPPER_BLOCK_N / _W8A8_HOPPER_WARP_N
+# exactly -- gate_up_interleave_permutation's layout is config-dependent on
+# this pair (see its docstring). Can't import those constants directly:
+# models/qwen3_5.py has an unconditional triton import at module level that
+# fails on any machine without triton (this dev machine included), so this
+# module -- which needs to stay CPU-testable -- hardcodes the same values
+# instead, same "assert rather than silently diverge" posture
+# quantize_weight_fp8_grouped already takes with group_size==128.
+_KERNEL_BLOCK_N = 32
+_KERNEL_WARP_N = 8
 
 
 def quantize_experts_module_fp8_inplace(experts: nn.Module, group_size: int = 128) -> None:
@@ -65,6 +100,29 @@ def quantize_experts_module_fp8_inplace(experts: nn.Module, group_size: int = 12
     reasoning as quantize_experts_module_inplace (INT8): holding both bf16
     and FP8 simultaneously nets zero capacity win.
 
+    Registers TWO gate_up_proj quantizations, not one -- same pattern
+    layers/smoke_test_moe_w8a8_hopper.py's main() already validated at small
+    scale (cosine 0.998 against a real Hopper run, 2026-08-24):
+      - gate_up_proj_fp8 / gate_up_proj_scale_fp8: CONTIGUOUS gate=[0,MI),
+        up=[MI,2*MI) layout, exactly what quantize_weight_fp8_grouped
+        produces from the checkpoint's natural row order. Read by the plain
+        dequant (prefill) branches in models/qwen3_5.py, which split
+        gate/up via a plain .chunk(2, 0) and would silently produce the
+        wrong SwiGLU split if given the interleaved layout instead.
+      - gate_up_proj_fp8_kernel / gate_up_proj_scale_fp8_kernel: the SAME
+        logical weight with rows reordered by gate_up_interleave_permutation
+        before quantization (permute-then-quantize, not quantize-then-
+        permute -- this keeps each 128x128 scale tile self-consistent for
+        whatever row order it was computed from, rather than needing scale
+        tiles reasoned about post-hoc under a row shuffle). Read only by the
+        fused moe_w8a8.cu kernel call sites (_forward_gathered_w8a8_hopper /
+        _forward_gathered_ep_w8a8_hopper), which need gate/up interleaved
+        every 8 physical rows -- see that function's docstring for why.
+    This doubles gate_up_proj's post-quantization memory (down_proj is
+    unaffected -- it isn't a fused gate+up projection, so it never needed a
+    second layout), trading capacity for reusing an already-proven-correct
+    pattern instead of inverse-permuting inside the hot decode path.
+
     Requires experts.gate_up_proj.shape[-2:] and experts.down_proj.shape[-2:]
     both divisible by group_size (128) -- true at this project's real
     production dims (H=2048, MI=512 -> gate_up N=1024) but not guaranteed in
@@ -74,7 +132,10 @@ def quantize_experts_module_fp8_inplace(experts: nn.Module, group_size: int = 12
     Device-agnostic like its INT8 counterpart -- no .cpu()/.cuda() calls, so
     this stays exercisable by a CPU-only test suite as well as the real CUDA
     call site this is designed for (ModelRunner.__init__, where
-    torch.set_default_device("cuda") is already active).
+    torch.set_default_device("cuda") is already active). gate_up_interleave_
+    permutation itself returns a CPU LongTensor; indexing a CUDA tensor with
+    it works fine (torch moves the index tensor implicitly), so no explicit
+    .to(device) is needed here either.
 
     Running both quantization schemes on the SAME module is not supported --
     config.py describes the two flags as "additive not a replacement" in the
@@ -95,6 +156,12 @@ def quantize_experts_module_fp8_inplace(experts: nn.Module, group_size: int = 12
     gu_fp8, gu_scale = quantize_weight_fp8_grouped(experts.gate_up_proj.data, group_size)
     dp_fp8, dp_scale = quantize_weight_fp8_grouped(experts.down_proj.data, group_size)
 
+    MI = experts.gate_up_proj.shape[-2] // 2
+    perm = gate_up_interleave_permutation(MI, _KERNEL_BLOCK_N, _KERNEL_WARP_N)
+    gu_fp8_kernel, gu_scale_kernel = quantize_weight_fp8_grouped(
+        experts.gate_up_proj.data[:, perm, :], group_size
+    )
+
     # Same loud-failure-over-silent-wrong-state reasoning as the INT8
     # version: __delattr__ removes the Parameter entirely (not set to None),
     # so any forward path still expecting bf16 gate_up_proj/down_proj fails
@@ -104,6 +171,8 @@ def quantize_experts_module_fp8_inplace(experts: nn.Module, group_size: int = 12
 
     experts.register_buffer("gate_up_proj_fp8", gu_fp8)
     experts.register_buffer("gate_up_proj_scale_fp8", gu_scale)
+    experts.register_buffer("gate_up_proj_fp8_kernel", gu_fp8_kernel)
+    experts.register_buffer("gate_up_proj_scale_fp8_kernel", gu_scale_kernel)
     experts.register_buffer("down_proj_fp8", dp_fp8)
     experts.register_buffer("down_proj_scale_fp8", dp_scale)
 

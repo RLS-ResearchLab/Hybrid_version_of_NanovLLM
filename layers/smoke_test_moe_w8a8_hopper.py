@@ -48,60 +48,8 @@ from moe_w8a8_hopper_quantize import (                          # noqa: E402
     quantize_activation_fp8_dynamic,
     quantize_weight_fp8_grouped,
     dequantize_weight_fp8_grouped_gathered,
+    gate_up_interleave_permutation,
 )
-
-
-def gate_up_interleave_permutation(MI, block_n=32, warp_n=8):
-    """Row-permutation for moe_w8a8.cu's up-proj wgmma, found 2026-08-24.
-
-    The kernel's SwiGLU combine pairs wgmma accumulator register c0
-    (physical gate_up_proj weight-row r) with c2 (row r+8) as (gate, up) for
-    the SAME logical down-proj-input feature -- derived from the Hopper
-    wgmma m64nNk32 F32-accumulator fragment layout (thread 0 owns
-    (0,0),(0,1),(8,0),(8,1), repeating every 8 N-columns) combined with this
-    kernel's own warpgroup/tn/warp_local tiling of the N axis. That means
-    the kernel needs gate and up interleaved every 8 physical rows, NOT laid
-    out as the conventional contiguous halves (gate=[0,MI), up=[MI,2*MI))
-    that both this test's naive synthetic weights and any standard
-    gate_up_proj checkpoint use. Confirmed empirically: hand-computing
-    SwiGLU from the kernel's own (independently verified-correct) gate/up
-    f_acc values under the contiguous assumption gave a value ~59x off and
-    opposite-signed from the reference at the matching coordinate.
-
-    Returns a LongTensor `perm` of length 2*MI such that indexing a
-    contiguous-layout (2*MI, ...) weight as `w[perm]` produces the
-    interleaved layout the kernel needs. CONFIG-DEPENDENT: this permutation
-    is only valid for the (block_n, warp_n) pair the kernel is actually
-    launched with -- recompute it if those change.
-    """
-    rows_per_block = block_n * warp_n
-    rows_per_warpgroup = block_n * 4
-    rows_per_tn = 64
-    logical_per_block = rows_per_block // 2
-    logical_per_warpgroup = logical_per_block // 2
-    N = 2 * MI
-    assert N % rows_per_block == 0, (
-        f"2*MI={N} must be divisible by block_n*warp_n={rows_per_block}"
-    )
-    num_blocks = N // rows_per_block
-
-    perm = torch.empty(N, dtype=torch.long)
-    for block in range(num_blocks):
-        for p_local in range(rows_per_block):
-            warpgroup = p_local // rows_per_warpgroup
-            p_in_wg = p_local % rows_per_warpgroup
-            tn = p_in_wg // rows_per_tn
-            p_in_tn = p_in_wg % rows_per_tn
-            band = p_in_tn // 16       # warp_local, 0-3
-            offset = p_in_tn % 16      # 0-15
-            is_gate = offset < 8
-            lane4 = offset % 8
-            logical_in_tn = band * 8 + lane4   # 0-31 (within this tn)
-            logical_feature = (block * logical_per_block + warpgroup * logical_per_warpgroup
-                                + tn * 32 + logical_in_tn)
-            p_global = block * rows_per_block + p_local
-            perm[p_global] = logical_feature if is_gate else (MI + logical_feature)
-    return perm
 
 
 def reference_pipeline(x, gu_fp8, gu_scale, dp_fp8, dp_scale, group_size,
