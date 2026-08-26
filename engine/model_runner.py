@@ -441,6 +441,17 @@ class ModelRunner:
                 gv["slot_mapping"][:bs] = context.slot_mapping
                 gv["context_lens"].zero_()
                 gv["context_lens"][:bs] = context.context_lens
+                # Reset before the partial overwrite, matching slot_mapping/
+                # state_slot_ids above -- without this, padding rows
+                # (bs:max_bs) keep stale block ids from whatever larger-bs
+                # call last wrote this static buffer, potentially pointing
+                # at blocks freed and reassigned to an unrelated sequence
+                # since. context_lens=0 for these rows should already make
+                # flash_attn_with_kvcache skip reading block_table for them
+                # entirely (same paired zero/-1 gating slot_mapping/
+                # state_slot_ids rely on) -- this is defense in depth, not
+                # a behavior change, in case that assumption is ever wrong.
+                gv["block_tables"].fill_(-1)
                 gv["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
                 # Padding rows (this graph's captured size may exceed bs)
                 # must resolve to the reserved scratch slot, not leftover
