@@ -55,19 +55,22 @@ def _maybe_print_timing():
             print(f"    {stage:8s}: {v/c*1000:7.3f} ms/call  "
                   f"({v/total*100:5.1f}% of this function's own time)")
 
-# Single, fixed, conservative config -- validated in the smoke tests, not yet
-# autotuned per shape/concurrency. layers/fused_moe_triton_raw.py's own
-# autotuner script (adapted from a prior project) is the template for doing
-# that properly later; using one safe config everywhere for now trades some
-# performance for not adding an untested autotuning dependency to the first
-# real integration attempt.
+# Retuned 2026-08-27 for Hopper (H100) -- the previous config (BLOCK_SIZE_K=64,
+# num_warps=4, num_stages=2, still below in a comment for reference) was the
+# one validated on A6000/Ampere back when this kernel was first built, and
+# had never been retuned since. layers/tune_fused_moe_triton.py swept 12
+# candidate configs at the real problem scale (E=128, K=2048, N=512, top_k=8,
+# M=32) using CUDA-event device-side timing; this one measured 1.53x faster
+# than the old default in that isolated benchmark. Old config, for reference
+# and easy revert: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64,
+# "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2}.
 _DEFAULT_CONFIG = {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 64,
-    "BLOCK_SIZE_K": 64,   # must divide the quantization group_size (128) evenly
+    "BLOCK_SIZE_K": 128,   # must divide the quantization group_size (128) evenly
     "GROUP_SIZE_M": 1,
-    "num_warps": 4,
-    "num_stages": 2,
+    "num_warps": 8,
+    "num_stages": 3,
 }
 
 
