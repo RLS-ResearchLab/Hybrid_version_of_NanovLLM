@@ -1543,9 +1543,40 @@ class Qwen35MoE(nn.Module):
         # experts -- confirmed handled correctly, see docstring.
         offs = expert_counts.cumsum(0).to(torch.int32)
 
+        # int8 branch, added to unblock use_moe_w8a8=True combined with
+        # use_vectorized_moe=True -- moe_int8_integration.py deletes the
+        # bf16 gate_up_proj/down_proj Parameters unconditionally regardless
+        # of which prefill dispatch path is active (fail loudly, not
+        # silently -- see moe_int8_integration.py's own comment), so this
+        # branch was always required for that combination to work, not
+        # just newly broken. dequantize_weight_int8_grouped is generic over
+        # leading batch dims (*lead, out_features, in_features =
+        # int8_weight.shape), so it dequantizes the FULL (NE, ...) expert
+        # table directly -- no per-expert loop needed, matching this
+        # function's own vectorized design. Unlike _forward_dispatch's
+        # per-expert dequant (which only ever materializes one expert's
+        # weights at a time), this materializes the full bf16-equivalent
+        # gate_up_proj/down_proj tensors upfront, every prefill call -- a
+        # real memory/bandwidth cost traded for keeping the grouped_mm path
+        # intact (torch._grouped_mm has no quantized-weight variant to feed
+        # int8 tensors directly). Not yet measured against the plain
+        # _forward_dispatch int8 path's cost -- confirm this is still a net
+        # win before trusting it blindly at scale.
+        if hasattr(self.experts, "gate_up_proj_int8"):
+            G = self.experts.moe_w8a8_group_size
+            gate_up_full = dequantize_weight_int8_grouped(
+                self.experts.gate_up_proj_int8, self.experts.gate_up_proj_scale, G, x.dtype
+            )
+            down_full = dequantize_weight_int8_grouped(
+                self.experts.down_proj_int8, self.experts.down_proj_scale, G, x.dtype
+            )
+        else:
+            gate_up_full = self.experts.gate_up_proj
+            down_full = self.experts.down_proj
+
         # Transposed VIEWs, not copies -- see docstring.
-        gate_up_t = self.experts.gate_up_proj.transpose(-1, -2)  # (NE, H, 2*MI)
-        down_t = self.experts.down_proj.transpose(-1, -2)        # (NE, MI, H)
+        gate_up_t = gate_up_full.transpose(-1, -2)  # (NE, H, 2*MI)
+        down_t = down_full.transpose(-1, -2)        # (NE, MI, H)
 
         gate_up_out = torch._grouped_mm(sorted_tokens, gate_up_t, offs=offs)  # (N*TK, 2*MI), x.dtype
         gate, up = gate_up_out.chunk(2, dim=-1)
