@@ -278,6 +278,27 @@ class BatchedEngine:
                 # diagnostic flag; revisit if this ever needs to be the
                 # permanent server path.
                 time.sleep(0.001)
+            else:
+                # GIL yield, found 2026-08-27: with no sleep at all on this
+                # branch, this thread calls step() back-to-back in a tight
+                # loop for the entire span of an active generation. Every
+                # decode step's Python-side bookkeeping (Scheduler.schedule(),
+                # postprocess(), tensor indexing) holds the GIL, and with no
+                # cooperative yield between iterations, this starves the
+                # asyncio event loop thread -- which has to actually read/
+                # parse an incoming HTTP connection before it can even call
+                # add_request() -- for the full duration of an active
+                # generation. Confirmed via [STEP DEBUG] server-side logging:
+                # a second request fired concurrently with a first did not
+                # reach add_request() until ~17-19s later, right when the
+                # first request's generation was finishing -- not explainable
+                # by network/tokenization latency (millisecond-scale), but
+                # exactly the signature of this thread starving the request
+                # from ever being read. A brief sleep here doesn't meaningfully
+                # cost decode throughput (a fraction of a percent against a
+                # ~15-20ms decode step) but gives the event loop thread a real
+                # chance to run between steps.
+                time.sleep(0.0001)
 
     def generate(self, prompt_token_ids: list[int], max_tokens: int,
                  temperature: float, ignore_eos: bool = False,
