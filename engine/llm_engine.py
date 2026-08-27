@@ -79,6 +79,18 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        # TEMPORARY DIAGNOSTIC 2026-08-27 -- prints only on a state change
+        # (prefill/decode flip, or the active seq_id set changing), not
+        # every decode step, to find exactly where two near-simultaneous
+        # requests stop being processed together. Remove once resolved.
+        sig = (is_prefill, tuple(s.seq_id for s in seqs))
+        if sig != getattr(self, "_last_step_sig", None):
+            import time as _t
+            print(f"[STEP DEBUG] t={_t.perf_counter():.3f} is_prefill={is_prefill} "
+                  f"n={len(seqs)} seq_ids={[s.seq_id for s in seqs]} "
+                  f"waiting={len(self.scheduler.waiting)} running={len(self.scheduler.running)}",
+                  flush=True)
+            self._last_step_sig = sig
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
