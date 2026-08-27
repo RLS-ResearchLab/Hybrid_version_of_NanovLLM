@@ -13,30 +13,34 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     use_fused_gdr_kernel: bool = False
-    # Decode-side counterpart to use_fused_gdr_kernel above -- that flag only
-    # ever affects PREFILL (models/qwen3_5.py's is_decode_shape check forces
-    # decode onto the sequential per-segment scan unconditionally, regardless
-    # of this flag). This one instead batches the per-segment Python loop in
-    # the DECODE branch into a single call to layers/fused_recurrent.py's
-    # Triton kernel (plus layers/gated_delta_net.py's causal-conv1d-decode
-    # kernel). Added 2026-08-26, candidate kernels only -- CORRECTNESS
-    # verified against a plain-PyTorch reference by hand-tracing the math
-    # (layers/smoke_test_fused_recurrent_gdr.py) but NEVER RUN on any
-    # hardware (no triton/CUDA on this dev machine). Do not set True before
-    # that smoke test has actually passed on a real GPU AND
-    # tests/profile_decode_launch_overhead.py (or equivalent) has confirmed
-    # the sequential loop this replaces is a measurable cost in the first
-    # place -- the one real profiling data point that exists
-    # (moe_quantization_memo.md's nsys trace) attributed eager-mode small-
-    # kernel overhead to PREFILL's _forward_dispatch_ep, not decode, and
-    # decode already runs under CUDA graph capture in production, which that
-    # same profile found eliminates most of this class of overhead for
-    # whatever it captures. ALSO UNCONFIRMED: whether this Triton kernel is
-    # capturable inside torch.cuda.graph() at all -- the reason decode never
-    # takes ANY fused path today is that the fla prefill kernel was found
-    # NOT to be capturable; that question is open, not assumed-safe, for
-    # this kernel too.
+    # Decode-side counterpart to use_fused_gdr_kernel above (that one is
+    # PREFILL-only -- is_decode_shape forces decode onto the sequential
+    # per-segment scan regardless of it). This routes the DECODE branch's
+    # per-request Python loop through fla.ops.gated_delta_rule.
+    # fused_recurrent_gated_delta_rule -- the single-step recurrent
+    # counterpart of the chunk kernel prefill uses (models/qwen3_5.py's
+    # _forward_decode_fused_gdr). REWRITTEN 2026-08-27: the original wired
+    # phantom, never-committed modules (nanovllm.layers.fused_recurrent /
+    # gated_delta_net) so this flag was dead; it now calls the real installed
+    # fla kernel. STILL GPU-UNVALIDATED -- the open question is whether fla's
+    # recurrent kernel is capturable inside torch.cuda.graph() (the chunk
+    # kernel is NOT: cudaErrorStreamCaptureInvalidated). Prefer
+    # use_batched_gdr_decode below (dependency-free, numerically identical,
+    # CPU-verified, graph-safe by construction) as the primary path; try
+    # this one on GPU only as an A/B against it -- see THROUGHPUT_PUSH_
+    # CHECKLIST.md's D2 decision.
     use_fused_gdr_decode_kernel: bool = False
+    # Triton-free batched decode path for Qwen35LinearAttention -- replaces
+    # forward()'s per-request `for i in range(num_segments)` Python loop (30
+    # of 40 layers, ~30k tiny kernel launches per captured decode step at
+    # concurrency 64) with one set of batched tensor ops. Unlike
+    # use_fused_gdr_decode_kernel above, this has NO missing dependency and
+    # is numerically identical to the sequential scan (same reduction order),
+    # CPU-verified (tests/test_qwen35_gdr_decode_batched.py: bitwise@N=1,
+    # ~1e-8@N=64, no 16-step drift). Still needs a GPU run to confirm it
+    # CUDA-graph-captures and to measure the actual throughput effect. Off by
+    # default; the sequential scan stays the ground-truth path.
+    use_batched_gdr_decode: bool = False
     use_vectorized_moe: bool = False
     use_moe_w8a8: bool = False
     moe_w8a8_weight_group_size: int = 128
@@ -143,6 +147,7 @@ class Config:
         # getattr(config, "use_fused_gdr_kernel", False) read.
         self.hf_config.use_fused_gdr_kernel = self.use_fused_gdr_kernel
         self.hf_config.use_fused_gdr_decode_kernel = self.use_fused_gdr_decode_kernel
+        self.hf_config.use_batched_gdr_decode = self.use_batched_gdr_decode
         self.hf_config.use_vectorized_moe = self.use_vectorized_moe
         self.hf_config.debug_ep_token_roundtrip = self.debug_ep_token_roundtrip
         # NOTE: use_moe_w8a8 / moe_w8a8_weight_group_size deliberately do NOT

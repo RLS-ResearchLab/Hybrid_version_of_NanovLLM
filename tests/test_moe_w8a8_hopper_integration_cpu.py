@@ -1,34 +1,40 @@
 """CPU-only correctness check for moe_w8a8_hopper_integration.py's
 quantize_experts_module_fp8_inplace / apply_moe_w8a8_hopper_quantization --
 the load-time FP8 weight-quantization pass, exercised without CUDA, without
-triton, and without the real Experts class (models/qwen3_5.py has an
-unconditional triton import at module level, confirmed empirically absent on
-this Windows dev machine, so it cannot be imported here at all).
+triton, and without compiling moe_w8a8.cu.
 
-Uses a minimal stand-in nn.Module with the same two Parameter names
-(gate_up_proj, down_proj) the real Experts module has -- this is a faithful
-exercise of quantize_experts_module_fp8_inplace's actual logic (it only ever
-touches those two attribute names), not a mock of behavior this test then
-just asserts happened.
+Sections 1-7 use a minimal _FakeExperts stand-in (same two Parameter names
+the pass touches) for the low-level permutation/scale-layout math. Section 8
+runs apply_moe_w8a8_hopper_quantization end-to-end against the REAL
+Qwen35MoE / Experts -- possible on a CPU-only box since layers/fused_moe_int8.py's
+triton import was made lazy 2026-08-27 (models/qwen3_5.py imports on CPU now).
+engine/model_runner.py DOES call this pass when config.use_moe_w8a8_hopper is
+set (2026-08-23), and _forward_gathered_w8a8_hopper / the FP8 elif branches
+in _forward_dispatch* read the buffers it registers.
 
-Does NOT validate: moe_w8a8.cu itself, the real Experts class, or engine
-integration (nothing calls apply_moe_w8a8_hopper_quantization from
-ModelRunner yet -- see moe_w8a8_hopper_integration.py's own module
-docstring). Validates only that the in-place mutation this pass performs --
-delete bf16 Parameters, register FP8 buffers, set the group_size attribute --
-does what it claims, correctly and without leaking the old memory reference.
+Does NOT validate: moe_w8a8.cu itself -- that still needs a real compile+run
+on Hopper (Phase 0). Validates the in-place mutation (delete bf16 Parameters,
+register the 6 FP8 buffers + kernel-permuted variant, set the group_size
+attr), the model-walk, and the double-quantization guard.
 
 Usage:
     python tests/test_moe_w8a8_hopper_integration_cpu.py
 """
 import os
 import sys
+import types
 
 import torch
 import torch.nn as nn
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if "nanovllm" not in sys.modules:
+    _pkg = types.ModuleType("nanovllm")
+    _pkg.__path__ = [_ROOT]
+    _pkg.__file__ = os.path.join(_ROOT, "__init__.py")
+    sys.modules["nanovllm"] = _pkg
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "layers"))
+sys.path.insert(0, os.path.join(_ROOT, "layers"))
 from moe_w8a8_hopper_integration import (               # noqa: E402
     quantize_experts_module_fp8_inplace,
     _KERNEL_BLOCK_N,
@@ -185,18 +191,53 @@ def main():
     assert cos_64_4 > 0.99
     ok &= cos_64_4 > 0.99
 
-    # ---- 8. apply_moe_w8a8_hopper_quantization's per-module count is
-    # exercised separately (it imports the real Experts class, which cannot
-    # be imported on this machine) -- explicitly out of scope here, not
-    # silently skipped. ----
-    print("\n[skipped] apply_moe_w8a8_hopper_quantization (walks real model.modules(), "
-          "requires importing models.qwen3_5.Experts -- blocked by the unconditional "
-          "triton import on this machine, needs a real GPU environment).")
+    # ---- 8. apply_moe_w8a8_hopper_quantization end-to-end against the REAL
+    # Qwen35MoE / Experts. Previously skipped because models/qwen3_5.py had an
+    # unconditional module-level `import triton`; that was made lazy
+    # 2026-08-27 (layers/fused_moe_int8.py), so the real class imports on a
+    # CPU-only box now. This exercises the actual model-walk + real-Experts
+    # mutation, not just the _FakeExperts stand-in. ----
+    import torch.distributed as dist
+    if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29547")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        dist.init_process_group("gloo")
+    from nanovllm.models.qwen3_5 import Qwen35MoE, Experts
+    from moe_w8a8_hopper_integration import apply_moe_w8a8_hopper_quantization
+
+    torch.manual_seed(1)
+    moe = Qwen35MoE(hidden_size=128, intermediate_size=256, shared_intermediate_size=256,
+                    num_experts=8, top_k=2)
+    with torch.no_grad():
+        moe.experts.gate_up_proj.normal_(0, 0.02)
+        moe.experts.down_proj.normal_(0, 0.02)
+
+    n = apply_moe_w8a8_hopper_quantization(moe, group_size=128)
+    print(f"[8] apply_moe_w8a8_hopper_quantization -> quantized {n} Experts module(s)")
+    assert n == 1, f"expected 1 Experts module quantized, got {n}"
+    exp = moe.experts
+    assert not hasattr(exp, "gate_up_proj") and not hasattr(exp, "down_proj"), \
+        "bf16 Experts Parameters must be deleted after quantization"
+    for buf in ("gate_up_proj_fp8", "gate_up_proj_scale_fp8", "gate_up_proj_fp8_kernel",
+                "gate_up_proj_scale_fp8_kernel", "down_proj_fp8", "down_proj_scale_fp8"):
+        assert hasattr(exp, buf), f"missing FP8 buffer after quantization: {buf}"
+    assert exp.gate_up_proj_fp8.dtype == torch.float8_e4m3fn
+    assert getattr(exp, "moe_w8a8_hopper_group_size", None) == 128
+    # Re-running must fail loudly (bf16 params already gone), not silently double-quantize.
+    try:
+        apply_moe_w8a8_hopper_quantization(moe, group_size=128)
+        raise AssertionError("expected RuntimeError on double-quantization")
+    except RuntimeError as e:
+        assert "already gone" in str(e)
+    print("    [OK] real Experts quantized, bf16 params deleted, 6 FP8 buffers registered, "
+          "double-quant fails loudly")
 
     print("\nPASS" if ok else "\nFAIL")
-    print("\nScope reminder: validates quantize_experts_module_fp8_inplace's in-place "
-          "mutation logic against a stand-in module only -- says nothing about the real "
-          "Experts class, moe_w8a8.cu, or engine wiring (none of which exist yet for this path).")
+    print("\nScope reminder: validates the load-time FP8 quantization pass (in-place mutation "
+          "logic + model-walk against the real Experts class) -- says NOTHING about moe_w8a8.cu "
+          "itself, which still needs a real compile+run on Hopper (Phase 0).")
     sys.exit(0 if ok else 1)
 
 

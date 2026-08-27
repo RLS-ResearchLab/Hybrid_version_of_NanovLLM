@@ -284,6 +284,7 @@ class Qwen35LinearAttention(nn.Module):
         rms_norm_eps: float,
         use_fused_gdr_kernel: bool = False,
         use_fused_gdr_decode_kernel: bool = False,
+        use_batched_gdr_decode: bool = False,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -321,20 +322,32 @@ class Qwen35LinearAttention(nn.Module):
         # discipline as moe_w8a8_hopper_integration.py's Phase 1/2 split.
         self.use_fused_gdr_decode_kernel = use_fused_gdr_decode_kernel
         self._fused_recurrent_gated_delta_rule = None
-        self._causal_conv1d_decode_triton = None
         if use_fused_gdr_decode_kernel:
             try:
-                from nanovllm.layers.fused_recurrent import fused_recurrent_gated_delta_rule
-                from nanovllm.layers.gated_delta_net import causal_conv1d_decode_triton
+                from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
             except ImportError as e:
                 raise ImportError(
-                    "use_fused_gdr_decode_kernel=True requires triton and a CUDA GPU "
-                    "(layers/fused_recurrent.py, layers/gated_delta_net.py). Install "
-                    "triton or leave use_fused_gdr_decode_kernel=False to use the "
-                    "existing sequential GDR decode scan."
+                    "use_fused_gdr_decode_kernel=True requires the 'flash-linear-attention' "
+                    "package ('fla' import name) and a CUDA GPU with Triton support -- it "
+                    "calls fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule, the "
+                    "single-step recurrent counterpart of the chunk kernel prefill already "
+                    "uses via use_fused_gdr_kernel. Leave it False for the sequential scan, "
+                    "or use use_batched_gdr_decode for the dependency-free batched path."
                 ) from e
             self._fused_recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
-            self._causal_conv1d_decode_triton = causal_conv1d_decode_triton
+
+        # Triton-free batched decode path (_forward_decode_batched). Same
+        # motivation as use_fused_gdr_decode_kernel -- collapse forward()'s
+        # per-request `for i in range(num_segments)` Python loop, which at
+        # concurrency 64 x 30 linear layers unrolls into ~30k tiny kernel
+        # launches per captured decode step -- but with pure batched tensor
+        # ops instead of a Triton kernel: no fla/triton dependency, and
+        # CUDA-graph-safe by construction (no .item(), no data-dependent
+        # shapes). Numerically identical to the sequential scan (same
+        # reduction order), so it can be turned on without a correctness
+        # ablation the way a reassociating kernel would need. Default False;
+        # the sequential scan stays the flag-off path and the ground truth.
+        self.use_batched_gdr_decode = use_batched_gdr_decode
 
         assert linear_attn_kq_heads % tp_size == 0
         assert linear_attn_v_heads % tp_size == 0
@@ -498,6 +511,12 @@ class Qwen35LinearAttention(nn.Module):
         if is_decode_shape and self.use_fused_gdr_decode_kernel:
             return self._forward_decode_fused_gdr(hidden_states, states, conv_states)
 
+        # Triton-free batched decode path -- same early, mutually-exclusive
+        # placement as the fused branch above, before any of this function's
+        # own work, so the sequential path below is untouched when it's off.
+        if is_decode_shape and self.use_batched_gdr_decode:
+            return self._forward_decode_batched(hidden_states, states, conv_states)
+
         # ── Project once over the whole packed N — pure per-token ops ──
         z = self.in_proj_z(hidden_states)        # (N, LVH*LHD)
         a = self.in_proj_a(hidden_states)        # (N, LVH)
@@ -654,44 +673,36 @@ class Qwen35LinearAttention(nn.Module):
 
         return self.out_proj(y), new_states, new_conv_states
 
-    def _forward_decode_fused_gdr(self, hidden_states, states, conv_states):
-        """UNVALIDATED, off by default -- see use_fused_gdr_decode_kernel's
-        docstring in config.py before ever enabling this. Never run against
-        the real kernels on any hardware (no triton/CUDA on the machine this
-        was written on); correctness only established by hand-tracing this
-        function's math against forward()'s sequential-scan decode branch
-        and a CPU-only plain-PyTorch reference comparison
-        (layers/smoke_test_fused_recurrent_gdr.py).
+    def _forward_decode_batched(self, hidden_states, states, conv_states):
+        """Triton-free batched replacement for forward()'s decode branch --
+        the `for i in range(num_segments)` Python loop plus its `for t in
+        range(T_i)` inner loop, both of which degenerate to one iteration per
+        request at decode (T_i == 1, num_segments == batch). Every op here is
+        the SAME op the sequential path runs, just with a leading batch dim N
+        instead of a Python loop over N segments: same projections, same
+        conv1d branch (the `seg_conv_state is not None and T_i == 1` one),
+        same head-expand -> L2-norm -> scale order, same single delta-rule
+        step in float32, same gated RMSNorm and out_proj. The K-dimension
+        reduction order (`.sum(dim=-2)`) is unchanged, so this is numerically
+        identical to the sequential scan (bitwise on CPU; GPU matmul
+        reassociation in the projections is the only expected difference,
+        same as the vectorized-MoE path).
 
-        Replaces forward()'s `for i in range(num_segments):` Python loop --
-        one iteration per request currently in the batch, every decode step,
-        every layer -- with ONE batched call each to
-        layers/gated_delta_net.py's causal_conv1d_decode_triton and
-        layers/fused_recurrent.py's fused_recurrent_gated_delta_rule. At
-        decode every segment has exactly one token and no cross-segment
-        interaction, so this is a straightforward batch-of-independent-
-        recurrences problem -- no cu_seqlens/varlen packing needed, unlike
-        _fused_gdr_scan's prefill case.
+        CUDA-graph-safe by construction: no `.item()`, no `.tolist()`, no
+        `.cpu()`, no Python branch on a tensor value, no data-dependent
+        shape -- every shape is a function of N (fixed per captured graph)
+        and static config dims.
 
-        Deliberately does NOT reuse the head-expand-then-L2-norm-then-scale
-        sequence forward()'s sequential path applies explicitly
-        (q.repeat_interleave(...); l2norm(q)*scale) -- the kernel takes q/k
-        at their ORIGINAL (un-expanded) lkh head count and does the head
-        mapping internally via its H/HV grid parameters (i_h = i_hv //
-        (HV//H), verified by reading fused_recurrent_gated_delta_rule_fwd_
-        kernel directly -- this is the same mapping repeat_interleave
-        produces, just without materializing the expanded tensor) and does
-        L2-norm + scale internally too (use_qk_l2norm_in_kernel=True,
-        scale=lhd**-0.5 passed as a kernel argument, applied in the same
-        normalize-then-scale order the sequential path uses). Passes RAW
-        `a`/`b` (pre-softplus, pre-sigmoid) as g/beta -- the kernel applies
-        -A_log.exp()*softplus(...) and sigmoid(...) internally
-        (use_beta_sigmoid_in_kernel=True); do NOT pre-transform them the way
-        forward()'s sequential path does before its loop, that would apply
-        the transform twice.
+        Args mirror _forward_decode_fused_gdr: `states` (N, LVH, LHD, LHD)
+        float32 or None; `conv_states` (N, QKV, CK-1) model dtype (the engine
+        always supplies both at decode via StateManager).
+
+        Returns (out, new_states, new_conv_states) with the exact shapes/
+        dtypes forward() returns for decode: out (N, H); new_states
+        (N, LVH, LHD, LHD) float32; new_conv_states (N, QKV, CK-1) model dtype.
         """
         N, _ = hidden_states.shape
-        lkh, lvh, lhd = self.lkh, self.lvh, self.lhd
+        lkh, lvh, lhd, ck = self.lkh, self.lvh, self.lhd, self.ck
         dt = hidden_states.dtype
 
         z = self.in_proj_z(hidden_states)        # (N, LVH*LHD)
@@ -699,42 +710,154 @@ class Qwen35LinearAttention(nn.Module):
         b = self.in_proj_b(hidden_states)        # (N, LVH)
         qkv = self.in_proj_qkv(hidden_states)    # (N, QKV)
 
-        qkv_conv, new_conv_states = self._causal_conv1d_decode_triton(
-            qkv.unsqueeze(-1), self.conv1d.weight, conv_states,
+        # Causal conv1d over the whole batch. Matches forward()'s
+        # `seg_conv_state is not None and T_i == 1` branch: prepend the
+        # CK-1-wide conv history, append this step's token -> (N, QKV, CK),
+        # one grouped conv collapses the window to length 1. conv_states is
+        # never None at decode (StateManager always supplies it); fall back
+        # to zeros only for defensiveness / standalone tests.
+        if conv_states is None:
+            conv_states = qkv.new_zeros(N, self.qkv_dim, ck - 1)
+        combined = torch.cat([conv_states, qkv.unsqueeze(-1)], dim=2)   # (N, QKV, CK)
+        new_conv_states = combined[:, :, -(ck - 1):].detach()           # (N, QKV, CK-1)
+        qkv_conv = F.conv1d(
+            combined, self.conv1d.weight, self.conv1d.bias,
+            padding=0, groups=self.qkv_dim,
+        )                                                              # (N, QKV, 1)
+        qkv_conv = F.silu(qkv_conv.transpose(1, 2))                    # (N, 1, QKV)
+
+        q = qkv_conv[:, :, :lkh * lhd].view(N, 1, lkh, lhd)
+        k = qkv_conv[:, :, lkh * lhd:2 * lkh * lhd].view(N, 1, lkh, lhd)
+        v = qkv_conv[:, :, 2 * lkh * lhd:].view(N, 1, lvh, lhd)
+
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())  # (N, LVH)
+        beta = b.sigmoid()                                                            # (N, LVH)
+
+        q = q.repeat_interleave(self.head_expand, dim=2)   # (N, 1, LVH, LHD)
+        k = k.repeat_interleave(self.head_expand, dim=2)
+        scale = lhd ** -0.5
+        q = l2norm(q.float()) * scale
+        k = l2norm(k.float())
+
+        g = g.float()
+        beta = beta.float()
+        v = v.float()
+
+        if states is None:
+            S = q.new_zeros(N, lvh, lhd, lhd, dtype=torch.float32)
+        else:
+            S = states.float()
+
+        # One delta-rule step, batched over N -- identical to forward()'s
+        # inner `for t in range(T_i)` body at t == 0.
+        g_t = g.exp().unsqueeze(-1).unsqueeze(-1)          # (N, LVH, 1, 1)
+        beta_t = beta.unsqueeze(-1)                        # (N, LVH, 1)
+        k_t = k[:, 0]                                      # (N, LVH, LHD)
+        v_t = v[:, 0]
+        q_t = q[:, 0]
+        S = S * g_t
+        kv_mem = (S * k_t.unsqueeze(-1)).sum(dim=-2)       # (N, LVH, LHD)
+        delta = (v_t - kv_mem) * beta_t
+        S = S + k_t.unsqueeze(-1) * delta.unsqueeze(-2)    # (N, LVH, LHD, LHD)
+        y = (S * q_t.unsqueeze(-1)).sum(dim=-2)            # (N, LVH, LHD)
+
+        new_states = S.detach()                            # (N, LVH, LHD, LHD) float32
+
+        y = y.to(dt).reshape(N * lvh, lhd)
+        z_flat = z.reshape(N * lvh, lhd)
+        y = self.norm(y, z_flat)
+        y = y.reshape(N, lvh * lhd)
+
+        return self.out_proj(y), new_states, new_conv_states
+
+    def _forward_decode_fused_gdr(self, hidden_states, states, conv_states):
+        """GPU-UNVALIDATED, off by default -- see use_fused_gdr_decode_kernel's
+        docstring in config.py. Same goal as _forward_decode_batched (kill
+        forward()'s per-request `for i in range(num_segments)` decode loop on
+        30 of 40 layers), but the single delta-rule recurrence step is done by
+        fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule -- the
+        single-step counterpart of the chunk kernel _fused_gdr_scan already
+        uses for prefill -- instead of the batched tensor ops
+        _forward_decode_batched does. Potentially fewer, larger kernels; the
+        open question is whether fla's recurrent kernel is capturable inside
+        torch.cuda.graph() (the chunk kernel is NOT --
+        cudaErrorStreamCaptureInvalidated). If it captures and beats
+        _forward_decode_batched, use it; otherwise the batched path wins.
+
+        REWRITTEN 2026-08-27: the previous version imported phantom modules
+        (nanovllm.layers.fused_recurrent / gated_delta_net) that were never
+        committed -- use_fused_gdr_decode_kernel=True was dead
+        (ModuleNotFoundError at construction). This version calls the real,
+        installed fla kernel and reuses _forward_decode_batched's batched
+        F.conv1d for the conv step (no phantom causal_conv1d_decode_triton).
+
+        Prep matches _fused_gdr_scan / the sequential path EXACTLY -- conv ->
+        silu -> split -> repeat_interleave head-expand -> l2norm -> q*scale,
+        g in log space (-A_log.exp()*softplus(a+dt_bias)), beta post-sigmoid
+        -- then passes use_qk_l2norm_in_kernel=False, use_beta_sigmoid_in_kernel=False,
+        scale=1.0 (q already carries the scale), same as _fused_gdr_scan's
+        point 1. Reassociates like any fused kernel, so it needs a real
+        correctness ablation on GPU, not a bitwise check.
+
+        Returns (out, new_states, new_conv_states) with the exact shapes/
+        dtypes forward() returns for decode.
+        """
+        N, _ = hidden_states.shape
+        lkh, lvh, lhd, ck = self.lkh, self.lvh, self.lhd, self.ck
+        dt = hidden_states.dtype
+
+        z = self.in_proj_z(hidden_states)        # (N, LVH*LHD)
+        a = self.in_proj_a(hidden_states)        # (N, LVH)
+        b = self.in_proj_b(hidden_states)        # (N, LVH)
+        qkv = self.in_proj_qkv(hidden_states)    # (N, QKV)
+
+        # Batched causal conv1d -- identical to _forward_decode_batched.
+        if conv_states is None:
+            conv_states = qkv.new_zeros(N, self.qkv_dim, ck - 1)
+        combined = torch.cat([conv_states, qkv.unsqueeze(-1)], dim=2)   # (N, QKV, CK)
+        new_conv_states = combined[:, :, -(ck - 1):].detach()
+        qkv_conv = F.conv1d(
+            combined, self.conv1d.weight, self.conv1d.bias,
+            padding=0, groups=self.qkv_dim,
         )
-        qkv_conv = qkv_conv.squeeze(-1)  # (N, QKV) -- SiLU already applied inside the kernel
+        qkv_conv = F.silu(qkv_conv.transpose(1, 2))                    # (N, 1, QKV)
 
-        q = qkv_conv[:, :lkh * lhd].view(N, 1, lkh, lhd)
-        k = qkv_conv[:, lkh * lhd:2 * lkh * lhd].view(N, 1, lkh, lhd)
-        v = qkv_conv[:, 2 * lkh * lhd:].view(N, 1, lvh, lhd)
-        g_raw = a.view(N, 1, lvh)
-        beta_raw = b.view(N, 1, lvh)
+        q = qkv_conv[:, :, :lkh * lhd].view(N, 1, lkh, lhd)
+        k = qkv_conv[:, :, lkh * lhd:2 * lkh * lhd].view(N, 1, lkh, lhd)
+        v = qkv_conv[:, :, 2 * lkh * lhd:].view(N, 1, lvh, lhd)
 
-        initial_state = states.to(torch.float32) if states is not None else None
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())  # (N, LVH)
+        beta = b.sigmoid()                                                            # (N, LVH)
+
+        q = q.repeat_interleave(self.head_expand, dim=2)   # (N, 1, LVH, LHD)
+        k = k.repeat_interleave(self.head_expand, dim=2)
+        scale = lhd ** -0.5
+        q = (l2norm(q.float()) * scale).to(dt)
+        k = l2norm(k.float()).to(dt)
+        g = g.float().unsqueeze(1)      # (N, 1, LVH), log space
+        beta = beta.float().unsqueeze(1)  # (N, 1, LVH), post-sigmoid
+        v = v.to(dt)
+
+        initial_state = states.float() if states is not None else None
 
         out, new_states = self._fused_recurrent_gated_delta_rule(
             q, k, v,
-            g=g_raw,
-            beta=beta_raw,
-            scale=lhd ** -0.5,
+            g=g,
+            beta=beta,
+            scale=1.0,   # q already carries lhd**-0.5 -- see _fused_gdr_scan point 1
             initial_state=initial_state,
             output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            use_beta_sigmoid_in_kernel=True,
+            use_qk_l2norm_in_kernel=False,   # q/k already L2-normed above
+            use_beta_sigmoid_in_kernel=False,  # beta already post-sigmoid
         )
-        # out: (N, 1, LVH, LHD) float, dtype matches v (bf16/fp16).
-        # new_states: (N, LVH, LHD, LHD) float32 -- matches the states
-        # buffer contract the rest of this class (and StateManager) expects,
-        # same as _fused_gdr_scan's own output.
+        # out: (N, 1, LVH, LHD); new_states: (N, LVH, LHD, LHD) float32.
 
-        out_flat = out.reshape(N * lvh, lhd).to(dt)
+        y = out.reshape(N * lvh, lhd).to(dt)
         z_flat = z.reshape(N * lvh, lhd)
-        normed = self.norm(out_flat, z_flat)
-        y = normed.reshape(N, lvh * lhd)
+        y = self.norm(y, z_flat)
+        y = y.reshape(N, lvh * lhd)
 
-        return self.out_proj(y), new_states, new_conv_states
+        return self.out_proj(y), new_states.float(), new_conv_states
 
     def _fused_gdr_scan(self, q_list, k_list, v_list, g_list, beta_list,
                          seg_z_list, S0_list, cu_seqlens, dt, lvh, lhd):
@@ -1772,6 +1895,7 @@ class Qwen35DecoderLayer(nn.Module):
                 rms_norm_eps=rms_norm_eps,
                 use_fused_gdr_kernel=getattr(config, "use_fused_gdr_kernel", False),
                 use_fused_gdr_decode_kernel=getattr(config, "use_fused_gdr_decode_kernel", False),
+                use_batched_gdr_decode=getattr(config, "use_batched_gdr_decode", False),
             )
 
         # MoE FFN

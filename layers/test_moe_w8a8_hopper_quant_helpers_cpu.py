@@ -35,12 +35,21 @@ def main():
     ok = True
 
     # ---- 1. Activation quantization: shape + round-trip sanity ----
-    M, K = 6, 256
+    # NOTE: quantize_activation_fp8_dynamic was CORRECTED 2026-08-24 to return
+    # a per-(token, 128-K-block) scale of shape (M, K // 128), replacing the
+    # old per-whole-row (M,) that caused an on-hardware out-of-bounds read in
+    # moe_w8a8.cu (see that function's docstring). This test still asserted
+    # the stale (M,) shape and was failing on that alone -- fixed 2026-08-27.
+    M, K, BS = 6, 256, 128
     x = torch.randn(M, K) * 0.02
     x_fp8, x_scale = quantize_activation_fp8_dynamic(x)
     print(f"[1] x_fp8={tuple(x_fp8.shape)} x_scale={tuple(x_scale.shape)} dtype={x_fp8.dtype}")
-    assert x_fp8.shape == (M, K) and x_scale.shape == (M,), "activation quant shape mismatch"
-    recon = x_fp8.float() * x_scale.unsqueeze(-1)
+    assert x_fp8.shape == (M, K), "activation quant fp8 shape mismatch"
+    assert x_scale.shape == (M, K // BS), (
+        f"activation quant scale shape mismatch: {tuple(x_scale.shape)} != {(M, K // BS)} "
+        f"-- expected per-(token, 128-K-block) scale"
+    )
+    recon = (x_fp8.float().view(M, K // BS, BS) * x_scale.unsqueeze(-1)).view(M, K)
     cos1 = F.cosine_similarity(x.reshape(-1), recon.reshape(-1), dim=0).item()
     print(f"    round-trip cosine={cos1:.6f}")
     assert cos1 > 0.99, "activation quant round-trip too lossy -- likely a real bug, not just fp8 precision"

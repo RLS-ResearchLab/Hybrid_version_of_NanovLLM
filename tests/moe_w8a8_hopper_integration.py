@@ -189,9 +189,10 @@ def apply_moe_w8a8_hopper_quantization(model: nn.Module, group_size: int = 128) 
     place. Returns the count quantized, matching apply_moe_int8_quantization
     and this project's "Found N Qwen35MoE layer(s)" logging convention.
 
-    NOT called from ModelRunner.__init__ yet -- see module docstring. This
-    function existing does not mean use_moe_w8a8_hopper=True works; nothing
-    passes that flag or calls this today.
+    CALLED from engine/model_runner.py's __init__ when config.use_moe_w8a8_hopper
+    is set (since 2026-08-23). The load-time pass + the forward-path buffer
+    reads are wired; what's still missing is a real moe_w8a8.cu compile+run on
+    Hopper (Phase 0) -- see the module docstring.
     """
     from nanovllm.models.qwen3_5 import Experts
 

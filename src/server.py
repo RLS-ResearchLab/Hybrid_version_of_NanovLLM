@@ -534,14 +534,34 @@ def main():
                              "same loop, which only pays this cost once at graph-capture time. "
                              "Requires the 'flash-linear-attention' package ('fla' import name) -- "
                              "fails loudly at model construction if missing, does not silently "
-                             "fall back. Does NOT affect decode (this kernel is prefill-only; see "
-                             "the separate, decode-only use_fused_gdr_decode_kernel path, which "
-                             "has no CLI flag here because its backing files "
-                             "(layers/fused_recurrent.py, layers/gated_delta_net.py) aren't in "
-                             "this repo -- do not enable that one). Never run on any hardware "
-                             "before this flag existed -- expect this to need its own real "
-                             "correctness check the first time it's used, same as "
-                             "--vectorized-moe did.")
+                             "fall back. Does NOT affect decode (this kernel is prefill-only; for "
+                             "decode use --batched-gdr-decode, or --fused-gdr-decode-kernel for "
+                             "the fla-recurrent-kernel variant). Never run on any hardware before "
+                             "this flag existed -- expect this to need its own real correctness "
+                             "check the first time it's used, same as --vectorized-moe did.")
+    parser.add_argument("--fused-gdr-decode-kernel", dest="fused_gdr_decode_kernel", action="store_true", default=False,
+                        help="DECODE-side variant of --batched-gdr-decode: routes the same "
+                             "per-request linear-attention decode loop through fla's single-step "
+                             "recurrent kernel (fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule) "
+                             "instead of pure batched tensor ops. Might be faster (fewer, larger "
+                             "kernels) BUT the open question is whether fla's recurrent kernel "
+                             "CUDA-graph-captures -- the chunk kernel does not. GPU-UNVALIDATED. "
+                             "Prefer --batched-gdr-decode; enable this only for an A/B against it. "
+                             "If both are passed this one wins (forward() checks it first).")
+    parser.add_argument("--batched-gdr-decode", dest="batched_gdr_decode", action="store_true", default=False,
+                        help="Enables the Triton-free batched DECODE path for linear-attention "
+                             "layers (models/qwen3_5.py's Qwen35LinearAttention._forward_decode_batched) "
+                             "instead of forward()'s `for i in range(num_segments)` per-request "
+                             "Python loop. That loop runs on 30 of 40 layers and, once unrolled "
+                             "into the captured decode graph at concurrency N, is ~N*30*~15 tiny "
+                             "kernel launches per decode step -- the leading suspect for the "
+                             "~310ms/step H100 decode cost. This replacement is pure batched "
+                             "tensor ops (no fla/triton), numerically identical to the "
+                             "sequential scan (CPU-verified: bitwise at N=1, ~1e-8 at N=64, no "
+                             "drift over 16 steps -- tests/test_qwen35_gdr_decode_batched.py), "
+                             "and CUDA-graph-safe by construction. NOT yet run on GPU: first use "
+                             "must confirm it graph-captures cleanly and measure the throughput "
+                             "effect. Independent of --fused-gdr-kernel (that one is prefill-only).")
     args = parser.parse_args()
 
     # See _executor's module-level comment -- sized to max_num_seqs (no
@@ -567,6 +587,8 @@ def main():
         "fused_moe_kernel": args.fused_moe_kernel,
         "vectorized_moe": args.vectorized_moe,
         "fused_gdr_kernel": args.fused_gdr_kernel,
+        "batched_gdr_decode": args.batched_gdr_decode,
+        "fused_gdr_decode_kernel": args.fused_gdr_decode_kernel,
     }
 
     # Loud, launch-time version of the same check bench_http_concurrency.py
@@ -602,6 +624,8 @@ def main():
         moe_w8a8_weight_group_size=args.moe_w8a8_weight_group_size,
         use_vectorized_moe=args.vectorized_moe,
         use_fused_gdr_kernel=args.fused_gdr_kernel,
+        use_batched_gdr_decode=args.batched_gdr_decode,
+        use_fused_gdr_decode_kernel=args.fused_gdr_decode_kernel,
     )
 
     # Added 2026-08-27: real KV-cache block count is only known after

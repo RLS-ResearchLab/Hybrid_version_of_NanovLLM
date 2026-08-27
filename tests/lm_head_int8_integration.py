@@ -118,8 +118,12 @@ def apply_lm_head_int8_quantization(model: nn.Module, group_size: int = 128) -> 
     layers), there is exactly one lm_head per model, so this is a
     presence check, not a count of a repeated structure.
 
-    NOT called from ModelRunner.__init__ yet unless use_lm_head_int8=True is
-    set -- see config.py's own comment on this flag.
+    CALLED from engine/model_runner.py's __init__ when config.use_lm_head_int8
+    is set (after load_model, before warmup) -- see config.py's comment on
+    the flag. The load-time pass + ParallelLMHead.forward()'s int8
+    dequant-on-read branch are both wired; what's unresolved is the
+    throughput question (see the module docstring's capacity-vs-throughput
+    section), which needs a GPU matched A/B.
     """
     lm_head = getattr(model, "lm_head", None)
     if lm_head is None:

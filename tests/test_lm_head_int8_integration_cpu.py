@@ -1,30 +1,38 @@
 """CPU-only correctness check for lm_head_int8_integration.py's
 quantize_lm_head_inplace / apply_lm_head_int8_quantization -- exercised
-without CUDA, without triton, and without the real Qwen35ForCausalLM class
-(models/qwen3_5.py has an unconditional triton import at module level,
-confirmed absent on this Windows dev machine, so it cannot be imported here).
+without CUDA, without triton.
 
-Uses minimal stand-in modules with the same attribute names/shapes the real
-ParallelLMHead and Qwen35ForCausalLM have (.weight Parameter on the former,
-.lm_head attribute on the latter) -- a faithful exercise of the actual
-mutation/lookup logic, not a mock of behavior this test then just asserts
-happened.
+Sections 1-7 use minimal stand-in modules (same attribute names/shapes) for
+the load-time mutation logic. Section 8 runs the REAL
+layers/embed_head.py::ParallelLMHead through a real decode-context
+forward() -- both the bf16 and the int8 dequant-on-read branch -- and
+compares logits, since models/qwen3_5.py imports on a CPU box now (the
+triton import in layers/fused_moe_int8.py was made lazy 2026-08-27).
+engine/model_runner.py DOES call apply_lm_head_int8_quantization when
+config.use_lm_head_int8 is set.
 
-Does NOT validate: the real ParallelLMHead class, real model integration, or
-the forward-path throughput question (see lm_head_int8_integration.py's own
-module docstring -- that's explicitly not claimed to be resolved by this or
-any CPU-only test).
+Does NOT validate: the forward-path THROUGHPUT question -- lm_head reads its
+whole weight matrix every call, so naive dequant-then-F.linear is a
+plausible bandwidth regression vs bf16-direct (see lm_head_int8_integration.py's
+module docstring). That's GPU-A/B-only.
 
 Usage:
-    python tests/test_lm_head_int8_integration_cpu.py
+    TORCHDYNAMO_DISABLE=1 python tests/test_lm_head_int8_integration_cpu.py
 """
 import os
 import sys
+import types
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if "nanovllm" not in sys.modules:
+    _pkg = types.ModuleType("nanovllm")
+    _pkg.__path__ = [_ROOT]
+    _pkg.__file__ = os.path.join(_ROOT, "__init__.py")
+    sys.modules["nanovllm"] = _pkg
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lm_head_int8_integration import quantize_lm_head_inplace, apply_lm_head_int8_quantization  # noqa: E402
 
@@ -107,10 +115,51 @@ def main():
     assert n0 == 0
     ok &= (n0 == 0)
 
+    # ---- 8. REAL ParallelLMHead forward(): bf16 vs int8-dequant-on-read ----
+    # Previously skipped (couldn't import the real class -- triton wall);
+    # PRE-1 removed that. This exercises the actual int8 branch in
+    # ParallelLMHead.forward() (layers/embed_head.py), which is what the
+    # engine runs every decode step under use_lm_head_int8=True.
+    import torch.distributed as dist
+    if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29551")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        dist.init_process_group("gloo")
+    from nanovllm.layers.embed_head import ParallelLMHead
+    from nanovllm.utils.context import set_context, reset_context
+
+    torch.manual_seed(2)
+    real_head = ParallelLMHead(V, H)
+    with torch.no_grad():
+        real_head.weight.normal_(0, 0.02)
+    Ntok = 32
+    x = torch.randn(Ntok, H) * 0.1
+
+    set_context(False)  # decode context -- forward() skips the prefill last-token slice
+    with torch.no_grad():
+        logits_bf16 = real_head(x).clone()
+
+    n_real = apply_lm_head_int8_quantization(types.SimpleNamespace(lm_head=real_head), group_size)
+    assert n_real == 1 and hasattr(real_head, "weight_int8") and not hasattr(real_head, "weight")
+    with torch.no_grad():
+        logits_int8 = real_head(x)
+    reset_context()
+
+    cos8 = F.cosine_similarity(logits_bf16.reshape(-1), logits_int8.reshape(-1), dim=0).item()
+    argmax_agree = (logits_bf16.argmax(-1) == logits_int8.argmax(-1)).float().mean().item()
+    print(f"[8] real ParallelLMHead.forward(): int8-vs-bf16 logits cosine={cos8:.6f}  "
+          f"argmax agreement={argmax_agree*100:.1f}% over {Ntok} tokens")
+    assert cos8 > 0.999, f"real forward int8 branch cosine {cos8:.6f} too low"
+    assert argmax_agree > 0.90, f"real forward argmax agreement {argmax_agree*100:.1f}% too low"
+    ok &= cos8 > 0.999 and argmax_agree > 0.90
+
     print("\nPASS" if ok else "\nFAIL")
-    print("\nScope reminder: validates the in-place mutation logic against stand-in modules only "
-          "-- says nothing about the real ParallelLMHead class, engine integration, or the "
-          "forward-path throughput question.")
+    print("\nScope reminder: validates the load-time quantization pass + the real "
+          "ParallelLMHead.forward() int8 branch's numeric behavior -- says NOTHING about the "
+          "forward-path THROUGHPUT question (naive dequant-then-F.linear vs bf16-direct), "
+          "which needs a GPU matched A/B.")
     sys.exit(0 if ok else 1)
 
 
