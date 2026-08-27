@@ -563,6 +563,20 @@ def main():
         use_vectorized_moe=args.vectorized_moe,
     )
 
+    # Added 2026-08-27: real KV-cache block count is only known after
+    # allocate_kv_cache() runs inside LLM(...) construction, unlike the
+    # other _server_config fields (known straight from args). Exposed here
+    # so a client can directly check real concurrent-request capacity
+    # (num_kvcache_blocks * kvcache_block_size // tokens_per_request)
+    # instead of inferring it after the fact from a suspicious "N requests
+    # ran, the rest queued behind them" pattern in a real sweep -- see
+    # BlockManager.can_allocate() returning -1 mid-prefill-admission as the
+    # actual mechanism this caps: Scheduler.schedule()'s prefill loop stops
+    # admitting new sequences the moment free blocks run out, even if
+    # max_num_seqs/max_num_batched_tokens would otherwise allow more.
+    _server_config["num_kvcache_blocks"] = llm.model_runner.config.num_kvcache_blocks
+    _server_config["kvcache_block_size"] = llm.model_runner.config.kvcache_block_size
+
     print(f"Starting engine (concurrency_mode={args.concurrency_mode})...")
     if args.concurrency_mode == "batched":
         _engine = BatchedEngine(llm)
