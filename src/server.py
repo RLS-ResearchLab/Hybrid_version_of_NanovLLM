@@ -83,6 +83,7 @@ import json
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import uuid
 from pathlib import Path
@@ -324,6 +325,17 @@ class BatchedEngine:
 
 app  = FastAPI()
 _engine: Optional[Engine] = None
+# Found 2026-08-27: asyncio's DEFAULT executor (what loop.run_in_executor(None, ...)
+# uses) is sized min(32, os.cpu_count()+4) -- on this box (28 cores) that's
+# exactly 32. Every concurrent request blocks one of those threads for its
+# ENTIRE generation (minutes, via Engine._gen_lock or BatchedEngine.generate's
+# ev.wait()), so the 33rd+ concurrent request doesn't even reach
+# add_request() until one of the first 32 finishes -- a hard wall completely
+# independent of max_num_seqs/max_num_batched_tokens/KV-cache capacity,
+# confirmed via [STEP DEBUG] server-side logging showing admission stuck at
+# exactly 32 regardless of prompt length. Explicit, correctly-sized executor
+# instead of the default -- sized in main() once args.max_num_seqs is known.
+_executor: Optional[ThreadPoolExecutor] = None
 # Populated in main() right after argparse, read-only afterward -- exists so
 # /health can report the actual admission-control config a running server
 # was launched with. Added 2026-08-26: a real concurrency=64 sweep session
@@ -371,7 +383,7 @@ async def chat_completions(req: ChatRequest):
     # The engine's generation lock serialises whole requests across all threads.
     loop = asyncio.get_event_loop()
     output_ids = await loop.run_in_executor(
-        None,
+        _executor,
         _engine.generate,
         input_ids,
         req.max_tokens,
@@ -404,7 +416,7 @@ async def chat_completions(req: ChatRequest):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    global _engine, _server_config
+    global _engine, _server_config, _executor
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True,
@@ -511,6 +523,13 @@ def main():
                              "Qwen35MoE.forward()'s branch order). See "
                              "tests/test_qwen35_vectorized_moe.py / tests/bench_vectorized_moe.py.")
     args = parser.parse_args()
+
+    # See _executor's module-level comment -- sized to max_num_seqs (no
+    # point exceeding what the engine can ever usefully run concurrently
+    # anyway) instead of asyncio's default min(32, cpu_count()+4), which
+    # silently caps real concurrency at 32 on this box regardless of what
+    # --max-num-seqs is actually set to.
+    _executor = ThreadPoolExecutor(max_workers=args.max_num_seqs)
 
     # Must happen before the LLM import a few lines down -- see that
     # import's own comment for why NANOVLLM_USE_FUSED_MOE_KERNEL has to be
