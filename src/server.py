@@ -562,6 +562,24 @@ def main():
                              "and CUDA-graph-safe by construction. NOT yet run on GPU: first use "
                              "must confirm it graph-captures cleanly and measure the throughput "
                              "effect. Independent of --fused-gdr-kernel (that one is prefill-only).")
+    parser.add_argument("--lm-head-int8", dest="use_lm_head_int8", action="store_true", default=False,
+                        help="INT8 weight-only quantization of lm_head (config.use_lm_head_int8). "
+                             "Real ~485MiB capacity win (tie_word_embeddings=False on the real "
+                             "checkpoint), CPU-validated (cosine 0.99998, 100%% argmax -- "
+                             "tests/test_lm_head_int8_integration_cpu.py). NOT a confirmed "
+                             "throughput win: lm_head reads its whole weight every decode step "
+                             "(no top-k subset like MoE), so naive dequant-then-matmul is a "
+                             "plausible bandwidth regression until a fused kernel exists. GPU A/B "
+                             "only -- measure on vs off at concurrency 64 + GSM8K non-regression.")
+    parser.add_argument("--moe-w8a8-hopper", dest="use_moe_w8a8_hopper", action="store_true", default=False,
+                        help="True W8A8 Hopper MoE path (moe_w8a8.cu, 2D-blocked FP8) -- separate "
+                             "scheme from --moe-w8a8 (1D-grouped INT8), mutually exclusive with it "
+                             "(model_runner runs INT8 first; this pass then raises). Quantizes "
+                             "expert weights to FP8 at load; the SEPARATE env var "
+                             "NANOVLLM_USE_MOE_W8A8_HOPPER=1 controls whether the decode forward "
+                             "actually calls the Hopper kernel. UNVALIDATED end-to-end -- do NOT "
+                             "set before Phase 0 (compile layers/moe_w8a8.cu -arch=sm_90a, run "
+                             "layers/smoke_test_moe_w8a8_hopper.py) has passed on real Hopper.")
     args = parser.parse_args()
 
     # See _executor's module-level comment -- sized to max_num_seqs (no
@@ -589,6 +607,8 @@ def main():
         "fused_gdr_kernel": args.fused_gdr_kernel,
         "batched_gdr_decode": args.batched_gdr_decode,
         "fused_gdr_decode_kernel": args.fused_gdr_decode_kernel,
+        "lm_head_int8": args.use_lm_head_int8,
+        "moe_w8a8_hopper": args.use_moe_w8a8_hopper,
     }
 
     # Loud, launch-time version of the same check bench_http_concurrency.py
@@ -600,6 +620,14 @@ def main():
               f"requests beyond {args.max_num_seqs} in a wave will queue instead of batching. "
               f"Raise --max-num-seqs to at least your highest planned concurrency level for a "
               f"real throughput sweep (see that flag's help text).")
+    if args.use_moe_w8a8 and args.use_moe_w8a8_hopper:
+        parser.error("--moe-w8a8 and --moe-w8a8-hopper are mutually exclusive (model_runner "
+                     "runs the INT8 pass first; the Hopper FP8 pass then raises 'weights already "
+                     "gone'). Pick one.")
+    if args.use_moe_w8a8_hopper and os.environ.get("NANOVLLM_USE_MOE_W8A8_HOPPER") != "1":
+        print("[WARNING] --moe-w8a8-hopper set but NANOVLLM_USE_MOE_W8A8_HOPPER != 1 -- weights "
+              "will be quantized to FP8 at load but the decode forward will NOT call the Hopper "
+              "kernel. Export NANOVLLM_USE_MOE_W8A8_HOPPER=1 to actually exercise moe_w8a8.cu.")
     if args.use_moe_w8a8 and not args.fused_moe_kernel:
         print(f"[WARNING] --moe-w8a8 without --fused-moe-kernel -- running the slower plain "
               f"gather+dequant+einsum path, not the fused Triton kernel. This is NOT the "
@@ -626,6 +654,8 @@ def main():
         use_fused_gdr_kernel=args.fused_gdr_kernel,
         use_batched_gdr_decode=args.batched_gdr_decode,
         use_fused_gdr_decode_kernel=args.fused_gdr_decode_kernel,
+        use_lm_head_int8=args.use_lm_head_int8,
+        use_moe_w8a8_hopper=args.use_moe_w8a8_hopper,
     )
 
     # Added 2026-08-27: real KV-cache block count is only known after
