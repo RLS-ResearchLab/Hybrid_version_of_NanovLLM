@@ -69,7 +69,7 @@ def build_prompt_text(tokenizer, target_tokens: int) -> str:
 
 
 def post_chat_completion(base_url: str, prompt_text: str, max_tokens: int, timeout: float,
-                          ignore_eos: bool = False):
+                          ignore_eos: bool = False, wave_t0: float = 0.0):
     payload = json.dumps({
         "messages": [{"role": "user", "content": prompt_text}],
         "max_tokens": max_tokens,
@@ -83,14 +83,17 @@ def post_chat_completion(base_url: str, prompt_text: str, max_tokens: int, timeo
         method="POST",
     )
     t0 = time.perf_counter()
+    start_offset_s = t0 - wave_t0
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.loads(resp.read().decode("utf-8"))
         dt = time.perf_counter() - t0
-        return {"ok": True, "latency_s": dt, "body": body}
+        return {"ok": True, "latency_s": dt, "body": body,
+                "start_offset_s": start_offset_s, "end_offset_s": start_offset_s + dt}
     except Exception as e:  # noqa: BLE001 -- record failure, don't crash the wave
         dt = time.perf_counter() - t0
-        return {"ok": False, "latency_s": dt, "error": repr(e)}
+        return {"ok": False, "latency_s": dt, "error": repr(e),
+                "start_offset_s": start_offset_s, "end_offset_s": start_offset_s + dt}
 
 
 def run_wave(base_url, prompt_text, max_tokens, concurrency, timeout, ignore_eos=False):
@@ -98,12 +101,24 @@ def run_wave(base_url, prompt_text, max_tokens, concurrency, timeout, ignore_eos
     results = []
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
         futs = [
-            ex.submit(post_chat_completion, base_url, prompt_text, max_tokens, timeout, ignore_eos)
+            ex.submit(post_chat_completion, base_url, prompt_text, max_tokens, timeout, ignore_eos, t0)
             for _ in range(concurrency)
         ]
         for f in as_completed(futs):
             results.append(f.result())
     wall_s = time.perf_counter() - t0
+
+    # Diagnostic added mid-session 2026-08-27: prints each request's own
+    # [start_offset, end_offset] within the wave, in submission order -- the
+    # direct way to tell "genuinely overlapping" from "back-to-back
+    # sequential" apart, rather than inferring it from aggregate wall_s
+    # alone (wall_s ~= N * single-request-latency is consistent with BOTH
+    # true serialization AND, less obviously, a batched engine that simply
+    # isn't speeding up under this workload -- only the per-request
+    # overlap picture actually distinguishes them).
+    for i, r in enumerate(sorted(results, key=lambda r: r["start_offset_s"])):
+        print(f"    req[{i}]: start={r['start_offset_s']:6.2f}s  end={r['end_offset_s']:6.2f}s  "
+              f"latency={r['latency_s']:6.2f}s  ok={r['ok']}")
 
     successes = [r for r in results if r["ok"]]
     failures = [r for r in results if not r["ok"]]
