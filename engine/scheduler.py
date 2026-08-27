@@ -113,6 +113,21 @@ class Scheduler:
             if not seq.block_table:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
+                    # -1 means "not enough free blocks right now" -- normally
+                    # transient (running sequences free their blocks as they
+                    # finish), so just stop admitting this round. But if this
+                    # sequence needs more blocks than the KV cache physically
+                    # holds, no future round can ever admit it -- and with
+                    # nothing else making progress the engine would spin
+                    # forever (previously: fall through to the decode branch's
+                    # bare `assert scheduled_seqs` and crash). Fail loudly.
+                    if seq.num_blocks > len(self.block_manager.blocks):
+                        raise RuntimeError(
+                            f"sequence {seq.seq_id} needs {seq.num_blocks} KV-cache blocks but "
+                            f"the cache has only {len(self.block_manager.blocks)} -- the prompt "
+                            f"is longer than this engine can serve. Raise "
+                            f"--gpu-memory-utilization, or lower --max-model-len / the prompt."
+                        )
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
@@ -149,7 +164,23 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
+        if not scheduled_seqs:
+            # Every sequence this decode round tried to run needed a fresh KV
+            # block with none free, so each was preempted -- they are all in
+            # self.waiting now (num_cached_tokens reset). Return an empty
+            # batch: the next schedule() re-admits them via the prefill branch
+            # once their freed blocks are visible, and LLMEngine.step() /
+            # BatchedEngine._loop() treat [] as a skipped tick. This replaced
+            # a bare `assert scheduled_seqs` that turned a real,
+            # memory-pressure-reachable state into a hard server crash.
+            #
+            # KNOWN GAP: a SINGLE sequence that has grown to fill the entire
+            # KV cache and still wants more tokens will preempt -> re-prefill
+            # -> preempt in a livelock here. That requires a config where one
+            # sequence's max length exceeds the whole cache; the real fix is
+            # an engine-level abort channel for such a sequence, which this
+            # scheduler does not have today.
+            return [], False
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 

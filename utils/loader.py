@@ -94,13 +94,28 @@ def _is_experts_weight(param_name: str) -> bool:
     return param_name.endswith(".experts.gate_up_proj") or param_name.endswith(".experts.down_proj")
 
 
-def load_model(model: nn.Module, path: str):
+def load_model(model: nn.Module, path: str, strict: bool = False):
+    """strict=True (the real engine path -- engine/model_runner.py) raises if
+    any model parameter was never written from the checkpoint. Left False by
+    default because several tests deliberately call load_model() against a
+    minimal fixture checkpoint that only contains the keys under test."""
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    # Track what actually got written so a renamed/missing checkpoint key
+    # can't silently leave a model parameter at its torch.empty() init --
+    # the exact failure mode tests/test_utils.assert_all_parameters_initialized
+    # exists to catch (recurred 4+ times in this project's history). Also
+    # count the keys translate_weight_name() drops, grouped by top-level
+    # prefix, so "vision/MTP tower skipped as expected" is visible and
+    # distinguishable from "the whole language model got dropped".
+    written_params: set[str] = set()
+    from collections import Counter
+    skipped_prefixes: Counter = Counter()
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
                 param_name = translate_weight_name(weight_name)
                 if param_name is None:
+                    skipped_prefixes[".".join(weight_name.split(".")[:2])] += 1
                     continue
                 for k in packed_modules_mapping:
                     if k in param_name:
@@ -109,6 +124,7 @@ def load_model(model: nn.Module, path: str):
                         param = model.get_parameter(mapped_name)
                         weight_loader = getattr(param, "weight_loader")
                         weight_loader(param, f.get_tensor(weight_name), shard_id)
+                        written_params.add(mapped_name)
                         break
                 else:
                     param = model.get_parameter(param_name)
@@ -130,3 +146,28 @@ def load_model(model: nn.Module, path: str):
                         )
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
+                    written_params.add(param_name)
+
+    # Post-load audit: every model parameter must have come from the
+    # checkpoint. A parameter left unwritten is torch.empty() garbage and
+    # will produce degenerate or NaN output with no crash at load time.
+    # Tolerate weight-tied heads (Qwen35ForCausalLM aliases lm_head.weight
+    # onto embed_tokens.weight in __init__ when tie_word_embeddings is set),
+    # detected by shared storage rather than by name.
+    all_params = dict(model.named_parameters())
+    unwritten = set(all_params) - written_params
+    if unwritten:
+        written_ptrs = {all_params[n].data_ptr() for n in written_params if n in all_params}
+        unwritten = {n for n in unwritten if all_params[n].data_ptr() not in written_ptrs}
+    n_skipped = sum(skipped_prefixes.values())
+    print(f"[LOAD] wrote {len(written_params)}/{len(all_params)} model params from "
+          f"{os.path.basename(path)}; skipped {n_skipped} non-language-model checkpoint "
+          f"key(s) {dict(skipped_prefixes) if skipped_prefixes else '{}'}"
+          f"{f'; {len(unwritten)} UNWRITTEN' if unwritten else ''}")
+    if unwritten and strict:
+        raise RuntimeError(
+            f"load_model: {len(unwritten)} model parameter(s) were never written from "
+            f"{path} -- they are uninitialized garbage. Missing: {sorted(unwritten)[:20]}"
+            f"{' ...' if len(unwritten) > 20 else ''}. This usually means a checkpoint key "
+            f"was renamed or is absent, or translate_weight_name() needs a new prefix."
+        )

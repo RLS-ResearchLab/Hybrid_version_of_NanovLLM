@@ -106,7 +106,7 @@ class ModelRunner:
         self._is_hybrid_model = (model_cls is Qwen35ForCausalLM)
 
         self.model = model_cls(hf_config)
-        load_model(self.model, config.model)
+        load_model(self.model, config.model, strict=True)
         if getattr(config, "use_moe_w8a8", False):
             # moe_int8_integration.py lives under tests/, not on any production
             # sys.path -- the models/qwen3_5.py import above happens to already put
