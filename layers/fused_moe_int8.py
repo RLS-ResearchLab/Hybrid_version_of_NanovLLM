@@ -22,7 +22,13 @@ import torch
 import torch.nn.functional as F
 
 from nanovllm.layers.moe_align_block_size import moe_align_block_size
-from nanovllm.layers.fused_moe_triton import invoke_fused_moe_kernel
+# NOTE: fused_moe_triton does `import triton` at module top -- triton has no
+# Windows wheel, so a top-level import here breaks `import models.qwen3_5` on
+# any CPU-only dev machine (models/qwen3_5.py imports this module
+# unconditionally). Deferred into fused_moe_int8_forward() instead -- same
+# lazy pattern layers/attention.py (Attention) and the FP8-Hopper path
+# already use. The kernel is only ever needed at real call time on a GPU;
+# nothing at import time touches it.
 
 # Diagnostic-only timing, added 2026-08-21 after the first real-engine test
 # (eager, concurrency=16) measured 29.3 tok/s -- SLOWER than the 37.1 tok/s
@@ -118,6 +124,8 @@ def fused_moe_int8_forward(
     Returns:
         (N, top_k, H) -- same shape/meaning as the current out_e.
     """
+    from nanovllm.layers.fused_moe_triton import invoke_fused_moe_kernel
+
     if config is None:
         config = _DEFAULT_CONFIG
 
