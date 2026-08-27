@@ -21,10 +21,21 @@ class StateManager:
         conv_kernel_size: int,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        check_slot_zeroed: bool = False,
     ):
         self.max_num_seqs = max_num_seqs
         self.num_linear_layers = num_linear_layers
         self.ck = conv_kernel_size
+        # allocate() zeros a slot's recurrent/conv state unconditionally
+        # (correct -- see there). This flag additionally ASSERTS the zero
+        # took, via a `.any()` reduction + host sync on ~63 MB per admitted
+        # request -- a real cost on the scheduler's admission path (holds
+        # BatchedEngine's request-admission lock) for a check that can only
+        # fail on a torch/CUDA bug in `.zero_()` itself. Off by default; turn
+        # on only for a state-contamination investigation (config.py's
+        # debug_check_state_slot_zeroed). The functional zeroing is NOT
+        # gated -- only the redundant post-check.
+        self.check_slot_zeroed = check_slot_zeroed
 
         # Slot `max_num_seqs` is a reserved SCRATCH slot, one past the real
         # range and never handed out by allocate() (free_slot_ids only ever
@@ -59,22 +70,23 @@ class StateManager:
         assert seq.state_slot is None
         slot_id = self.free_slot_ids.popleft()
         self.used_slot_ids.add(slot_id)
-        # Zero on allocate: guards a fresh sequence against reading
-        # whatever the previous tenant of this slot left behind.
+        # Zero on allocate: guards a fresh sequence against reading whatever
+        # the previous tenant of this slot left behind (or, for a slot never
+        # yet handed out, warmup_model()'s residue). Unconditional.
         self.states[:, slot_id].zero_()
         self.conv_states[:, slot_id].zero_()
-        # Fail loudly rather than silently serving a contaminated slot --
-        # a leftover nonzero value here means a new sequence would read
-        # a previous tenant's recurrent/conv state with no crash or NaN,
-        # just silently wrong output.
-        assert not self.states[:, slot_id].any(), (
-            f"StateManager slot {slot_id} not fully zeroed after allocate() -- "
-            f"recurrent state contamination risk for the incoming sequence"
-        )
-        assert not self.conv_states[:, slot_id].any(), (
-            f"StateManager slot {slot_id} not fully zeroed after allocate() -- "
-            f"conv-state contamination risk for the incoming sequence"
-        )
+        if self.check_slot_zeroed:
+            # Debug-only -- see __init__. `.any()` + host sync on ~63 MB per
+            # admitted request; the zeroing above is the real guarantee, this
+            # only catches a `.zero_()` that silently didn't take.
+            assert not self.states[:, slot_id].any(), (
+                f"StateManager slot {slot_id} not fully zeroed after allocate() -- "
+                f"recurrent state contamination risk for the incoming sequence"
+            )
+            assert not self.conv_states[:, slot_id].any(), (
+                f"StateManager slot {slot_id} not fully zeroed after allocate() -- "
+                f"conv-state contamination risk for the incoming sequence"
+            )
         seq.state_slot = slot_id
         return slot_id
 

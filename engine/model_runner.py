@@ -163,6 +163,7 @@ class ModelRunner:
                 lvh=la0.lvh, lhd=la0.lhd, qkv_dim=la0.qkv_dim,
                 conv_kernel_size=la0.ck,
                 dtype=hf_config.dtype,
+                check_slot_zeroed=getattr(config, "debug_check_state_slot_zeroed", False),
             )
             torch.cuda.synchronize()
             print(f"[MEM DEBUG] after StateManager construction: "

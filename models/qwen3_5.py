@@ -1249,13 +1249,16 @@ class Qwen35MoE(nn.Module):
 
             # Equivalent to the dispatch loop's `h @ down_proj[e].t()`.
             out_e = torch.einsum('nkhm,nkm->nkh', down, h)      # (N, TK, H)
-        # NOTE: unlike _forward_dispatch/_forward_dispatch_ep, this combine
-        # is NOT promoted to fp32 -- same unpromoted bf16-sum-across-top_k
-        # pattern that measurably caused ~1.3% relative error there before
-        # the fix (see _forward_dispatch's comment), so this decode path
-        # likely has the same issue. Not fixed here: this path wasn't
-        # ablation-tested, only _forward_dispatch/_forward_dispatch_ep were.
-        out = (out_e * w.unsqueeze(-1)).sum(dim=1)               # (N, H)
+        # fp32-promoted combine -- matches _forward_dispatch / _forward_gathered_ep's
+        # discipline. B1 ablation (2026-08-27, tests/test_moe_decode_combine_precision_cpu.py):
+        # promoting only this step moves the shipped bf16 answer by ~0.29% relative
+        # on a synthetic Qwen35MoE -- real, but far below the "~1.3%" the old
+        # comment inferred from _forward_dispatch (whose PRE-fix code also
+        # accumulated into a bf16 buffer; `.sum(dim=1)` here already uses an fp32
+        # accumulator, so only rounding `out_e * w` products to bf16 is at
+        # stake). Strictly better, ~free, removes a standing "known issue".
+        # expert FFN matmuls (out_e) stay in x.dtype -- only the combine is promoted.
+        out = (out_e.float() * w.float().unsqueeze(-1)).sum(dim=1).to(x.dtype)   # (N, H)
  
         sg = torch.sigmoid(self.shared_expert_gate(x))
         out = out + sg * self.shared_expert(x)

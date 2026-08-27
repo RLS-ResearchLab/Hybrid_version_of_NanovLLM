@@ -92,6 +92,14 @@ class Config:
     # tests/test_moe_ep_dispatch_edge_cases.py construct Qwen35MoE directly
     # with this flag explicitly True, bypassing this Config default.
     debug_ep_token_roundtrip: bool = False
+    # Debug-only: gates StateManager.allocate()'s post-zeroing `.any()`
+    # assertion, which forces a reduction + host sync on ~63 MB of recurrent
+    # state per admitted request -- on the scheduler's admission path, which
+    # BatchedEngine drives while holding its request-admission lock. The
+    # zeroing itself is unconditional; this only re-checks that `.zero_()`
+    # took (can fail only on a torch/CUDA bug). Turn on for a
+    # state-contamination investigation, not for normal/benchmarked runs.
+    debug_check_state_slot_zeroed: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
