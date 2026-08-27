@@ -63,6 +63,26 @@ class ModelRunner:
         self.ack_event = ack_event
         self.state_manager = None
         torch._dynamo.config.disable = self.enforce_eager
+        # Found 2026-08-27: PyTorch's default recompile_limit (8) exactly
+        # matches self.graph_bs's bucket count ([1,2,4,8,16,32,48,64], 8
+        # buckets) -- but layers/layernorm.py's Qwen35RMSNorm.rms_forward
+        # (@torch.compile) is called on q_norm AND k_norm, which have
+        # DIFFERENT shapes at the same batch size under GQA (num_heads !=
+        # num_kv_heads), so capturing all 8 decode buckets needs 16 distinct
+        # compiled shape-variants of the same function against an 8-slot
+        # budget. Once exhausted, torch._dynamo silently falls back to slow
+        # uncompiled eager execution for whichever buckets get captured
+        # last -- confirmed via a real "hit config.recompile_limit (8)"
+        # warning during capture, not a guess. Since CUDA graph capture
+        # freezes whatever actually ran at capture time, an eager fallback
+        # here would be permanent for the life of the server, on every
+        # layer, every decode step. Set generously above the ~16+ shapes
+        # this model's own capture loop needs (decode buckets x q/k norm
+        # variants, plus prefill's own varying shapes, plus whatever margin
+        # other @torch.compile call sites in this codebase need) rather than
+        # tuned to the exact minimum -- cheap safety margin, no downside
+        # besides a marginally larger compile cache.
+        torch._dynamo.config.recompile_limit = 64
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
