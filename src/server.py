@@ -522,6 +522,26 @@ def main():
                              "separate EP dispatch path, which this flag does not touch -- see "
                              "Qwen35MoE.forward()'s branch order). See "
                              "tests/test_qwen35_vectorized_moe.py / tests/bench_vectorized_moe.py.")
+    parser.add_argument("--fused-gdr-kernel", dest="fused_gdr_kernel", action="store_true", default=False,
+                        help="Enables flash-linear-attention's chunked Gated Delta Rule kernel "
+                             "(fla.ops.gated_delta_rule.chunk_gated_delta_rule) for PREFILL on "
+                             "linear-attention layers, instead of the sequential per-token Python "
+                             "scan (models/qwen3_5.py's Qwen35LinearAttention.forward(), the "
+                             "`for i in range(num_segments): for t in range(T_i):` loop). That "
+                             "loop runs on 30 of this model's 40 layers (3 GDR layers per 4-layer "
+                             "block) and is NEVER CUDA-graph-captured (prefill isn't captured at "
+                             "all), unlike the structurally identical decode-time version of the "
+                             "same loop, which only pays this cost once at graph-capture time. "
+                             "Requires the 'flash-linear-attention' package ('fla' import name) -- "
+                             "fails loudly at model construction if missing, does not silently "
+                             "fall back. Does NOT affect decode (this kernel is prefill-only; see "
+                             "the separate, decode-only use_fused_gdr_decode_kernel path, which "
+                             "has no CLI flag here because its backing files "
+                             "(layers/fused_recurrent.py, layers/gated_delta_net.py) aren't in "
+                             "this repo -- do not enable that one). Never run on any hardware "
+                             "before this flag existed -- expect this to need its own real "
+                             "correctness check the first time it's used, same as "
+                             "--vectorized-moe did.")
     args = parser.parse_args()
 
     # See _executor's module-level comment -- sized to max_num_seqs (no
@@ -546,6 +566,7 @@ def main():
         "tensor_parallel_size": args.tensor_parallel_size,
         "fused_moe_kernel": args.fused_moe_kernel,
         "vectorized_moe": args.vectorized_moe,
+        "fused_gdr_kernel": args.fused_gdr_kernel,
     }
 
     # Loud, launch-time version of the same check bench_http_concurrency.py
@@ -580,6 +601,7 @@ def main():
         use_moe_w8a8=args.use_moe_w8a8,
         moe_w8a8_weight_group_size=args.moe_w8a8_weight_group_size,
         use_vectorized_moe=args.vectorized_moe,
+        use_fused_gdr_kernel=args.fused_gdr_kernel,
     )
 
     # Added 2026-08-27: real KV-cache block count is only known after
