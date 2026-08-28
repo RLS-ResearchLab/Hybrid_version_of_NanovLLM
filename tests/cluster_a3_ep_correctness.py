@@ -21,12 +21,13 @@ Two things this script measures, both on the REAL checkpoint:
      technique cluster_a2_tp_correctness.py uses (separate process,
      device_map="auto"). Reuses that script's --phase reference artifact
      directly -- no need to reload the ~69GB checkpoint twice.
-  2. EXPERT-UTILIZATION HISTOGRAM ON REAL WEIGHTS: tests/moe_expert_utilization_histogram.py
-     explicitly flags, in its own docstring, that it only ever measured
-     RANDOM weights ("this measures whether round-robin sharding creates a
-     STRUCTURAL imbalance risk under routing that has no learned bias ...
-     it does NOT measure ... what a TRAINED model's LEARNED expert
-     preferences look like ... Re-run this exact script against real
+  2. EXPERT-UTILIZATION HISTOGRAM ON REAL WEIGHTS: an earlier diagnostic
+     (tests/moe_expert_utilization_histogram.py, since removed -- its
+     investigation closed) explicitly flagged, in its own docstring, that it
+     only ever measured RANDOM weights ("this measures whether round-robin
+     sharding creates a STRUCTURAL imbalance risk under routing that has no
+     learned bias ... it does NOT measure ... what a TRAINED model's LEARNED
+     expert preferences look like ... Re-run this exact script against real
      checkpoint weights once available"). This closes that gap: routes a
      real prompt corpus (GSM8K questions, not random tokens -- genuinely
      varied, real text) through EVERY MoE layer's REAL gate weights loaded
@@ -220,8 +221,8 @@ def phase_compare(args):
 
 def phase_histogram(args):
     """Expert-utilization histogram on REAL weights, REAL routing -- closes
-    the gap tests/moe_expert_utilization_histogram.py's own docstring flags
-    (random weights only, see module docstring). Runs real GSM8K questions'
+    the gap the earlier random-weights-only diagnostic flagged in its own
+    docstring (see module docstring). Runs real GSM8K questions'
     hidden states through the REAL loaded gate at every MoE layer and
     records per-expert / per-round-robin-rank (token,k) counts, same
     counting methodology as the existing script (torch.bincount over
@@ -333,7 +334,7 @@ def phase_histogram(args):
                     "n_prompts": len(prompts), "per_layer": summary}, f, indent=2)
     print(f"\nSaved to {out_path}")
     print("\nThis is a REAL-WEIGHT, REAL-ROUTING measurement -- unlike "
-          "tests/moe_expert_utilization_histogram.py's random-weight run, this one CAN speak to "
+          "the earlier random-weight-only run, this one CAN speak to "
           "whether round-robin sharding creates a per-rank load imbalance under the model's "
           "actual learned expert preferences. Still just this checkpoint / this prompt "
           "distribution (GSM8K) -- not a claim about every workload this engine will ever see.")

@@ -105,8 +105,8 @@ def quantize_experts_module_inplace(experts: nn.Module, group_size: int) -> None
 def apply_moe_int8_quantization(model: nn.Module, group_size: int) -> int:
     """Walks the model, quantizes every MoE layer's Experts module in place.
     Returns the count quantized, for logging (matches this project's
-    existing "Found N Qwen35MoE layer(s)" logging convention, e.g.
-    tests/moe_expert_utilization_histogram.py)."""
+    existing "Found N Qwen35MoE layer(s)" logging convention used
+    elsewhere in the diagnostic scripts)."""
     from nanovllm.models.qwen3_5 import Experts
 
     count = 0

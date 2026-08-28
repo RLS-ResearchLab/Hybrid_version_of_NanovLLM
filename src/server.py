@@ -521,7 +521,7 @@ def main():
                              "effect at --tensor-parallel-size 1 (ep_size>1 always uses the "
                              "separate EP dispatch path, which this flag does not touch -- see "
                              "Qwen35MoE.forward()'s branch order). See "
-                             "tests/test_qwen35_vectorized_moe.py / tests/bench_vectorized_moe.py.")
+                             "tests/test_qwen35_vectorized_moe.py.")
     parser.add_argument("--fused-gdr-kernel", dest="fused_gdr_kernel", action="store_true", default=False,
                         help="Enables flash-linear-attention's chunked Gated Delta Rule kernel "
                              "(fla.ops.gated_delta_rule.chunk_gated_delta_rule) for PREFILL on "

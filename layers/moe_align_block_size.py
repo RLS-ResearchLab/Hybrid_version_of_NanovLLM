@@ -1,15 +1,16 @@
 """Pure-PyTorch replacement for vllm._custom_ops.moe_align_block_size.
 
-layers/fused_moe_triton_raw.py is vLLM's real fused-MoE Triton kernel, copied
-in as a reference (dead code, never wired up -- see its own git history,
-2026-07-27, three weeks before this project's quantization work). Its
-moe_align_block_size() calls ops.moe_align_block_size(...), a compiled CUDA
+Originally written against layers/fused_moe_triton_raw.py, vLLM's real
+fused-MoE Triton kernel copied in as a reference (2026-07-27, three weeks
+before this project's quantization work); that file's own
+moe_align_block_size() called ops.moe_align_block_size(...), a compiled CUDA
 extension inside the actual vllm package -- pulling in real vLLM as a
 dependency just for one supporting op is backwards for a project whose whole
 point is being a lightweight, from-scratch alternative to vLLM. This file
 reimplements just that one function in plain PyTorch, matching the exact
-input/output contract fused_moe_triton_raw.py's Triton kernel expects, so the
-kernel itself can be reused unmodified once wired in.
+input/output contract the Triton kernel expects. The kernel itself was since
+wired in as layers/fused_moe_triton.py; the raw reference copy was deleted
+2026-08-26 (git history has it if needed).
 
 CUDA-graph safety, the constraint that shaped every design choice here: every
 output tensor is allocated at the SAME fixed worst-case size the original
