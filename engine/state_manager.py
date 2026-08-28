@@ -113,11 +113,27 @@ class StateManager:
         self.conv_states[layer_idx].index_copy_(0, slot_ids, conv_state.to(self.conv_states.dtype))
 
     def get_all(self, slot_ids: torch.Tensor, num_total_layers: int, linear_layer_indices: list[int]):
+        # Single batched index_select across ALL linear layers at once (dim=1
+        # selects slots, dim=0 spans layers), instead of one index_select
+        # kernel launch per layer. This runs INSIDE the captured CUDA graph
+        # every decode step (model_runner.py's capture_cudagraph()'s _step())
+        # -- added 2026-08-28 after nsys profiling flagged state I/O as a
+        # real per-step cost (~15% of the batched-path step). Reads the exact
+        # same bytes as the old per-layer loop (no extra copy introduced --
+        # unlike the write side, which would need a torch.stack() of
+        # per-layer tensors first since those come from 30 independently-
+        # computed forward() outputs, not a shared buffer; that stack would
+        # add a full extra copy and isn't clearly a net win without GPU
+        # profiling, so set_all()/the mirroring inline loop in _step() is
+        # deliberately left untouched here). Slicing the batched result per
+        # layer below is a view into already-materialized data, not a copy.
+        combined_states = self.states.index_select(1, slot_ids)
+        combined_conv = self.conv_states.index_select(1, slot_ids)
         states = [None] * num_total_layers
         conv_states = [None] * num_total_layers
         for compact_idx, full_idx in enumerate(linear_layer_indices):
-            states[full_idx] = self.states[compact_idx].index_select(0, slot_ids)
-            conv_states[full_idx] = self.conv_states[compact_idx].index_select(0, slot_ids)
+            states[full_idx] = combined_states[compact_idx]
+            conv_states[full_idx] = combined_conv[compact_idx]
         return states, conv_states
 
     def set_all(self, slot_ids: torch.Tensor, states: list, conv_states: list, linear_layer_indices: list[int]) -> None:

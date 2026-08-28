@@ -8,9 +8,22 @@ config has never been retuned since it was set.
 
 Reuses layers/smoke_test_fused_moe_triton.py's real-quantizer setup (same
 quantize_weight_int8_grouped call, not synthetic int8 noise) so results are
-directly comparable to that script's own baseline number. M defaults to 32
-to match the concurrency level where the real engine's throughput curve was
-actually measured this session, not the smoke test's modest M=16.
+directly comparable to that script's own baseline number.
+
+DEFAULTS UPDATED 2026-08-28 (post GDR-decode-fix session): E=256/M=64, not
+the previous E=128/M=32. The old defaults matched
+layers/smoke_test_fused_moe_triton.py's tp=2 EP-shard shape
+(local_num_experts = 256/2 = 128) and an M=32 concurrency level from before
+the GDR decode bottleneck was found. Once the GDR loop was fixed
+(--batched-gdr-decode / --fused-gdr-decode-kernel), MoE became the #1 GPU
+cost and the real production shape being optimized is tp=1 / ep_size=1 (all
+256 experts local, no sharding) at concurrency 64, where the 908/1467 tok/s
+numbers were actually measured (SESSION_HANDOFF_2026-08-28.md). Note the
+per-expert token-count ratio (M*top_k/E) is ~2 either way (256/128 or
+512/256), so the padding-waste *ratio* the old defaults exercised was
+already representative -- but the absolute expert count affects grid size
+/ SM occupancy, so retuning against the actual shape matters. Pass
+--E 128 --M 32 to reproduce the old tp=2 smoke-test shape if needed.
 
 Uses CUDA events for the timed comparison, not just host-side
 time.perf_counter() -- the session's own GIL-starvation bug (found in
@@ -59,16 +72,38 @@ CANDIDATE_CONFIGS = [
     {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64,  "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 3},
     {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64,  "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2},
     {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64,  "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 3},
+    # -- Decode-specific candidates added 2026-08-28. At the real production
+    # shape (E=256, top_k=8, concurrency 64) avg tokens/expert ~= 2, so
+    # BLOCK_SIZE_M=16 already pads ~8x (see THROUGHPUT_PUSH_CHECKLIST.md
+    # item 3). Larger GROUP_SIZE_M (more L2 reuse across the many
+    # near-empty per-expert blocks) and more stages/warps (deeper pipeline
+    # to hide the same fixed per-block weight-tile load over more, smaller
+    # blocks) are the two knobs that can help WITHOUT going below the
+    # tensor-core minimum tile size.
+    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64,  "BLOCK_SIZE_K": 64,  "GROUP_SIZE_M": 4, "num_warps": 4, "num_stages": 3},
+    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64,  "BLOCK_SIZE_K": 64,  "GROUP_SIZE_M": 8, "num_warps": 8, "num_stages": 4},
+    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 4, "num_warps": 8, "num_stages": 4},
+    # EXPERIMENTAL, verify correctness AND speed before trusting: fused_moe_
+    # kernel's inner loop uses tl.dot(a, b) (fused_moe_triton.py:122/125/127),
+    # which lowers to tensor-core MMA and generally wants block dims >= 16 on
+    # Hopper to actually use tensor cores -- BLOCK_SIZE_M=8 is NOT guaranteed
+    # to be a real win; it may silently fall off tensor cores onto a slower
+    # path, or (less likely, tl.arange requires power-of-2 sizes so this
+    # should still be valid) hit a Triton lowering error. Untested -- this is
+    # a CPU-window hypothesis, not a validated config. Include in the sweep
+    # but do NOT adopt without confirming device_ms actually improves.
+    {"BLOCK_SIZE_M": 8,  "BLOCK_SIZE_N": 64,  "BLOCK_SIZE_K": 64,  "GROUP_SIZE_M": 4, "num_warps": 4, "num_stages": 3},
+    {"BLOCK_SIZE_M": 8,  "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64,  "GROUP_SIZE_M": 4, "num_warps": 8, "num_stages": 3},
 ]
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--E", type=int, default=128, help="local expert count -- matches the smoke test's tp=2 shape by default")
+    ap.add_argument("--E", type=int, default=256, help="local expert count -- default matches the real tp=1/ep_size=1 production shape (all 256 experts local); pass --E 128 for the tp=2 EP-shard shape smoke_test_fused_moe_triton.py uses")
     ap.add_argument("--K", type=int, default=2048)
     ap.add_argument("--N", type=int, default=512)
     ap.add_argument("--top-k", type=int, default=8, dest="top_k")
-    ap.add_argument("--M", type=int, default=32, help="concurrency proxy -- default matches the level the real sweep was measured at, not the smoke test's M=16")
+    ap.add_argument("--M", type=int, default=64, help="concurrency proxy -- default matches concurrency 64, where the real 908/1467 tok/s decode numbers were measured (SESSION_HANDOFF_2026-08-28.md), not the earlier M=32 sweep")
     ap.add_argument("--group-size", type=int, default=128, dest="group_size")
     ap.add_argument("--trials", type=int, default=10)
     ap.add_argument("--warmup", type=int, default=3)

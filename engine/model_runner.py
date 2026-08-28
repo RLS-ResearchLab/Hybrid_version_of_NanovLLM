@@ -445,8 +445,16 @@ class ModelRunner:
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
+        # Computed on the host, from data already sitting in plain Python,
+        # BEFORE the GPU tensor below even exists -- passed through to
+        # Sampler.forward() so its hot-path decision doesn't need to
+        # re-derive the same fact via a GPU->host sync
+        # (`bool((temperatures == 0).all())`) every decode step. See
+        # Sampler.forward()'s docstring for why that sync was a real,
+        # measured-variance cost, not just theoretical overhead.
+        all_greedy = all(t == 0 for t in temperatures)
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return temperatures
+        return temperatures, all_greedy
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -470,7 +478,7 @@ class ModelRunner:
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        temperatures, all_greedy = self.prepare_sample(seqs) if self.rank == 0 else (None, None)
  
         if self.state_manager is not None:
             context = get_context()
@@ -507,13 +515,28 @@ class ModelRunner:
                 # cu_seqlens_q for decode is always arange(0, bs+1) — already
                 # correct as a static buffer, no per-call refresh needed.
 
+                # nvtx ranges added 2026-08-28 (CPU window, no GPU access) --
+                # purely diagnostic, torch.cuda.nvtx push/pop cost is
+                # negligible whether or not a profiler is attached. Exists
+                # to settle, on the next nsys capture, whether the
+                # unidentified ~2ms/step elementwise op (SESSION_HANDOFF_
+                # 2026-08-28.md) lives in the eager lm_head GEMM or the
+                # eager sampler call below -- both run OUTSIDE the captured
+                # graph today (capture_cudagraph()'s _step() only covers
+                # self.model.model(...), the 40-layer backbone), so both are
+                # real candidates for host-dispatch-induced GPU idle bubbles
+                # that a graph replay's kernels don't suffer from.
+                torch.cuda.nvtx.range_push("decode_graph_replay")
                 graph.replay()
+                torch.cuda.nvtx.range_pop()
 
                 hidden = gv["outputs"][:bs]
                 # State write-back happens INSIDE the captured graph now
                 # (see capture_cudagraph()'s _step()) -- no eager
                 # index_copy_ needed here anymore.
+                torch.cuda.nvtx.range_push("decode_lm_head_eager")
                 logits = self.model.compute_logits(hidden)
+                torch.cuda.nvtx.range_pop()
             else:
                 num_layers = len(self.model.model.layers)
                 linear_idx = self.model.model.linear_layer_indices
@@ -526,7 +549,13 @@ class ModelRunner:
         else:
             logits = self.run_model(input_ids, positions, is_prefill)
  
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        # Not "decode_"-prefixed like the two ranges above -- this call site
+        # also fires for prefill (is_prefill=True takes the eager branch
+        # above, not the graph-replay one), so the label stays accurate for
+        # both.
+        torch.cuda.nvtx.range_push("sampler_eager")
+        token_ids = self.sampler(logits, temperatures, all_greedy=all_greedy).tolist() if self.rank == 0 else None
+        torch.cuda.nvtx.range_pop()
         if is_prefill and self.rank == 0 and self.config.debug_print_prefill_samples:
             argmax_ids = logits.argmax(dim=-1).tolist()
             for seq, argmax_id, token_id in zip(seqs, argmax_ids, token_ids):

@@ -10,6 +10,17 @@ This test proves the fast path is (a) numerically identical to routing the
 same all-greedy batch through _sample(), and (b) NOT taken when any row is
 sampled (mixed batch still gets per-row selection).
 
+UPDATED 2026-08-28 (CPU window, no GPU access): adds two more checks for the
+follow-up fix that removed the GPU->host sync from the hot path --
+1. `logits.argmax(dim=-1)` (no `.float()` cast) vs `logits.float().argmax(dim=-1)`
+   are proven bitwise-identical on a bf16 input, not just the fp32 tensors the
+   original test used (where `.float()` was already a no-op and couldn't have
+   caught a dtype-dependent regression).
+2. `Sampler.forward()`'s new `all_greedy` parameter (host-precomputed, so
+   engine/model_runner.py's hot path never needs
+   `bool((temperatures == 0).all())`'s GPU sync) produces output identical to
+   the old GPU-side auto-detection, for both all_greedy=True and False/mixed.
+
 Pure CPU. Run with TORCHDYNAMO_DISABLE=1.
 
 Usage:
@@ -65,6 +76,31 @@ def main():
         torch.manual_seed(2); b = s(logits, temps_hot)
         differs = not torch.equal(a, b) if bs > 1 else True  # bs=1 may coincide
         print(f"bs={bs:3d} all-hot    : two draws differ (stochastic path live)? {differs}")
+
+        # ---- bf16 cast-removal proof: argmax(bf16) == argmax(bf16.float()) ----
+        # The original test's `eager` reference above used torch.randn's
+        # default fp32 dtype, where `.float()` was already a no-op -- it
+        # could never have caught a dtype-dependent regression. bf16 is the
+        # actual production dtype (real checkpoint is bfloat16), and this is
+        # where removing the cast needed to be proven safe, not assumed.
+        logits_bf16 = logits.to(torch.bfloat16)
+        no_cast = logits_bf16.argmax(dim=-1)
+        with_cast = logits_bf16.float().argmax(dim=-1)
+        bf16_match = torch.equal(no_cast, with_cast)
+        print(f"bs={bs:3d} bf16 cast  : argmax(bf16) == argmax(bf16.float())? {bf16_match}")
+        ok &= bf16_match
+
+        # ---- host-precomputed all_greedy param matches GPU-side auto-detect ----
+        fast_auto = s(logits, temps0)                      # all_greedy=None -> auto GPU-side check
+        fast_precomputed = s(logits, temps0, all_greedy=True)
+        greedy_param_match = torch.equal(fast_auto, fast_precomputed)
+        torch.manual_seed(123)
+        mixed_auto = s(logits, temps_mixed)
+        torch.manual_seed(123)
+        mixed_precomputed = s(logits, temps_mixed, all_greedy=False)
+        mixed_param_match = torch.equal(mixed_auto, mixed_precomputed)
+        print(f"bs={bs:3d} all_greedy param : greedy match={greedy_param_match}  mixed match={mixed_param_match}")
+        ok &= greedy_param_match and mixed_param_match
 
     print("\n" + "-" * 66)
     print("PASS" if ok else "FAIL")
