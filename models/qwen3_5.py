@@ -1880,7 +1880,31 @@ class Qwen35DecoderLayer(nn.Module):
                 rms_norm_eps=rms_norm_eps,
             )
         else:
-           
+            # linear_value_head_dim is a REAL, separate field in this
+            # checkpoint schema (confirmed present in the actual
+            # qwen35_checkpoint/config.json's text_config, and modeled as a
+            # distinct field from linear_key_head_dim in this project's own
+            # tests/make_fake_hf_config.py fixture) -- but Qwen35LinearAttention
+            # has only ONE head_dim (self.lhd), applied uniformly to Q/K/V, and
+            # nothing here ever reads linear_value_head_dim. Currently harmless
+            # because the real checkpoint happens to set both to 128, but if a
+            # future checkpoint ever ships with a different V head_dim, this
+            # silently ignores it -- the resulting shape mismatch would surface
+            # later as an opaque tensor-shape error inside _qkv_weight_loader's
+            # .split()/.narrow() calls, not a clear message here. Fail loudly
+            # and specifically instead, until Qwen35LinearAttention actually
+            # supports independent K/Q vs V head dims.
+            _linear_key_head_dim = getattr(
+                config, "linear_key_head_dim", getattr(config, "linear_attn_head_dim", 128)
+            )
+            _linear_value_head_dim = getattr(config, "linear_value_head_dim", None)
+            assert _linear_value_head_dim is None or _linear_value_head_dim == _linear_key_head_dim, (
+                f"checkpoint config sets linear_value_head_dim={_linear_value_head_dim} != "
+                f"linear_key_head_dim={_linear_key_head_dim} -- Qwen35LinearAttention only "
+                f"supports a single shared head_dim for Q/K/V and would silently use "
+                f"linear_key_head_dim for V too. Not supported; needs a real code change, "
+                f"not a config workaround."
+            )
             self.linear_attn = Qwen35LinearAttention(
                 hidden_size=hidden_size,
                 linear_attn_kq_heads=getattr(
@@ -1889,9 +1913,7 @@ class Qwen35DecoderLayer(nn.Module):
                 linear_attn_v_heads=getattr(
                     config, "linear_num_value_heads", getattr(config, "linear_attn_v_heads", 32)
                 ),
-                linear_attn_head_dim=getattr(
-                    config, "linear_key_head_dim", getattr(config, "linear_attn_head_dim", 128)
-                ),
+                linear_attn_head_dim=_linear_key_head_dim,
                 conv_kernel_size=getattr(
                     config, "linear_conv_kernel_dim", getattr(config, "conv_kernel_size", 4)
                 ),

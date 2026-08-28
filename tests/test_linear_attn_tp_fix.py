@@ -55,13 +55,18 @@ def worker(rank: int):
           f"{getattr(hc, 'linear_attn_kq_heads', 16)} linear_attn_v_heads(getattr)="
           f"{getattr(hc, 'linear_attn_v_heads', 32)} linear_attn_head_dim(getattr)="
           f"{getattr(hc, 'linear_attn_head_dim', 128)}")
-    # NOTE: the real config.json uses different field names (linear_num_key_heads /
-    # linear_num_value_heads / linear_key_head_dim), which getattr's fallback
-    # doesn't find -- it silently uses the hardcoded defaults (16/32/128)
-    # instead of reading the real config. Those defaults happen to equal the
-    # real checkpoint's actual values, so this specific verification isn't
-    # affected, but that's a coincidence, not a confirmation the naming is
-    # wired correctly -- separate, unfixed issue, flagged not fixed here.
+    # NOTE (stale as of 2026-08-28, left for history): this used to warn that
+    # the real config.json's field names (linear_num_key_heads /
+    # linear_num_value_heads / linear_key_head_dim) weren't being read, only
+    # coincidentally-matching hardcoded defaults. That's no longer true --
+    # models/qwen3_5.py's Qwen35DecoderLayer.__init__ now tries the real
+    # checkpoint's field names FIRST (getattr(config, "linear_num_key_heads",
+    # getattr(config, "linear_attn_kq_heads", 16)), and analogously for the
+    # other two), falling back to the old names only if neither is present.
+    # Verified against the real qwen35_checkpoint/config.json's text_config
+    # directly. The (LKH, LVH, LHD) = (16, 32, 128) below are still real
+    # checkpoint values, now confirmed actually read, not just coincidental
+    # defaults.
 
     # No assert_all_parameters_initialized here (see tests/test_utils.py):
     # torch.device("meta") allocates no real storage -- this test only reads
