@@ -693,6 +693,30 @@ class Qwen35LinearAttention(nn.Module):
 
         return self.out_proj(y), new_states, new_conv_states
 
+    # Compiled decode-only gate helper, added 2026-08-28. Shared by
+    # _forward_decode_batched and _forward_decode_fused_gdr below -- both
+    # compute this identical (g, beta) pair right after the conv1d/silu/
+    # split step. Unlike Qwen35RMSNormGated/l2norm, no decode-only-variant
+    # split is needed here: both callers are reached ONLY through forward()'s
+    # `is_decode_shape` gate (num_segments == N, i.e. every segment is
+    # exactly one token) -- the prefill sequential scan's OWN (g, beta)
+    # computation (this file's `for i in range(num_segments)` loop, `seg_a`/
+    # `seg_b` variables) is a textually separate, untouched copy of the same
+    # formula, never routed through this method. ~7-8 eager launches
+    # collapsed into one compiled call (.float() x3, negate, .exp(),
+    # .add(), F.softplus(), multiply, plus beta's .sigmoid()) -- called once
+    # per GDR layer (30/40 layers), same shape-budget bound as the other
+    # decode-only compiled functions this session added (at most 8 shapes,
+    # tied to the fixed CUDA-graph bucket list). See
+    # engine/model_runner.py's recompile_limit comment (bumped 64->256
+    # 2026-08-28 to cover this session's additions) for the shared-budget
+    # accounting. GPU-UNVALIDATED.
+    @torch.compile
+    def _decode_gate_compiled(self, a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+        beta = b.sigmoid()
+        return g, beta
+
     def _forward_decode_batched(self, hidden_states, states, conv_states):
         """Triton-free batched replacement for forward()'s decode branch --
         the `for i in range(num_segments)` Python loop plus its `for t in
@@ -750,8 +774,7 @@ class Qwen35LinearAttention(nn.Module):
         k = qkv_conv[:, :, lkh * lhd:2 * lkh * lhd].view(N, 1, lkh, lhd)
         v = qkv_conv[:, :, 2 * lkh * lhd:].view(N, 1, lvh, lhd)
 
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())  # (N, LVH)
-        beta = b.sigmoid()                                                            # (N, LVH)
+        g, beta = self._decode_gate_compiled(a, b)   # (N, LVH) each
 
         q = q.repeat_interleave(self.head_expand, dim=2)   # (N, 1, LVH, LHD)
         k = k.repeat_interleave(self.head_expand, dim=2)
@@ -851,8 +874,7 @@ class Qwen35LinearAttention(nn.Module):
         k = qkv_conv[:, :, lkh * lhd:2 * lkh * lhd].view(N, 1, lkh, lhd)
         v = qkv_conv[:, :, 2 * lkh * lhd:].view(N, 1, lvh, lhd)
 
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())  # (N, LVH)
-        beta = b.sigmoid()                                                            # (N, LVH)
+        g, beta = self._decode_gate_compiled(a, b)   # (N, LVH) each
 
         q = q.repeat_interleave(self.head_expand, dim=2)   # (N, 1, LVH, LHD)
         k = k.repeat_interleave(self.head_expand, dim=2)

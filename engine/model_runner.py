@@ -107,9 +107,30 @@ class ModelRunner:
         # future rename can't crash __init__. The [DYNAMO] print is a
         # deliberate startup breadcrumb -- grep it against the recompile
         # warning to confirm the limit actually took on whatever torch ships.
+        # Bumped 64 -> 256 on 2026-08-28 (CPU window): this session added
+        # several more @torch.compile call sites sharing this exact budget
+        # (layers/layernorm.py's Qwen35RMSNormGated.forward_decode_compiled,
+        # models/qwen3_5.py's l2norm_decode_compiled, and 3 new MoE combine
+        # functions -- _decode_combine_compiled / _decode_ep_pre_allreduce_
+        # compiled / _decode_ep_post_allreduce_compiled), each needing up to
+        # 8 shapes (one per CUDA-graph bucket). Tallying what's ALREADY
+        # sharing this pool: q_norm+k_norm alone need 16 (this comment's own
+        # 2026-08-27 note, from a real "hit config.recompile_limit (8)"
+        # warning), plus prefill's own continuously-varying RMSNorm shapes
+        # (unbounded in principle -- real traffic has many distinct prompt
+        # lengths), plus Sampler._sample's live (non-bucketed) batch sizes
+        # (up to max_num_seqs=64 distinct values). Adding this session's
+        # ~40 more decode-bucket-bound shapes on top of an already-
+        # contested budget risked being the thing that silently pushed it
+        # over 64 -- same "generous margin, cheap, no real downside" logic
+        # as the original 8->64 bump, just re-applied now that more is
+        # sharing the pool. GPU-UNVALIDATED -- the `[DYNAMO]` print below
+        # reports whatever value actually took; grep server logs for "hit
+        # config.recompile_limit" to confirm 256 is still enough, same
+        # discipline as before.
         for _n in ("recompile_limit", "cache_size_limit"):
             try:
-                setattr(torch._dynamo.config, _n, 64)
+                setattr(torch._dynamo.config, _n, 256)
             except AttributeError:
                 pass
         try:
