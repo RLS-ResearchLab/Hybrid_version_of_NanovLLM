@@ -45,6 +45,8 @@ WHAT THIS FILE DOES NOT DO
 Usage (as a library):
     from tests.moe_int8_quantize import quantize_weight_int8_grouped, dequantize_weight_int8_grouped
 """
+import os
+
 import torch
 
 
@@ -101,6 +103,36 @@ def quantize_weight_int8_grouped(
     return int8_w, scale
 
 
+_COMPILE_DEQUANT = os.environ.get("NANOVLLM_COMPILE_DEQUANT", "0") == "1"
+
+
+def _dequant_int8_grouped_math(int8_weight, scale, group_size, out_dtype, lead, out_features, in_features):
+    num_groups = in_features // group_size
+    w = int8_weight.reshape(*lead, out_features, num_groups, group_size)
+    scale_bcast = scale.unsqueeze(-1).to(out_dtype)
+    return (w * scale_bcast).reshape(*lead, out_features, in_features)
+
+
+# GPU-UNVALIDATED, off by default -- an untested hypothesis, not a fix. See
+# dequantize_weight_int8_grouped's docstring for the full history: this exact
+# @torch.compile was tried 2026-08-21 and reverted same day as a REAL,
+# measured regression (37.1 -> 33.0 tok/s), suspected root cause being
+# torch._dynamo's then-default cache_size_limit=8 getting exhausted by this
+# function's per-CUDA-graph-bucket shape variation (8 buckets: 1,2,4,8,16,32,
+# 48,64) competing with layers/layernorm.py's rms_forward for the SAME global
+# budget. SMELL-11 (2026-08-27/28, model_runner.py) later found and fixed
+# that exact class of bug on torch 2.13 -- recompile_limit AND cache_size_limit
+# both belt-and-suspenders-set to 64 -- but nobody has re-tested THIS
+# regression against that fix. If the hypothesis is right, this env var
+# should now be safe to enable; if wrong, it should reproduce the same
+# ~11% regression as before. Either result is informative -- run the same
+# matched A/B methodology (concurrency=16, gpu_memory_utilization=0.75,
+# tp=2 or whatever the current default is, identical otherwise) before
+# trusting a result either way, same discipline as everything else in this
+# file's history.
+_dequant_int8_grouped_math_compiled = torch.compile(_dequant_int8_grouped_math)
+
+
 def dequantize_weight_int8_grouped(
     int8_weight: torch.Tensor, scale: torch.Tensor, group_size: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
@@ -116,6 +148,16 @@ def dequantize_weight_int8_grouped(
     the same limit, plausibly caused partial/inconsistent compilation rather than a clean
     win. Do not re-add @torch.compile here without re-measuring -- it was a real,
     verified regression on this codepath, not a hypothetical one.
+
+    RE-EXAMINED 2026-08-28 (CPU window, no GPU access): SMELL-11's recompile_limit/
+    cache_size_limit fix (engine/model_runner.py, belt-and-suspenders 8 -> 64) was
+    landed a week AFTER this regression was found and reverted, and directly
+    addresses the exact mechanism suspected here. Nobody has re-tested this function
+    against that fix. `NANOVLLM_COMPILE_DEQUANT=1` now exists specifically to make
+    that re-test a one-line env var flip instead of rewriting this function during a
+    validation window -- see `_dequant_int8_grouped_math_compiled`'s comment above.
+    Still OFF by default; this is an untested hypothesis riding on a plausible but
+    unconfirmed root-cause story, not a verified fix.
 
     Computes directly in out_dtype (bf16 in production), NOT fp32 -- changed
     2026-08-21 after a matched-settings A/B on real hardware measured the
@@ -168,10 +210,8 @@ def dequantize_weight_int8_grouped(
         f"{tuple(int8_weight.shape)} at group_size={group_size}."
     )
 
-    w = int8_weight.reshape(*lead, out_features, num_groups, group_size)
-    scale_bcast = scale.unsqueeze(-1).to(out_dtype)
-    dequant = (w * scale_bcast).reshape(*lead, out_features, in_features)
-    return dequant
+    impl = _dequant_int8_grouped_math_compiled if _COMPILE_DEQUANT else _dequant_int8_grouped_math
+    return impl(int8_weight, scale, group_size, out_dtype, lead, out_features, in_features)
 
 
 def quantize_experts_module(gate_up_proj: torch.Tensor, down_proj: torch.Tensor, group_size: int):
