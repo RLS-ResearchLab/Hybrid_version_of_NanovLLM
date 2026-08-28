@@ -49,7 +49,8 @@ echo "python3 -> $(which python3)"
 echo "=== [4/8] CUDA-independent pip deps + background checkpoint download ==="
 pip install --upgrade pip -q
 pip install -q transformers xxhash numpy tqdm safetensors fastapi "uvicorn[standard]" pydantic \
-    huggingface_hub accelerate "jinja2>=3.1.0" aiohttp tabulate datasets ninja packaging
+    huggingface_hub accelerate "jinja2>=3.1.0" aiohttp tabulate datasets ninja packaging \
+    wheel setuptools psutil
 # (deliberately skipping lm-eval and flash-linear-attention from requirements.txt --
 # neither is needed for the actual test scripts, both are slow to install)
 
@@ -96,6 +97,21 @@ else
     echo "nvcc $CURRENT_NVCC_VER already matches driver ceiling, skipping toolkit install."
 fi
 nvcc --version
+
+# Every session handoff in this repo assumes `source ~/qLLM/cuda_env.sh`
+# before launching the server (nvcc-on-PATH gotcha above, plus
+# PYTHONUNBUFFERED=1 -- without it, server startup logs are block-buffered
+# and don't appear until the process exits, making `tail -f`/`grep` on a
+# live server misleading). Generate it here so a from-scratch setup.sh run
+# actually produces the file every later doc/script expects, instead of
+# relying on it being hand-written mid-session.
+cat > "$REPO_DIR/cuda_env.sh" <<EOF
+export CUDA_HOME=/usr/local/cuda-${CUDA_VER}
+export PATH=\$CUDA_HOME/bin:\$PATH
+export LD_LIBRARY_PATH=\$CUDA_HOME/lib64:\$LD_LIBRARY_PATH
+export PYTHONUNBUFFERED=1
+EOF
+echo "Wrote $REPO_DIR/cuda_env.sh -- source it before every server launch."
 
 echo "=== [6/8] torch (cu${CUDA_TAG} index) ==="
 
@@ -174,19 +190,51 @@ else
 fi
 [ "$FA_MAX_JOBS" -gt "$NPROC" ] && FA_MAX_JOBS=$NPROC
 echo "RAM=${RAM_GB}GB nproc=${NPROC} -> MAX_JOBS=${FA_MAX_JOBS} (flat cap, not RAM-proportional -- see comment above)"
+
+# RESOLVED 2026-08-27 (was "unresolved, root cause not found" as of 2026-08-23):
+# the "cutlass compile errors" were never a cutlass/CUDA-13 incompatibility --
+# two mundane, sequential blockers that the ninja stack trace hides behind
+# generic-looking noise:
+#   1. nvcc not actually on PATH even after the toolkit install above
+#      (nvidia-smi's "CUDA Version" is the DRIVER's ceiling, not a usable
+#      toolkit link) -- already handled by this script's own PATH/
+#      LD_LIBRARY_PATH exports in step 5, but g++ is not, see next point.
+#   2. g++ missing -- apt's cuda-toolkit package pulls in gcc but NOT g++,
+#      and nvcc's host compiler (cc1plus) ships with g++, not gcc alone.
+#      Confirmed error: "gcc: fatal error: cannot execute 'cc1plus'".
+# If a build still fails after the g++ install below, the ninja trace still
+# hides the real line -- always: grep -A25 "^FAILED:" flash_attn_build.log
+if ! command -v g++ >/dev/null 2>&1 || ! gcc -print-prog-name=cc1plus | grep -q '/'; then
+    echo "g++ missing (nvcc needs cc1plus, which ships with g++, not gcc alone) -- installing..."
+    sudo apt-get update -qq
+    sudo apt-get install -y g++
+fi
+
 if ! python3 -c "import flash_attn" 2>/dev/null; then
-    # NOTE: unresolved as of 2026-08-23 -- flash-attn's bundled cutlass had
-    # real compile errors against CUDA 13.0 on the H200 box (not just the
-    # deprecation-warning noise), root cause not yet found. If this fails,
-    # capture full output (not just the tail) and read the actual "error:"
-    # lines, not the surrounding warnings:
-    #   MAX_JOBS=N pip install flash-attn --no-build-isolation > flash_attn_build.log 2>&1
-    #   grep -B5 "error:" flash_attn_build.log
-    MAX_JOBS=$FA_MAX_JOBS pip install flash-attn --no-build-isolation
+    # FLASH_ATTN_CUDA_ARCHS=90 -- flash-attn ignores TORCH_CUDA_ARCH_LIST and
+    # defaults to its OWN "80;90;100;110;120" (5 archs) if left unset; on a
+    # real box this alone turned an unconstrained build (found 2026-08-28,
+    # A40 box) into one compiling backward-pass kernels for 4 architectures
+    # nothing here targets. 90 = Hopper (H100/H200) -- the only target this
+    # project runs on. FLASH_ATTENTION_DISABLE_BACKWARD=TRUE roughly halves
+    # the compile units (inference-only, no training). Confirmed working
+    # recipe, ~15-25 min on a 20-core/125GB box:
+    FLASH_ATTN_CUDA_ARCHS=90 MAX_JOBS=$FA_MAX_JOBS FLASH_ATTENTION_DISABLE_BACKWARD=TRUE \
+        FLASH_ATTENTION_FORCE_BUILD=TRUE \
+        pip install flash-attn --no-build-isolation \
+        2>&1 | tee flash_attn_build.log \
+        || { echo "flash-attn build FAILED -- ninja's own error is usually buried; try: grep -A25 '^FAILED:' flash_attn_build.log" >&2; exit 1; }
 else
     echo "flash-attn already importable, skipping."
 fi
 python3 -c "import triton; print('triton', triton.__version__)"
+
+if ! python3 -c "import fla" 2>/dev/null; then
+    # Pinned, not latest -- --fused-gdr-decode-kernel was written against
+    # this exact fused_recurrent_gated_delta_rule signature. Triton-based,
+    # no compile step -- trivial compared to flash-attn above.
+    pip install -q "flash-linear-attention==0.5.2"
+fi
 
 echo "=== [8/8] Done ==="
 echo "Checkpoint download progress: tail -f $REPO_DIR/checkpoint_download.log"
