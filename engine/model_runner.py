@@ -56,6 +56,20 @@ class ModelRunner:
         hf_config = config.hf_config
         hf_config.dtype = _resolve_dtype(hf_config.dtype)
         self.block_size = config.kvcache_block_size
+        # Sequence.block_size is a CLASS attribute, normally set once by
+        # LLMEngine.__init__ -- but that only runs in the rank0/main
+        # process. Rank>0 processes are spawned via
+        # multiprocessing.get_context("spawn") straight into ModelRunner
+        # (never through LLMEngine.__init__), so without this line their
+        # copy of Sequence.block_size silently stays at the class
+        # definition's hardcoded default (256) regardless of what
+        # kvcache_block_size is actually configured. prepare_decode()'s
+        # slot_mapping computation reads seq.last_block_num_tokens, which
+        # divides by this class attribute -- a mismatch there computes the
+        # wrong KV-cache slot on every decode step for that rank whenever
+        # tensor_parallel_size > 1 and kvcache_block_size != 256. Masked
+        # today only because 256 is also the default.
+        Sequence.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
@@ -96,12 +110,12 @@ class ModelRunner:
         for _n in ("recompile_limit", "cache_size_limit"):
             try:
                 setattr(torch._dynamo.config, _n, 64)
-            except Exception:
+            except AttributeError:
                 pass
         try:
             torch._dynamo.config.accumulated_recompile_limit = max(
                 512, getattr(torch._dynamo.config, "accumulated_recompile_limit", 512))
-        except Exception:
+        except AttributeError:
             pass
         print("[DYNAMO] recompile_limit=%s cache_size_limit=%s accumulated=%s" % (
             getattr(torch._dynamo.config, "recompile_limit", "?"),
@@ -471,6 +485,11 @@ class ModelRunner:
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
+            # Reset before the partial overwrite -- see the identical fix
+            # in run()'s hybrid-model graph branch below for why: without
+            # it, padding rows (bs:max_bs) keep stale block ids from
+            # whatever larger-bs call last wrote this static buffer.
+            graph_vars["block_tables"].fill_(-1)
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
@@ -526,17 +545,29 @@ class ModelRunner:
                 # self.model.model(...), the 40-layer backbone), so both are
                 # real candidates for host-dispatch-induced GPU idle bubbles
                 # that a graph replay's kernels don't suffer from.
+                # try/finally: an unmatched range_pop (e.g. graph.replay()
+                # raising on an illegal memory access, or compute_logits
+                # OOMing on the eager vocab-wide GEMM) would otherwise
+                # permanently desync this thread's NVTX range stack for the
+                # rest of the process -- harmless in single-process CLI/bench
+                # runs (the process dies with the exception anyway) but
+                # corrupts every later nsys capture in a long-lived server
+                # process that survives the exception.
                 torch.cuda.nvtx.range_push("decode_graph_replay")
-                graph.replay()
-                torch.cuda.nvtx.range_pop()
+                try:
+                    graph.replay()
+                finally:
+                    torch.cuda.nvtx.range_pop()
 
                 hidden = gv["outputs"][:bs]
                 # State write-back happens INSIDE the captured graph now
                 # (see capture_cudagraph()'s _step()) -- no eager
                 # index_copy_ needed here anymore.
                 torch.cuda.nvtx.range_push("decode_lm_head_eager")
-                logits = self.model.compute_logits(hidden)
-                torch.cuda.nvtx.range_pop()
+                try:
+                    logits = self.model.compute_logits(hidden)
+                finally:
+                    torch.cuda.nvtx.range_pop()
             else:
                 num_layers = len(self.model.model.layers)
                 linear_idx = self.model.model.linear_layer_indices
@@ -554,8 +585,10 @@ class ModelRunner:
         # above, not the graph-replay one), so the label stays accurate for
         # both.
         torch.cuda.nvtx.range_push("sampler_eager")
-        token_ids = self.sampler(logits, temperatures, all_greedy=all_greedy).tolist() if self.rank == 0 else None
-        torch.cuda.nvtx.range_pop()
+        try:
+            token_ids = self.sampler(logits, temperatures, all_greedy=all_greedy).tolist() if self.rank == 0 else None
+        finally:
+            torch.cuda.nvtx.range_pop()
         if is_prefill and self.rank == 0 and self.config.debug_print_prefill_samples:
             argmax_ids = logits.argmax(dim=-1).tolist()
             for seq, argmax_id, token_id in zip(seqs, argmax_ids, token_ids):
@@ -776,7 +809,15 @@ class ModelRunner:
             state_ptr_before = sm.states.data_ptr()
             conv_ptr_before = sm.conv_states.data_ptr()
  
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # max_bs is appended explicitly (deduped+sorted) because range(16,
+        # max_bs+1, 16) only lands ON max_bs when max_bs is itself a
+        # multiple of 16 (or <=8). Any other --max-num-seqs (e.g. 100, 50,
+        # 24) left a gap between the top bucket and max_bs -- run()/
+        # run_model()'s `next(x for x in self.graph_bs if x >= bs)` then
+        # raised StopIteration the moment the scheduler admitted a decode
+        # batch size in that gap, which Scheduler.schedule() legitimately
+        # allows up to max_num_seqs.
+        self.graph_bs = sorted(set([1, 2, 4, 8] + list(range(16, max_bs + 1, 16)) + [max_bs]))
         self.graphs = {}
         self.graph_pool = None
  

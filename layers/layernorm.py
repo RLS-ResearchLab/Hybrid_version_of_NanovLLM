@@ -19,11 +19,17 @@ class RMSNorm(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        # Out-of-place throughout: when x arrives as float32, x.float() is a
+        # documented PyTorch no-op that returns the SAME tensor object (no
+        # copy), so an in-place .mul_ here would silently mutate the
+        # caller's own input tensor. Not just a paranoia guard -- this
+        # module is used in fp32 test/CPU configs (see add_rms_forward's
+        # analogous bug, which this mirrors).
         orig_dtype = x.dtype
         x = x.float()
         var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
+        x = x * torch.rsqrt(var + self.eps)
+        x = x.to(orig_dtype) * self.weight
         return x
 
     @torch.compile
@@ -32,12 +38,24 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Out-of-place throughout -- see rms_forward's comment. The in-place
+        # version of this method had a real bug: when x arrives as float32,
+        # `x.float()` and the later `x.to(orig_dtype)` are both no-ops (same
+        # tensor, no copy), so `residual = x.to(orig_dtype)` aliased `x`
+        # rather than snapshotting it -- the subsequent in-place
+        # rsqrt/weight-scale mutations then overwrote `residual` too, so
+        # callers got back the fully-normalized-and-weighted value as
+        # `residual` instead of the pre-norm sum needed for the next
+        # layer's skip connection. Only manifests when the working dtype is
+        # float32 (bf16/fp16 inputs make x.float() a real copy, which
+        # happened to mask this). Qwen35RMSNorm.add_rms_forward already
+        # used this same out-of-place shape and was never affected.
         orig_dtype = x.dtype
-        x = x.float().add_(residual.float())
+        x = x.float() + residual.float()
         residual = x.to(orig_dtype)
         var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
+        x = x * torch.rsqrt(var + self.eps)
+        x = x.to(orig_dtype) * self.weight
         return x, residual
 
     def forward(

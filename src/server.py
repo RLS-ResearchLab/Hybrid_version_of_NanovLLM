@@ -81,6 +81,7 @@ import asyncio
 import atexit
 import json
 import os
+import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -258,20 +259,50 @@ class BatchedEngine:
         self._pending: dict[int, threading.Event] = {}
         self._results: dict[int, list[int]] = {}
         self._stop = threading.Event()
+        # Set (once, never cleared) if _loop dies from an exception -- see
+        # _loop's except clause. generate() checks this to fail fast
+        # instead of hanging on ev.wait() forever, and /health reports it.
+        self._error: Optional[BaseException] = None
         self._loop_thread = threading.Thread(target=self._loop, daemon=True)
         self._loop_thread.start()
 
     def _loop(self):
         while not self._stop.is_set():
-            with self._lock:
-                idle = self.llm.is_finished()
-                if not idle:
-                    outputs, _ = self.llm.step()
-                    for seq_id, token_ids in outputs:
-                        self._results[seq_id] = token_ids
-                        ev = self._pending.pop(seq_id, None)
-                        if ev is not None:
-                            ev.set()
+            try:
+                with self._lock:
+                    idle = self.llm.is_finished()
+                    if not idle:
+                        outputs, _ = self.llm.step()
+                        for seq_id, token_ids in outputs:
+                            self._results[seq_id] = token_ids
+                            ev = self._pending.pop(seq_id, None)
+                            if ev is not None:
+                                ev.set()
+            except BaseException as e:
+                # Previously uncaught: an exception here (CUDA OOM, an
+                # illegal memory access, a bug in an opt-in GPU-unvalidated
+                # path) silently killed this daemon thread. Every
+                # already-waiting generate() call then blocked on ev.wait()
+                # forever, every subsequent add_request() queued an Event
+                # that would never be set, and the server looked "up"
+                # (/health still responded) while serving nothing -- no
+                # crash, no log signal, no recovery short of a manual
+                # restart. The engine's internal state (Scheduler queues,
+                # CUDA graph static buffers, StateManager slots) is not
+                # guaranteed consistent after a mid-step exception, so
+                # this does not try to resume -- it stops the loop, wakes
+                # every thread currently blocked in generate() so they
+                # fail fast instead of hanging, and leaves _error set so
+                # /health and every future generate() call can report why.
+                import traceback
+                traceback.print_exc()
+                with self._lock:
+                    self._error = e
+                    for ev in self._pending.values():
+                        ev.set()
+                    self._pending.clear()
+                self._stop.set()
+                break
             if idle:
                 # Nothing scheduled -- no in-flight or waiting requests.
                 # Short poll interval, not a Condition variable woken by
@@ -311,10 +342,16 @@ class BatchedEngine:
                              ignore_eos=ignore_eos, stop=stop)
         ev = threading.Event()
         with self._lock:
+            if self._error is not None:
+                raise RuntimeError(f"engine loop stopped after an error: {self._error!r}")
             seq_id = self.llm.add_request(prompt_token_ids, sp)
             self._pending[seq_id] = ev
         ev.wait()
         with self._lock:
+            if seq_id not in self._results:
+                # ev was set by _loop's except clause without a result --
+                # the loop died before this request finished.
+                raise RuntimeError(f"engine loop stopped before this request finished: {self._error!r}")
             return self._results.pop(seq_id)
 
     def shutdown(self):
@@ -353,6 +390,10 @@ _server_config: Optional[dict] = None
 @app.get("/health")
 def health():
     body = {"status": "ok"}
+    engine_error = getattr(_engine, "_error", None)
+    if engine_error is not None:
+        body["status"] = "error"
+        body["error"] = repr(engine_error)
     if _server_config is not None:
         body["config"] = _server_config
     return JSONResponse(body)
@@ -362,6 +403,15 @@ async def chat_completions(req: ChatRequest):
     global _engine
     if _engine is None:
         raise HTTPException(503, "Model not loaded")
+    if req.max_tokens <= 0:
+        # SamplingParams/Scheduler never validated this: num_completion_tokens
+        # starts at 0 and only increases, so `== max_tokens` (the only
+        # max_tokens stop check that exists) can never fire for max_tokens<=0
+        # -- generation would run unbounded (gated only by EOS/stop-string,
+        # or truly forever under ignore_eos=True), tying up a concurrency
+        # slot indefinitely instead of the empty/immediate completion a
+        # client sending max_tokens=0 would reasonably expect.
+        raise HTTPException(400, "max_tokens must be >= 1")
 
     # Apply chat template (thinking disabled via enable_thinking=False)
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
@@ -379,22 +429,48 @@ async def chat_completions(req: ChatRequest):
     input_ids = _engine.tok.encode(text, add_special_tokens=False)
     prompt_tokens = len(input_ids)
 
+    # SamplingParams.stop / Sequence.stop_patterns treat every entry as a
+    # REGEX (see sampling_params.py's docstring -- deliberate, since this
+    # project's own GSM8K eval harness passes real regex stop patterns
+    # through the same field). The OpenAI-compatible `stop` field here is
+    # documented and expected to match LITERAL strings, so escape at this
+    # API boundary rather than changing Sequence's regex semantics (which
+    # would break the eval harness). Without this, a client's ordinary
+    # stop string containing regex metacharacters (e.g. "2+2=4", "(done)")
+    # silently matches too broadly/narrowly, or -- for unbalanced syntax
+    # like "(" -- raises re.error, surfacing as an unhandled 500.
+    escaped_stop = [re.escape(s) for s in req.stop] if req.stop else None
+
     # Run generation in a thread so the event loop stays unblocked.
     # The engine's generation lock serialises whole requests across all threads.
     loop = asyncio.get_event_loop()
-    output_ids = await loop.run_in_executor(
-        _executor,
-        _engine.generate,
-        input_ids,
-        req.max_tokens,
-        req.temperature,
-        req.ignore_eos,
-        req.stop,
-    )
+    try:
+        output_ids = await loop.run_in_executor(
+            _executor,
+            _engine.generate,
+            input_ids,
+            req.max_tokens,
+            req.temperature,
+            req.ignore_eos,
+            escaped_stop,
+        )
+    except RuntimeError as e:
+        # Raised by BatchedEngine.generate() when the background loop
+        # thread has died (see BatchedEngine._loop's except clause) --
+        # report as a clean 503 rather than an opaque 500.
+        raise HTTPException(503, f"engine unavailable: {e}")
 
     output_text = _engine.tok.decode(output_ids, skip_special_tokens=True)
     completion_tokens = len(output_ids)
-    finish_reason = "stop" if (output_ids and output_ids[-1] == _engine.eos_id) else "length"
+    # "length" only when max_tokens was actually the reason generation
+    # stopped; any other termination (EOS, or a stop-string match) is
+    # "stop". The previous check (`last token == eos_id`) mislabeled every
+    # stop-string termination as "length", since a stop-string match ends
+    # generation on ordinary text, not the EOS token -- and the engine
+    # (Scheduler.postprocess) does not currently track which of the three
+    # termination reasons actually fired, so this is the best signal
+    # available without a deeper engine change.
+    finish_reason = "length" if completion_tokens >= req.max_tokens else "stop"
 
     return JSONResponse({
         "id":      f"chatcmpl-{uuid.uuid4()}",
