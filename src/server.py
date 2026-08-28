@@ -647,6 +647,16 @@ def main():
                              "(no top-k subset like MoE), so naive dequant-then-matmul is a "
                              "plausible bandwidth regression until a fused kernel exists. GPU A/B "
                              "only -- measure on vs off at concurrency 64 + GSM8K non-regression.")
+    parser.add_argument("--lm-head-in-graph", dest="use_lm_head_in_graph", action="store_true", default=False,
+                        help="Folds the eager lm_head GEMM into the captured CUDA graph instead of "
+                             "running it after graph.replay() every decode step (config."
+                             "use_lm_head_in_graph). 2026-08-28, CPU window: candidate fix for an "
+                             "unidentified ~2ms/step nsys anomaly -- an eager kernel launch outside "
+                             "the graph pays real CPU-dispatch overhead a captured one doesn't. "
+                             "Static CUDA-graph-safety audit done (see config.py's docstring); NOT "
+                             "yet run on GPU -- first use must confirm it actually captures cleanly. "
+                             "HARD-RESTRICTED to --tensor-parallel-size 1 -- the tp>1 dist.gather "
+                             "path allocates fresh tensors every call, which is not capture-safe.")
     parser.add_argument("--moe-w8a8-hopper", dest="use_moe_w8a8_hopper", action="store_true", default=False,
                         help="True W8A8 Hopper MoE path (moe_w8a8.cu, 2D-blocked FP8) -- separate "
                              "scheme from --moe-w8a8 (1D-grouped INT8), mutually exclusive with it "
@@ -684,6 +694,7 @@ def main():
         "batched_gdr_decode": args.batched_gdr_decode,
         "fused_gdr_decode_kernel": args.fused_gdr_decode_kernel,
         "lm_head_int8": args.use_lm_head_int8,
+        "lm_head_in_graph": args.use_lm_head_in_graph,
         "moe_w8a8_hopper": args.use_moe_w8a8_hopper,
     }
 
@@ -700,6 +711,12 @@ def main():
         parser.error("--moe-w8a8 and --moe-w8a8-hopper are mutually exclusive (model_runner "
                      "runs the INT8 pass first; the Hopper FP8 pass then raises 'weights already "
                      "gone'). Pick one.")
+    if args.use_lm_head_in_graph and args.tensor_parallel_size > 1:
+        parser.error("--lm-head-in-graph requires --tensor-parallel-size 1 -- ParallelLMHead's "
+                     "tp>1 dist.gather branch allocates fresh tensors every call "
+                     "([torch.empty_like(logits) for _ in range(self.tp_size)]), which is not "
+                     "CUDA-graph-capture-safe as written. Either drop --lm-head-in-graph or run "
+                     "at tp=1.")
     if args.use_moe_w8a8_hopper and os.environ.get("NANOVLLM_USE_MOE_W8A8_HOPPER") != "1":
         print("[WARNING] --moe-w8a8-hopper set but NANOVLLM_USE_MOE_W8A8_HOPPER != 1 -- weights "
               "will be quantized to FP8 at load but the decode forward will NOT call the Hopper "
@@ -731,6 +748,7 @@ def main():
         use_batched_gdr_decode=args.batched_gdr_decode,
         use_fused_gdr_decode_kernel=args.fused_gdr_decode_kernel,
         use_lm_head_int8=args.use_lm_head_int8,
+        use_lm_head_in_graph=args.use_lm_head_in_graph,
         use_moe_w8a8_hopper=args.use_moe_w8a8_hopper,
     )
 

@@ -113,6 +113,26 @@ def l2norm(x, dim=-1, eps=1e-6):
     return x / (x.norm(dim=dim, keepdim=True) + eps)
 
 
+# DECODE-ONLY compiled variant, added 2026-08-28. l2norm above stays
+# UNCOMPILED because it's also called from the sequential per-segment
+# PREFILL scan (this file's Qwen35LinearAttention.forward(), the
+# `q = l2norm(q.float()) * scale` / `k = l2norm(k.float())` lines inside the
+# `for i in range(num_segments)` loop) with arbitrary, continuously-varying
+# per-segment token counts -- compiling the shared function would expose it
+# to effectively unbounded distinct shapes there. l2norm_decode_compiled is
+# called ONLY from _forward_decode_batched/_forward_decode_fused_gdr, which
+# run exclusively inside the captured CUDA-graph region at exactly one of
+# the graph's fixed bucket sizes ([1,2,4,8,16,32,48,64] -- fixed forever,
+# since max_num_seqs=64 is a confirmed-fixed concurrency ceiling), so this
+# adds at most 8 compiled variants to torch._dynamo's shared cache_size_limit
+# budget, not an open-ended amount. See layers/layernorm.py's
+# Qwen35RMSNormGated.forward_decode_compiled for the full shape-budget
+# reasoning (same argument, same 8-shape bound) and the SMELL-11 history
+# this budget was previously exhausted by. GPU-UNVALIDATED -- confirm no
+# `hit config.recompile_limit` warning after adding this.
+l2norm_decode_compiled = torch.compile(l2norm)
+
+
 # ─── Full Attention (GQA with gated output) ────────────────────────────────────
 
 
@@ -736,8 +756,8 @@ class Qwen35LinearAttention(nn.Module):
         q = q.repeat_interleave(self.head_expand, dim=2)   # (N, 1, LVH, LHD)
         k = k.repeat_interleave(self.head_expand, dim=2)
         scale = lhd ** -0.5
-        q = l2norm(q.float()) * scale
-        k = l2norm(k.float())
+        q = l2norm_decode_compiled(q.float()) * scale
+        k = l2norm_decode_compiled(k.float())
 
         g = g.float()
         beta = beta.float()
@@ -765,7 +785,12 @@ class Qwen35LinearAttention(nn.Module):
 
         y = y.to(dt).reshape(N * lvh, lhd)
         z_flat = z.reshape(N * lvh, lhd)
-        y = self.norm(y, z_flat)
+        # forward_decode_compiled, not forward() -- @torch.compile'd variant
+        # scoped to decode's bounded shape set (see layers/layernorm.py's
+        # Qwen35RMSNormGated docstring). forward() itself stays uncompiled
+        # because prefill's sequential scan also calls it, with unbounded
+        # per-segment shapes.
+        y = self.norm.forward_decode_compiled(y, z_flat)
         y = y.reshape(N, lvh * lhd)
 
         return self.out_proj(y), new_states, new_conv_states
@@ -832,8 +857,8 @@ class Qwen35LinearAttention(nn.Module):
         q = q.repeat_interleave(self.head_expand, dim=2)   # (N, 1, LVH, LHD)
         k = k.repeat_interleave(self.head_expand, dim=2)
         scale = lhd ** -0.5
-        q = (l2norm(q.float()) * scale).to(dt)
-        k = l2norm(k.float()).to(dt)
+        q = (l2norm_decode_compiled(q.float()) * scale).to(dt)
+        k = l2norm_decode_compiled(k.float()).to(dt)
         g = g.float().unsqueeze(1)      # (N, 1, LVH), log space
         beta = beta.float().unsqueeze(1)  # (N, 1, LVH), post-sigmoid
         v = v.to(dt)
@@ -854,7 +879,12 @@ class Qwen35LinearAttention(nn.Module):
 
         y = out.reshape(N * lvh, lhd).to(dt)
         z_flat = z.reshape(N * lvh, lhd)
-        y = self.norm(y, z_flat)
+        # forward_decode_compiled, not forward() -- @torch.compile'd variant
+        # scoped to decode's bounded shape set (see layers/layernorm.py's
+        # Qwen35RMSNormGated docstring). forward() itself stays uncompiled
+        # because prefill's sequential scan also calls it, with unbounded
+        # per-segment shapes.
+        y = self.norm.forward_decode_compiled(y, z_flat)
         y = y.reshape(N, lvh * lhd)
 
         return self.out_proj(y), new_states.float(), new_conv_states
@@ -1131,7 +1161,59 @@ class Qwen35MoE(nn.Module):
         if self.use_vectorized_moe:
             return self._forward_dispatch_vectorized(x)
         return self._forward_dispatch(x)
- 
+
+    # Compiled decode-only combine helpers, added 2026-08-28. Both
+    # _forward_gathered (ep_size==1) and _forward_gathered_ep (ep_size>1)
+    # below are called EXCLUSIVELY from forward()'s `is_decode` branch (see
+    # forward() above) -- never from prefill, unlike layers/layernorm.py's
+    # Qwen35RMSNormGated / this file's l2norm, which needed a separate
+    # decode-only variant precisely because they're ALSO called from the
+    # prefill sequential scan. No such split is needed here: these two
+    # methods have no prefill caller at all, so compiling their own combine
+    # code directly is safe by construction, not just by a shape-budget
+    # argument. Same nsys motivation as the GDR RMSNormGated/l2norm fix --
+    # MoE runs on all 40 layers (more than GDR's 30), and this combine
+    # section (~14 small elementwise/GEMM launches/layer: float casts,
+    # multiply, sum, sigmoid-gate GEMM, shared-expert SwiGLU) was entirely
+    # uncompiled, ~560 launches/step on top of GDR's ~1,380.
+    #
+    # Shape budget: runs at exactly one of the 8 fixed CUDA-graph bucket
+    # sizes in the validated production config (max_num_seqs=64 is a
+    # confirmed-permanent ceiling); bounded to at most 64 distinct shapes
+    # even under the rare --enforce-eager fallback (never prefill's
+    # effectively-unbounded token counts). GPU-UNVALIDATED -- confirm no
+    # `hit config.recompile_limit` warning after adding these on top of the
+    # GDR compiled functions sharing the same torch._dynamo budget.
+    @torch.compile
+    def _decode_combine_compiled(self, out_e: torch.Tensor, w: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        out = (out_e.float() * w.float().unsqueeze(-1)).sum(dim=1).to(x.dtype)
+        sg = torch.sigmoid(self.shared_expert_gate(x))
+        return out + sg * self.shared_expert(x)
+
+    # Split around dist.all_reduce deliberately -- compiling a function that
+    # itself issues a distributed collective is a genuinely different,
+    # less-precedented risk than the pure local-tensor-math compiles above
+    # (this exact codebase already has a documented torch._dynamo quirk
+    # history, see tests/moe_int8_quantize.py's reverted dequant compile --
+    # not the place to also be the first thing here to compile across an
+    # NCCL call). The collective itself was never going to benefit from
+    # kernel fusion anyway; only the elementwise math on either side of it
+    # can. _forward_gathered_ep calls these two directly, with a plain
+    # eager dist.all_reduce() in between.
+    @torch.compile
+    def _decode_ep_pre_allreduce_compiled(self, out_e: torch.Tensor, w: torch.Tensor,
+                                           owned_mask: torch.Tensor) -> torch.Tensor:
+        combine_dtype = torch.float32
+        mask = owned_mask.to(combine_dtype).unsqueeze(-1)
+        weighted = out_e.to(combine_dtype) * w.to(combine_dtype).unsqueeze(-1) * mask
+        return weighted.sum(dim=1)   # (N, H) fp32, pre-all_reduce
+
+    @torch.compile
+    def _decode_ep_post_allreduce_compiled(self, local_out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        local_out = local_out.to(x.dtype)
+        sg = torch.sigmoid(self.shared_expert_gate(x))
+        return local_out + sg * self.shared_expert(x)
+
     def _forward_gathered_w8a8_hopper(self, x: torch.Tensor, w: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """True W8A8 Hopper path for _forward_gathered (ep_size=1 decode).
         UNVALIDATED -- see the import-site comment above and
@@ -1258,11 +1340,12 @@ class Qwen35MoE(nn.Module):
         # accumulator, so only rounding `out_e * w` products to bf16 is at
         # stake). Strictly better, ~free, removes a standing "known issue".
         # expert FFN matmuls (out_e) stay in x.dtype -- only the combine is promoted.
-        out = (out_e.float() * w.float().unsqueeze(-1)).sum(dim=1).to(x.dtype)   # (N, H)
- 
-        sg = torch.sigmoid(self.shared_expert_gate(x))
-        out = out + sg * self.shared_expert(x)
-        return out
+        # _decode_combine_compiled (defined near forward() above) does the
+        # same math as this comment's original inline version -- combine +
+        # shared-expert-gate + shared-expert, ~14 eager launches collapsed
+        # into one compiled call. See that method's docstring for the
+        # shape-safety reasoning (this method has no prefill caller).
+        return self._decode_combine_compiled(out_e, w, x)
 
     def _forward_gathered_ep_w8a8_hopper(self, x: torch.Tensor, w: torch.Tensor,
                                           local_slots: torch.Tensor, owned_mask: torch.Tensor) -> torch.Tensor:
@@ -1440,14 +1523,14 @@ class Qwen35MoE(nn.Module):
             out_e = torch.einsum('nkhm,nkm->nkh', down, h)             # (N, TK, H)
 
         # Weighted-multiply/local-accumulate/all_reduce combine always
-        # happens in fp32 -- see docstring.
-        combine_dtype = torch.float32
-        mask = owned_mask.to(combine_dtype).unsqueeze(-1)          # (N, TK, 1)
-        weighted = out_e.to(combine_dtype) * w.to(combine_dtype).unsqueeze(-1) * mask
-        local_out = weighted.sum(dim=1)                             # (N, H), fp32
+        # happens in fp32 -- see docstring. _decode_ep_pre_allreduce_compiled
+        # / _decode_ep_post_allreduce_compiled (defined near forward() above)
+        # do the same math as this comment's original inline version, split
+        # around the plain eager dist.all_reduce() -- see those methods'
+        # docstring for why the collective itself stays uncompiled.
+        local_out = self._decode_ep_pre_allreduce_compiled(out_e, w, owned_mask)   # (N, H), fp32
 
         dist.all_reduce(local_out)
-        local_out = local_out.to(x.dtype)
 
         # Token-id round-trip check, using the exact same owned_mask this
         # rank's real computation used. A token is "touched" by this rank if
@@ -1455,6 +1538,9 @@ class Qwen35MoE(nn.Module):
         # top_k>=1 pairs, each assigned to exactly one rank, so every token
         # is touched by exactly one rank for each of its pairs -- MAX-combine
         # across ranks recovers arange(N) with no leftover -1 sentinels.
+        # Moved ahead of the post-allreduce combine below (harmless
+        # reordering -- this block only reads owned_mask, independent of
+        # local_out's dtype/value) so the compiled call isn't split by it.
         if self.debug_ep_token_roundtrip:
             touched = owned_mask.any(dim=1)                             # (N,) bool
             token_id_local = torch.where(
@@ -1465,8 +1551,7 @@ class Qwen35MoE(nn.Module):
             dist.all_reduce(token_id_local, op=dist.ReduceOp.MAX)
             self._last_ep_token_id_roundtrip = token_id_local
 
-        sg = torch.sigmoid(self.shared_expert_gate(x))
-        out = local_out + sg * self.shared_expert(x)
+        out = self._decode_ep_post_allreduce_compiled(local_out, x)
         return out
 
     def _forward_dispatch(self, x: torch.Tensor) -> torch.Tensor:

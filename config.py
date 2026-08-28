@@ -66,6 +66,28 @@ class Config:
     # until a fused kernel exists). Off by default, independent of use_moe_w8a8.
     use_lm_head_int8: bool = False
     lm_head_int8_group_size: int = 128
+    # Folds the eager lm_head GEMM (ParallelLMHead.forward(), currently run
+    # AFTER graph.replay() every decode step -- see engine/model_runner.py's
+    # run()) INSIDE the captured CUDA graph instead, alongside the backbone.
+    # 2026-08-28, CPU window (no GPU access): nsys profiling the same day
+    # found an unidentified ~2ms/step cost with high variance; this eager
+    # dispatch (plus the sampler's, addressed separately) is a real
+    # candidate -- a kernel launch outside the graph pays real CPU-dispatch
+    # overhead a captured one doesn't. Static audit: ParallelLMHead.forward()
+    # has no data-dependent branching at decode (context.is_prefill is
+    # always False during capture -- capture_cudagraph() never captures
+    # prefill; hasattr(self, "weight_int8") is a load-time module attribute,
+    # not a runtime tensor check; F.linear and dequantize_weight_int8_grouped
+    # are both shape-static, no .item()/data-dependent branch). TP>1's
+    # dist.gather branch allocates FRESH tensors every call
+    # (`[torch.empty_like(logits) for _ in range(self.tp_size)]`) -- NOT
+    # capture-safe as written, so this flag is HARD-RESTRICTED to
+    # tensor_parallel_size=1 (src/server.py raises if combined with tp>1).
+    # STILL GPU-UNVALIDATED -- same open question as every other graph-
+    # capture change in this project: does it actually capture cleanly on
+    # real hardware. Off by default; the eager call after replay() stays the
+    # ground-truth path.
+    use_lm_head_in_graph: bool = False
     # Debug-only: prints argmax vs sampled token for every prefilled seq on
     # every prefill call. Forces an extra argmax() + host-sync .tolist() in
     # the hot path even when nobody reads the output -- default off so

@@ -153,3 +153,41 @@ class Qwen35RMSNormGated(nn.Module):
         x = x * x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         x = (self.weight.to(dt) * x.to(dt)).float()
         return (x * F.silu(gate.float())).to(dt)
+
+    # DECODE-ONLY compiled variant, added 2026-08-28 -- forward() above stays
+    # UNCOMPILED because the same nn.Module instance is also called from the
+    # sequential per-segment PREFILL scan (models/qwen3_5.py's
+    # Qwen35LinearAttention, seg_y = self.norm(seg_y, seg_z_flat)) with
+    # arbitrary, continuously-varying per-segment token counts -- compiling
+    # the shared method would expose it to effectively unbounded distinct
+    # shapes there, defeating the whole point of a bounded shape budget (see
+    # below) and likely exhausting torch._dynamo's cache_size_limit on real
+    # traffic. This method is called ONLY from
+    # _forward_decode_batched/_forward_decode_fused_gdr
+    # (models/qwen3_5.py), which run exclusively inside the captured
+    # CUDA-graph region at exactly one of the graph's fixed bucket sizes
+    # (never an arbitrary live batch count -- padding rows fill the rest).
+    # max_num_seqs=64 is a confirmed-fixed ceiling (this project will never
+    # scale concurrency higher), so the bucket list
+    # [1,2,4,8,16,32,48,64] is fixed at exactly 8 distinct shapes forever --
+    # this adds at most 8 compiled variants to torch._dynamo's shared
+    # budget, not an open-ended amount.
+    #
+    # That budget itself was the site of a real, measured regression once
+    # before: tests/moe_int8_quantize.py's dequantize_weight_int8_grouped
+    # had @torch.compile tried 2026-08-21 and reverted same day (37.1 ->
+    # 33.0 tok/s), suspected cause being torch._dynamo's then-default
+    # cache_size_limit=8 exhausted by that function's own per-bucket shape
+    # variation competing with RMSNorm/Qwen35RMSNorm's compiled methods for
+    # the same limit. SMELL-11 (2026-08-27/28) later bumped it 8->64.
+    # GPU-UNVALIDATED -- confirm the `[DYNAMO] recompile_limit=...`
+    # diagnostic still shows no "hit config.recompile_limit" warning after
+    # adding this (and the decode-only l2norm variant, models/qwen3_5.py)
+    # on top of the existing compiled functions sharing this budget.
+    @torch.compile
+    def forward_decode_compiled(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward(x, gate)

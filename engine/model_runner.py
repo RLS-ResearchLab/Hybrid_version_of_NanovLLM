@@ -541,10 +541,12 @@ class ModelRunner:
                 # unidentified ~2ms/step elementwise op (SESSION_HANDOFF_
                 # 2026-08-28.md) lives in the eager lm_head GEMM or the
                 # eager sampler call below -- both run OUTSIDE the captured
-                # graph today (capture_cudagraph()'s _step() only covers
-                # self.model.model(...), the 40-layer backbone), so both are
-                # real candidates for host-dispatch-induced GPU idle bubbles
-                # that a graph replay's kernels don't suffer from.
+                # graph BY DEFAULT (capture_cudagraph()'s _step() only
+                # covers self.model.model(...), the 40-layer backbone,
+                # unless config.use_lm_head_in_graph folds lm_head in too --
+                # see that flag's docstring), so both are real candidates
+                # for host-dispatch-induced GPU idle bubbles that a graph
+                # replay's kernels don't suffer from.
                 # try/finally: an unmatched range_pop (e.g. graph.replay()
                 # raising on an illegal memory access, or compute_logits
                 # OOMing on the eager vocab-wide GEMM) would otherwise
@@ -563,11 +565,18 @@ class ModelRunner:
                 # State write-back happens INSIDE the captured graph now
                 # (see capture_cudagraph()'s _step()) -- no eager
                 # index_copy_ needed here anymore.
-                torch.cuda.nvtx.range_push("decode_lm_head_eager")
-                try:
-                    logits = self.model.compute_logits(hidden)
-                finally:
-                    torch.cuda.nvtx.range_pop()
+                if getattr(self.config, "use_lm_head_in_graph", False):
+                    # lm_head already ran INSIDE the graph (capture_cudagraph()'s
+                    # _step()) -- just read the static output buffer, no eager
+                    # dispatch, no nvtx range needed here (there's nothing this
+                    # thread does between replay() finishing and the read below).
+                    logits = gv["logits"][:bs]
+                else:
+                    torch.cuda.nvtx.range_push("decode_lm_head_eager")
+                    try:
+                        logits = self.model.compute_logits(hidden)
+                    finally:
+                        torch.cuda.nvtx.range_pop()
             else:
                 num_layers = len(self.model.model.layers)
                 linear_idx = self.model.model.linear_layer_indices
@@ -776,7 +785,7 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
- 
+
         graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
@@ -785,7 +794,14 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
- 
+
+        # config.use_lm_head_in_graph: only meaningful/safe for the hybrid
+        # model's graph-captured decode path (below) -- defined here so
+        # _step() can close over it regardless of which branch this method
+        # takes, but the buffer itself is only allocated inside the
+        # _is_hybrid_model block, since that's the only place it's read.
+        lm_head_in_graph = getattr(config, "use_lm_head_in_graph", False)
+
         if self._is_hybrid_model:
             # Decode: every sequence contributes exactly 1 token, so
             # cu_seqlens is always arange(0, bs+1) — same construction
@@ -799,7 +815,23 @@ class ModelRunner:
             state_slot_ids = torch.full((max_bs,), self.state_manager.scratch_slot_id, dtype=torch.int64)
             graph_vars["cu_seqlens_q"] = cu_seqlens_q
             graph_vars["state_slot_ids"] = state_slot_ids
- 
+
+            # config.use_lm_head_in_graph -- fold the lm_head GEMM into the
+            # captured graph instead of running it eagerly after replay()
+            # (see run()'s graph branch below and config.py's docstring for
+            # the full reasoning + the CUDA-graph-safety audit). Restricted
+            # to world_size==1 -- ParallelLMHead's tp>1 dist.gather branch
+            # allocates fresh tensors every call, not capture-safe;
+            # src/server.py already refuses this combination at parse time,
+            # this assert is defense in depth against any other caller of
+            # ModelRunner directly.
+            if lm_head_in_graph:
+                assert self.world_size == 1, (
+                    "use_lm_head_in_graph requires world_size==1 -- ParallelLMHead's tp>1 "
+                    "dist.gather branch is not CUDA-graph-capture-safe as written."
+                )
+                graph_vars["logits"] = torch.zeros(max_bs, hf_config.vocab_size)
+
             num_layers = len(self.model.model.layers)
             linear_idx = self.model.model.linear_layer_indices
             sm = self.state_manager
@@ -837,6 +869,13 @@ class ModelRunner:
                         input_ids[:bs], positions[:bs], cu_seqlens_bs, states, conv_states
                     )
                     outputs[:bs] = hidden
+                    if lm_head_in_graph:
+                        # context.is_prefill is False here (set_context(False, ...)
+                        # above), so ParallelLMHead.forward() takes the decode
+                        # branch unconditionally -- no data-dependent shape, safe
+                        # to capture. See config.py's use_lm_head_in_graph
+                        # docstring for the full safety audit.
+                        graph_vars["logits"][:bs] = self.model.compute_logits(hidden)
                     for compact_idx, full_idx in enumerate(linear_idx):
                         # Write the new recurrent/conv state directly back
                         # into StateManager's real buffers, INSIDE the
