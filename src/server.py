@@ -655,8 +655,10 @@ def main():
                              "the graph pays real CPU-dispatch overhead a captured one doesn't. "
                              "Static CUDA-graph-safety audit done (see config.py's docstring); NOT "
                              "yet run on GPU -- first use must confirm it actually captures cleanly. "
-                             "HARD-RESTRICTED to --tensor-parallel-size 1 -- the tp>1 dist.gather "
-                             "path allocates fresh tensors every call, which is not capture-safe.")
+                             "tp>1 SUPPORTED (2026-08-28) via a separate static-buffer gather in "
+                             "engine/model_runner.py -- ParallelLMHead.forward()'s own tp>1 combine "
+                             "(dist.gather + torch.cat, fresh tensors every call) stays eager-only "
+                             "and untouched; this flag bypasses it with a pre-allocated equivalent.")
     parser.add_argument("--moe-w8a8-hopper", dest="use_moe_w8a8_hopper", action="store_true", default=False,
                         help="True W8A8 Hopper MoE path (moe_w8a8.cu, 2D-blocked FP8) -- separate "
                              "scheme from --moe-w8a8 (1D-grouped INT8), mutually exclusive with it "
@@ -711,12 +713,9 @@ def main():
         parser.error("--moe-w8a8 and --moe-w8a8-hopper are mutually exclusive (model_runner "
                      "runs the INT8 pass first; the Hopper FP8 pass then raises 'weights already "
                      "gone'). Pick one.")
-    if args.use_lm_head_in_graph and args.tensor_parallel_size > 1:
-        parser.error("--lm-head-in-graph requires --tensor-parallel-size 1 -- ParallelLMHead's "
-                     "tp>1 dist.gather branch allocates fresh tensors every call "
-                     "([torch.empty_like(logits) for _ in range(self.tp_size)]), which is not "
-                     "CUDA-graph-capture-safe as written. Either drop --lm-head-in-graph or run "
-                     "at tp=1.")
+    # tp>1 restriction lifted 2026-08-28 -- engine/model_runner.py's
+    # capture_cudagraph() now builds its own static-buffer gather/combine
+    # instead of routing through ParallelLMHead.forward()'s eager-only one.
     if args.use_moe_w8a8_hopper and os.environ.get("NANOVLLM_USE_MOE_W8A8_HOPPER") != "1":
         print("[WARNING] --moe-w8a8-hopper set but NANOVLLM_USE_MOE_W8A8_HOPPER != 1 -- weights "
               "will be quantized to FP8 at load but the decode forward will NOT call the Hopper "

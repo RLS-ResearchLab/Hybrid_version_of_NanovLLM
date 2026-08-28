@@ -78,15 +78,33 @@ class Config:
     # always False during capture -- capture_cudagraph() never captures
     # prefill; hasattr(self, "weight_int8") is a load-time module attribute,
     # not a runtime tensor check; F.linear and dequantize_weight_int8_grouped
-    # are both shape-static, no .item()/data-dependent branch). TP>1's
-    # dist.gather branch allocates FRESH tensors every call
-    # (`[torch.empty_like(logits) for _ in range(self.tp_size)]`) -- NOT
-    # capture-safe as written, so this flag is HARD-RESTRICTED to
-    # tensor_parallel_size=1 (src/server.py raises if combined with tp>1).
+    # are both shape-static, no .item()/data-dependent branch).
+    #
+    # tp>1 SUPPORTED (2026-08-28): ParallelLMHead.forward()'s own tp>1
+    # combine allocates FRESH tensors every call
+    # (`[torch.empty_like(logits) for _ in range(self.tp_size)]` then
+    # `torch.cat(...)`) -- not capture-safe, and left completely UNCHANGED
+    # (still the eager-only path for any caller that isn't this one).
+    # Instead, capture_cudagraph() calls ParallelLMHead._local_logits() (the
+    # pre-gather per-rank computation, extracted into its own method the
+    # same day specifically for this reuse) and does its OWN combine against
+    # static buffers allocated once at capture-setup time: a
+    # (max_bs, shard_width) buffer per rank for dist.gather's destination
+    # (only meaningful on rank 0, mirroring ParallelLMHead.forward()'s own
+    # `if self.tp_rank == 0 else None` convention), and one
+    # (max_bs, vocab_size) buffer for torch.cat's `out=` parameter --
+    # dist.gather writes into the persistent gather buffers, torch.cat
+    # writes into the persistent combined buffer, neither allocates fresh
+    # memory on replay.
+    #
     # STILL GPU-UNVALIDATED -- same open question as every other graph-
     # capture change in this project: does it actually capture cleanly on
-    # real hardware. Off by default; the eager call after replay() stays the
-    # ground-truth path.
+    # real hardware, now for BOTH the tp=1 and tp>1 code paths (the tp>1
+    # path additionally exercises dist.gather + torch.cat(out=...) inside a
+    # captured region, which has no precedent in this codebase to lean on --
+    # unlike dist.all_reduce, which is already proven capturable at tp=2,
+    # see project history). Off by default; the eager call after replay()
+    # stays the ground-truth path.
     use_lm_head_in_graph: bool = False
     # Debug-only: prints argmax vs sampled token for every prefilled seq on
     # every prefill call. Forces an extra argmax() + host-sync .tolist() in

@@ -66,7 +66,18 @@ class ParallelLMHead(VocabParallelEmbedding):
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
 
-    def forward(self, x: torch.Tensor):
+    def _local_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Pre-gather computation: this rank's own vocab-shard logits only
+        (full vocab at tp_size==1, since num_embeddings_per_partition ==
+        num_embeddings there). Extracted 2026-08-28 so a CUDA-graph-safe
+        caller (engine/model_runner.py's capture_cudagraph(), when
+        config.use_lm_head_in_graph is set) can reuse this exact computation
+        while supplying its OWN static-buffer combine instead of forward()'s
+        below (which allocates fresh tensors every call via torch.empty_like/
+        torch.cat -- fine in eager code, not CUDA-graph-capture-safe).
+        forward() itself is UNCHANGED behaviorally by this refactor -- same
+        ops, same order, just calling through this method instead of
+        inlining them."""
         context = get_context()
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
@@ -84,7 +95,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             )
         else:
             weight = self.weight
-        logits = F.linear(x, weight)
+        return F.linear(x, weight)
+
+    def forward(self, x: torch.Tensor):
+        logits = self._local_logits(x)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)

@@ -591,7 +591,12 @@ class ModelRunner:
                     # _step()) -- just read the static output buffer, no eager
                     # dispatch, no nvtx range needed here (there's nothing this
                     # thread does between replay() finishing and the read below).
-                    logits = gv["logits"][:bs]
+                    # At world_size>1, "logits" only exists in gv on rank 0
+                    # (capture_cudagraph() only allocates it there, mirroring
+                    # ParallelLMHead.forward()'s own tp_rank==0-only combine) --
+                    # None on other ranks, matching that same convention; the
+                    # sampler call below already only runs `if self.rank == 0`.
+                    logits = gv["logits"][:bs] if self.rank == 0 else None
                 else:
                     torch.cuda.nvtx.range_push("decode_lm_head_eager")
                     try:
@@ -840,18 +845,45 @@ class ModelRunner:
             # config.use_lm_head_in_graph -- fold the lm_head GEMM into the
             # captured graph instead of running it eagerly after replay()
             # (see run()'s graph branch below and config.py's docstring for
-            # the full reasoning + the CUDA-graph-safety audit). Restricted
-            # to world_size==1 -- ParallelLMHead's tp>1 dist.gather branch
-            # allocates fresh tensors every call, not capture-safe;
-            # src/server.py already refuses this combination at parse time,
-            # this assert is defense in depth against any other caller of
-            # ModelRunner directly.
+            # the full reasoning + the CUDA-graph-safety audit).
+            #
+            # tp>1 SUPPORT added 2026-08-28: ParallelLMHead.forward()'s
+            # tp>1 combine (layers/embed_head.py) allocates fresh tensors
+            # every call (`[torch.empty_like(logits) for _ in
+            # range(self.tp_size)]` then `torch.cat(...)`), which is not
+            # CUDA-graph-capture-safe -- that method itself is UNCHANGED and
+            # stays the eager-only path. Here we instead call
+            # ParallelLMHead._local_logits() (the pre-gather local-shard
+            # computation, extracted from forward() the same day
+            # specifically for this reuse) and do our OWN combine against
+            # static, pre-allocated buffers:
+            #   - gather_dest: world_size separate (max_bs, shard_width)
+            #     buffers, allocated ONCE here, only meaningful on rank 0
+            #     (mirrors ParallelLMHead.forward()'s own
+            #     `if self.tp_rank == 0 else None` convention -- dist.gather's
+            #     gather_list argument must be None on non-dst ranks).
+            #   - graph_vars["logits"]: one (max_bs, vocab_size) buffer,
+            #     rank 0 only (matches run()'s `self.sampler(...) if
+            #     self.rank == 0` -- other ranks never sample).
+            # dist.gather itself writes INTO the persistent gather_dest
+            # tensors (no allocation), and torch.cat's `out=` parameter
+            # writes the concat result directly into the persistent logits
+            # buffer instead of allocating a new one -- both steps reuse
+            # fixed memory across every replay, same discipline as every
+            # other captured-graph buffer in this method.
             if lm_head_in_graph:
-                assert self.world_size == 1, (
-                    "use_lm_head_in_graph requires world_size==1 -- ParallelLMHead's tp>1 "
-                    "dist.gather branch is not CUDA-graph-capture-safe as written."
-                )
-                graph_vars["logits"] = torch.zeros(max_bs, hf_config.vocab_size)
+                lm_head_mod = self.model.lm_head
+                if self.world_size > 1:
+                    shard_width = hf_config.vocab_size // self.world_size
+                    gather_dest = (
+                        [torch.zeros(max_bs, shard_width) for _ in range(self.world_size)]
+                        if self.rank == 0 else None
+                    )
+                    if self.rank == 0:
+                        graph_vars["logits"] = torch.zeros(max_bs, hf_config.vocab_size)
+                else:
+                    gather_dest = None
+                    graph_vars["logits"] = torch.zeros(max_bs, hf_config.vocab_size)
 
             num_layers = len(self.model.model.layers)
             linear_idx = self.model.model.linear_layer_indices
@@ -892,11 +924,19 @@ class ModelRunner:
                     outputs[:bs] = hidden
                     if lm_head_in_graph:
                         # context.is_prefill is False here (set_context(False, ...)
-                        # above), so ParallelLMHead.forward() takes the decode
-                        # branch unconditionally -- no data-dependent shape, safe
-                        # to capture. See config.py's use_lm_head_in_graph
-                        # docstring for the full safety audit.
-                        graph_vars["logits"][:bs] = self.model.compute_logits(hidden)
+                        # above), so _local_logits() takes its decode branch
+                        # unconditionally -- no data-dependent shape, safe to
+                        # capture. See config.py's use_lm_head_in_graph
+                        # docstring and this method's own comment above for
+                        # the full safety audit (tp=1 vs tp>1).
+                        logits_local = lm_head_mod._local_logits(hidden)
+                        if self.world_size > 1:
+                            gather_dest_bs = [t[:bs] for t in gather_dest] if self.rank == 0 else None
+                            dist.gather(logits_local, gather_dest_bs, 0)
+                            if self.rank == 0:
+                                torch.cat(gather_dest_bs, dim=-1, out=graph_vars["logits"][:bs])
+                        else:
+                            graph_vars["logits"][:bs] = logits_local
                     for compact_idx, full_idx in enumerate(linear_idx):
                         # Write the new recurrent/conv state directly back
                         # into StateManager's real buffers, INSIDE the

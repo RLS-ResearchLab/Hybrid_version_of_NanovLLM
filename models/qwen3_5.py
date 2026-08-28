@@ -1212,6 +1212,23 @@ class Qwen35MoE(nn.Module):
         sg = torch.sigmoid(self.shared_expert_gate(x))
         return out + sg * self.shared_expert(x)
 
+    # Shared decode-only routing helper, added 2026-08-28 -- identical
+    # `w, idx = torch.topk(self.gate(x), TK, dim=-1); w = softmax(w).to(dtype)`
+    # duplicated in both _forward_gathered and _forward_gathered_ep (~4
+    # launches: gate GEMM, topk, softmax, cast). Same no-prefill-exposure
+    # safety case as _decode_combine_compiled above -- both callers are
+    # is_decode-gated only. `idx`'s VALUES are data-dependent (which experts
+    # get selected varies by input), but its SHAPE is always static (N, TK)
+    # given N and self.top_k -- dynamo only needs the shape fixed, not the
+    # values, so this is safe to compile the same way advanced-indexing
+    # gathers elsewhere in this codebase already are (see
+    # engine/state_manager.py's index_select precedent).
+    @torch.compile
+    def _decode_route_compiled(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        w, idx = torch.topk(self.gate(x), self.top_k, dim=-1)
+        w = F.softmax(w, dim=-1).to(x.dtype)
+        return w, idx
+
     # Split around dist.all_reduce deliberately -- compiling a function that
     # itself issues a distributed collective is a genuinely different,
     # less-precedented risk than the pure local-tensor-math compiles above
@@ -1280,8 +1297,7 @@ class Qwen35MoE(nn.Module):
         H, TK = self.hidden_size, self.top_k
         N = x.shape[0]
 
-        w, idx = torch.topk(self.gate(x), TK, dim=-1)          # (N, TK)
-        w = F.softmax(w, dim=-1).to(x.dtype)
+        w, idx = self._decode_route_compiled(x)                # (N, TK) each
 
         if _USE_MOE_W8A8_HOPPER and hasattr(self.experts, "gate_up_proj_fp8"):
             # Early return, deliberately not interleaved into the int8/bf16
@@ -1472,8 +1488,7 @@ class Qwen35MoE(nn.Module):
         TK, P = self.top_k, self.ep_size
         N = x.shape[0]
 
-        w, idx = torch.topk(self.gate(x), TK, dim=-1)            # (N, TK) global expert ids
-        w = F.softmax(w, dim=-1).to(x.dtype)
+        w, idx = self._decode_route_compiled(x)                   # (N, TK) each, global expert ids
 
         local_slots = idx // P                                    # (N, TK) -- always in-bounds, see docstring
         owned_mask = (idx % P) == self.ep_rank                    # (N, TK) bool
