@@ -168,7 +168,7 @@ def build_runner(model_dir, fake_config_loader, max_num_seqs, max_model_len,
         # no-op and weights are set explicitly afterward (below). Do NOT
         # stub this when pointed at a real checkpoint (--model + explicit
         # --no-fake-config-loader) -- that path needs real weight loading.
-        loader_mod.load_model = lambda model, path: None
+        loader_mod.load_model = lambda model, path, **kw: None
 
     if tensor_parallel_size == 1:
         from nanovllm.config import Config

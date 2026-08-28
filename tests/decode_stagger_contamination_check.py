@@ -112,7 +112,7 @@ import nanovllm.layers.sampler as sampler_mod
 sampler_mod.Sampler.forward = lambda self, logits, temperatures: logits.float().argmax(dim=-1)
 
 import nanovllm.utils.loader as loader_mod
-loader_mod.load_model = lambda model, path: None
+loader_mod.load_model = lambda model, path, **kw: None
 
 import nanovllm.config as config_mod
 

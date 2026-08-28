@@ -35,7 +35,7 @@ if _WS_NAME != "nanovllm":
     sys.modules["nanovllm"] = nanovllm_pkg
 
 import nanovllm.utils.loader as loader_mod
-loader_mod.load_model = lambda model, path: None
+loader_mod.load_model = lambda model, path, **kw: None
 
 import nanovllm.config as config_mod
 sys.path.insert(0, os.path.dirname(__file__))

@@ -82,7 +82,31 @@ class ModelRunner:
         # other @torch.compile call sites in this codebase need) rather than
         # tuned to the exact minimum -- cheap safety margin, no downside
         # besides a marginally larger compile cache.
-        torch._dynamo.config.recompile_limit = 64
+        #
+        # 2026-08-28 (GPU window #2): on torch 2.13+cu130 the single
+        # `recompile_limit = 64` assignment was a NO-OP -- every server log
+        # still showed "torch._dynamo hit config.recompile_limit (8)". torch
+        # 2.13 also carries a separate `cache_size_limit` (the pre-2.5 name,
+        # now de-aliased), and the warning path checks a limit that plain
+        # assignment to one of the two names does not raise. Belt-and-
+        # suspenders: set both names + the accumulated cap, all guarded so a
+        # future rename can't crash __init__. The [DYNAMO] print is a
+        # deliberate startup breadcrumb -- grep it against the recompile
+        # warning to confirm the limit actually took on whatever torch ships.
+        for _n in ("recompile_limit", "cache_size_limit"):
+            try:
+                setattr(torch._dynamo.config, _n, 64)
+            except Exception:
+                pass
+        try:
+            torch._dynamo.config.accumulated_recompile_limit = max(
+                512, getattr(torch._dynamo.config, "accumulated_recompile_limit", 512))
+        except Exception:
+            pass
+        print("[DYNAMO] recompile_limit=%s cache_size_limit=%s accumulated=%s" % (
+            getattr(torch._dynamo.config, "recompile_limit", "?"),
+            getattr(torch._dynamo.config, "cache_size_limit", "?"),
+            getattr(torch._dynamo.config, "accumulated_recompile_limit", "?")), flush=True)
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
