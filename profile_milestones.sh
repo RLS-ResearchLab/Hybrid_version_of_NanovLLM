@@ -51,7 +51,32 @@ cd "$REPO_DIR" || { echo "FATAL: $REPO_DIR not found -- run setup.sh first" >&2;
 # with "is a missing but already registered worktree", and that failure
 # would otherwise cost a full manual `git worktree prune` + re-run cycle in
 # the middle of a session where that turnaround is expensive.
-git worktree prune -v
+#
+# Scoped to $WORKTREE_ROOT specifically -- NOT a blanket `git worktree
+# prune`, which operates on the whole repo's worktree registry. A bare
+# prune here would also silently drop tracking for any unrelated worktree
+# elsewhere in this same repo (e.g. a developer's own manually-created one,
+# possibly pointing at since-unmounted storage), which has nothing to do
+# with this script's own $WORKTREE_ROOT/<label> worktrees.
+prune_stale_worktrees_under() {
+    local root="$1" path=""
+    while IFS= read -r line; do
+        case "$line" in
+            worktree\ *) path="${line#worktree }" ;;
+            prunable\ *)
+                case "$path" in
+                    "$root"/*)
+                        echo "[prune] removing stale worktree registration under $root: $path ($line)"
+                        git worktree remove --force "$path" 2>/dev/null \
+                            || { rm -rf "$path"; git worktree remove --force "$path" 2>/dev/null || true; }
+                        ;;
+                esac
+                ;;
+            "") path="" ;;
+        esac
+    done < <(git worktree list --porcelain)
+}
+prune_stale_worktrees_under "$WORKTREE_ROOT"
 
 if ! command -v nsys >/dev/null 2>&1; then
     echo "FATAL: nsys (Nsight Systems CLI) not found on PATH." >&2
@@ -124,13 +149,20 @@ stop_server() {
     if kill -0 "$pid" 2>/dev/null; then
         # SIGINT, not SIGTERM: nsys's own documented graceful-stop path is
         # Ctrl-C (SIGINT) -- that's what makes it stop the target AND
-        # finalize the .nsys-rep. SIGTERM's behavior against the nsys
-        # wrapper process itself isn't documented the same way, and this is
-        # exactly the spot where guessing wrong is expensive: losing the
-        # trace after the full multi-minute bench has already run, not just
-        # a quick retry. 120s budget before escalating -- finalizing a trace
-        # with thousands of captured kernels can take real, non-trivial time.
-        kill -INT "$pid" 2>/dev/null
+        # finalize the .nsys-rep. A real terminal Ctrl-C delivers SIGINT to
+        # the whole foreground PROCESS GROUP, not just one PID -- signaling
+        # only nsys's own PID risks missing that behavior if nsys relies on
+        # the group-wide delivery (e.g. reaching python src/server.py
+        # directly) rather than forwarding the stop itself. run_one launches
+        # this job under `set -m` specifically so $pid is a process-group
+        # leader, so `-$pid` here reaches the whole group the same way a
+        # real Ctrl-C would. SIGTERM's behavior against the nsys wrapper
+        # process itself isn't documented the same way, and this is exactly
+        # the spot where guessing wrong is expensive: losing the trace after
+        # the full multi-minute bench has already run, not just a quick
+        # retry. 120s budget before escalating -- finalizing a trace with
+        # thousands of captured kernels can take real, non-trivial time.
+        kill -INT -- "-$pid" 2>/dev/null || kill -INT "$pid" 2>/dev/null
         local waited=0
         while [ "$waited" -lt 120 ]; do
             kill -0 "$pid" 2>/dev/null || break
@@ -139,21 +171,32 @@ stop_server() {
         done
         if kill -0 "$pid" 2>/dev/null; then
             echo "  [WARN] nsys/server still alive ${waited}s after SIGINT -- escalating to SIGTERM then SIGKILL (trace may be incomplete/corrupt if it comes to this)"
-            kill -TERM "$pid" 2>/dev/null
+            kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
             sleep 10
-            kill -9 "$pid" 2>/dev/null || true
+            kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
         fi
     fi
     pkill -9 -f "src/server.py" 2>/dev/null || true
     sleep 3   # port 2333 (NCCL init) release -- documented gotcha, EADDRINUSE otherwise
 
     # Verify the port is ACTUALLY free before returning -- if something is
-    # still bound to it, the NEXT run's wait_for_health would burn its full
-    # timeout guessing why a brand-new server never comes up, instead of
-    # surfacing the real cause immediately.
-    if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
-        echo "  [WARN] port ${PORT} still answering after stop_server -- something didn't die. Check 'ps aux | grep server.py' before the next run."
-    fi
+    # still bound to it (e.g. wedged in an uninterruptible GPU-driver
+    # teardown state that even SIGKILL can't clear), the NEXT run's
+    # wait_for_health would happily succeed against THIS run's stale server
+    # instead of the new one, and bench_http_concurrency.py would silently
+    # measure the wrong commit -- a corrupted number in summary.md with no
+    # FAILED anywhere near the point of corruption. Retry for a bit (teardown
+    # can take a few more seconds even once unstuck), then treat this as
+    # fatal to the whole sweep rather than a soft warning: nothing downstream
+    # can tell a healthy new server apart from this stale one.
+    local free_wait=0
+    while [ "$free_wait" -lt 30 ]; do
+        curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1 || return 0
+        sleep 5
+        free_wait=$((free_wait + 5))
+    done
+    echo "  [FATAL] port ${PORT} still answering ${free_wait}s after stop_server exhausted SIGINT/SIGTERM/SIGKILL/pkill -- something is wedged and cannot be killed from userspace (check 'ps aux | grep server.py', 'nvidia-smi'). Refusing to start the next run: it would silently benchmark this stale server instead of the new one." >&2
+    return 1
 }
 
 run_one() {
@@ -173,12 +216,17 @@ run_one() {
             # execution (not just a previous invocation -- the startup
             # prune only catches staleness from before the script started)
             # can leave a stale registration if `git worktree remove`
-            # failed silently for the same label. Retry once after pruning
-            # before giving up, rather than losing the whole run to
-            # something a single extra command fixes.
-            echo "[$label] git worktree add failed, retrying once after 'git worktree prune'..."
-            git worktree prune -v
-            git worktree add "$wt_dir" "$sha" || { echo "[$label] FAILED: git worktree add (after prune retry)"; return 1; }
+            # failed silently for the same label. Retry once before giving
+            # up, rather than losing the whole run to something a single
+            # extra command fixes. Scoped to exactly $wt_dir (not a blanket
+            # `git worktree prune`, which would also touch any unrelated
+            # worktree registration elsewhere in this repo) -- we already
+            # know the specific stale path here, so there's no need for the
+            # broader tool.
+            echo "[$label] git worktree add failed, retrying once after removing any stale registration for $wt_dir..."
+            git worktree remove --force "$wt_dir" 2>/dev/null
+            rm -rf "$wt_dir"
+            git worktree add "$wt_dir" "$sha" || { echo "[$label] FAILED: git worktree add (after cleanup retry)"; return 1; }
         fi
     else
         # Reusing a directory left over from an earlier interrupted run (e.g.
@@ -220,6 +268,14 @@ run_one() {
         # nsys itself once the bench finishes (see stop_server), and WANTS
         # nsys's default behavior of propagating that to the server so it
         # exits and nsys can finalize the .nsys-rep cleanly.
+        # `set -m` (job control / monitor mode): a non-interactive script has
+        # this off by default, which means a backgrounded job stays in the
+        # SAME process group as the script itself instead of getting its own
+        # -- exactly what stop_server's group-wide `kill -INT -- -$pid` needs
+        # to actually mean something (see stop_server's comment). Scoped to
+        # this subshell only so it doesn't change job-control behavior
+        # anywhere else in the script.
+        set -m
         # `env` is NOT decorative here -- confirmed by testing directly: bash
         # only recognizes a leading `NAME=value` TOKEN as an env-assignment
         # prefix; a variable EXPANSION in that position (`$extra_env ...`,
@@ -230,7 +286,21 @@ run_one() {
         # name whenever $extra_env is empty, i.e. for 5 of these 7 runs.
         # `env` sidesteps this: it's a real command that takes NAME=value
         # pairs as plain arguments, so $extra_env can safely be empty or not.
-        env $extra_env CUDA_VISIBLE_DEVICES="$gpu_ids" PYTHONUNBUFFERED=1 \
+        # Split into an array (not a bare `$extra_env` expansion) before
+        # passing it to `env`: a bare unquoted expansion is subject to
+        # pathname (glob) expansion too, not just word-splitting -- a future
+        # RUNS entry whose value happened to contain `*` or `?` would
+        # silently glob-expand against $wt_dir's contents instead of being
+        # passed through as a literal env value. `"${extra_env_arr[@]}"` still
+        # relies on whitespace to separate multiple NAME=value pairs (same
+        # as every other field in the pipe-delimited RUNS table), so a value
+        # that itself needs an embedded space still isn't supported -- but
+        # the silent-glob failure mode is closed.
+        local -a extra_env_arr=()
+        if [ -n "$extra_env" ]; then
+            read -ra extra_env_arr <<< "$extra_env"
+        fi
+        env "${extra_env_arr[@]}" CUDA_VISIBLE_DEVICES="$gpu_ids" PYTHONUNBUFFERED=1 \
         nsys profile -o "$rep_base" --force-overwrite=true --cuda-graph-trace=node \
             python src/server.py \
                 --model qwen35_checkpoint \
@@ -254,14 +324,14 @@ run_one() {
     if ! wait_for_health "$PORT" "$HEALTH_TIMEOUT_S"; then
         echo "[$label] FAILED: /health never came up within ${HEALTH_TIMEOUT_S}s -- tail of $srv_log:"
         tail -40 "$srv_log"
-        stop_server "$srv_pid"
+        stop_server "$srv_pid" || { echo "[$label] ABORTING entire sweep: port ${PORT} could not be freed, see FATAL above." >&2; exit 1; }
         return 1
     fi
 
     if ! smoke_test "$PORT"; then
         echo "[$label] FAILED: smoke chat-completion request failed -- tail of $srv_log:"
         tail -40 "$srv_log"
-        stop_server "$srv_pid"
+        stop_server "$srv_pid" || { echo "[$label] ABORTING entire sweep: port ${PORT} could not be freed, see FATAL above." >&2; exit 1; }
         return 1
     fi
     echo "[$label] server up, smoke test passed -- running bench + nsys capture"
@@ -282,7 +352,7 @@ run_one() {
         echo "[$label] WARNING: bench_http_concurrency.py exited $bench_rc -- see $out_dir/bench.log (trace may still be usable up to the failure point)"
     fi
 
-    stop_server "$srv_pid"
+    stop_server "$srv_pid" || { echo "[$label] ABORTING entire sweep: port ${PORT} could not be freed, see FATAL above." >&2; exit 1; }
 
     if [ -f "${rep_base}.nsys-rep" ]; then
         # .nsys-rep files are large and don't reliably survive being copied off
