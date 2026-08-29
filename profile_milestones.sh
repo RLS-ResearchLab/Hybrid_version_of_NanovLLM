@@ -28,13 +28,30 @@ CKPT_DIR="$REPO_DIR/qwen35_checkpoint"
 WORKTREE_ROOT="$HOME/qLLM_profile_worktrees"
 OUT_ROOT="$HOME/qLLM_profile_traces/$(date +%Y-%m-%d)"
 PORT=8000
-HEALTH_TIMEOUT_S=600      # real-checkpoint load + CUDA-graph capture is minutes, not seconds
+# 30 min, not 10: SESSION_HANDOFF_2026-08-28.md documents multi-bucket graph
+# capture already taking "minutes for 10-12 buckets" on the FIXED decode
+# path. db148fb/eec3fe0 (2 of these 7 runs) still have the UNFIXED O(batch)
+# per-segment GDR loop that the rest of this project's history exists to
+# fix -- the CPU window measured that loop unrolling into ~30,000 near-empty
+# kernel launches per decode step at concurrency 64 once captured. A
+# too-short timeout here would kill a server that's still legitimately
+# capturing and report a false FAILED, wasting the boot for nothing.
+HEALTH_TIMEOUT_S=1800
 BENCH_LEVELS=64           # production never scales past concurrency 64 on this project -- see memory
 KEEP_WORKTREES="${KEEP_WORKTREES:-0}"
 RUNS_FILTER="${RUNS_FILTER:-}"
 
 mkdir -p "$WORKTREE_ROOT" "$OUT_ROOT"
 cd "$REPO_DIR" || { echo "FATAL: $REPO_DIR not found -- run setup.sh first" >&2; exit 1; }
+
+# Clears any worktree registrations left dangling by an earlier interrupted
+# run (e.g. this script got killed mid-run, or a worktree directory was
+# removed by hand without `git worktree remove`) -- confirmed by testing:
+# without this, `git worktree add` on a path git still half-remembers fails
+# with "is a missing but already registered worktree", and that failure
+# would otherwise cost a full manual `git worktree prune` + re-run cycle in
+# the middle of a session where that turnaround is expensive.
+git worktree prune -v
 
 if ! command -v nsys >/dev/null 2>&1; then
     echo "FATAL: nsys (Nsight Systems CLI) not found on PATH." >&2
@@ -47,20 +64,35 @@ if [ ! -d "$CKPT_DIR" ]; then
     exit 1
 fi
 source "$REPO_DIR/cuda_env.sh" 2>/dev/null || true   # CUDA_HOME/PATH/LD_LIBRARY_PATH, if the box has it (see project_qllm_box_setup_flash_attn_cuda13 memory)
+if [ ! -f "$REPO_DIR/.venv/bin/activate" ]; then
+    echo "FATAL: $REPO_DIR/.venv/bin/activate not found -- run setup.sh first." >&2
+    exit 1
+fi
 source "$REPO_DIR/.venv/bin/activate"
 
-# ── run table: sha|label|tp|gpu_ids|gmu|extra_server_flags ────────────────
+# ── run table: sha|label|tp|gpu_ids|gmu|extra_env|extra_server_flags ──────
 # One shared venv, one shared checkpoint (symlinked into each worktree, NOT
 # copied -- 5 commits x 67GB would blow most rental boxes' root disk, exactly
 # the failure mode setup.sh's own checkpoint step already guards against).
+#
+# extra_env matters for db148fb/eec3fe0 specifically: at those commits there
+# is NO --fused-moe-kernel CLI flag yet (confirmed via `git show <sha>:src/
+# server.py | grep add_argument` -- it doesn't exist before 57e4373). The
+# fused Triton MoE kernel is instead gated by `_USE_FUSED_MOE_KERNEL =
+# os.environ.get("NANOVLLM_USE_FUSED_MOE_KERNEL", "0") == "1"`, a MODULE-
+# IMPORT-TIME statement in models/qwen3_5.py -- it MUST be in the process
+# environment before `python src/server.py` starts, or db148fb (whose whole
+# point is "lock in the verified FUSED-kernel result") would silently run
+# the slow gather+dequant+einsum path instead, quietly measuring the wrong
+# thing rather than crashing. Confirmed identical gating in eec3fe0 too.
 RUNS=(
-"db148fb|db148fb_fused_int8_kernel|2|0,1|0.85|--moe-w8a8"
-"eec3fe0|eec3fe0_w8a8_hopper_lmhead_int8|2|0,1|0.85|--moe-w8a8"
-"57e4373|57e4373_h100_4bugs_kernel_retune|1|0|0.70|--moe-w8a8 --fused-moe-kernel --vectorized-moe --fused-gdr-kernel"
-"b891eae|b891eae_batched_gdr_decode|1|0|0.70|--moe-w8a8 --fused-moe-kernel --vectorized-moe --fused-gdr-kernel --batched-gdr-decode"
-"b891eae|b891eae_fused_gdr_decode_kernel|1|0|0.70|--moe-w8a8 --fused-moe-kernel --vectorized-moe --fused-gdr-kernel --fused-gdr-decode-kernel"
-"1124c2d|1124c2d_HEAD_batched_gdr_decode|1|0|0.70|--moe-w8a8 --fused-moe-kernel --vectorized-moe --fused-gdr-kernel --batched-gdr-decode"
-"1124c2d|1124c2d_HEAD_fused_gdr_decode_kernel|1|0|0.70|--moe-w8a8 --fused-moe-kernel --vectorized-moe --fused-gdr-kernel --fused-gdr-decode-kernel"
+"db148fb|db148fb_fused_int8_kernel|2|0,1|0.85|NANOVLLM_USE_FUSED_MOE_KERNEL=1|--moe-w8a8"
+"eec3fe0|eec3fe0_w8a8_hopper_lmhead_int8|2|0,1|0.85|NANOVLLM_USE_FUSED_MOE_KERNEL=1|--moe-w8a8"
+"57e4373|57e4373_h100_4bugs_kernel_retune|1|0|0.70||--moe-w8a8 --fused-moe-kernel --vectorized-moe --fused-gdr-kernel"
+"b891eae|b891eae_batched_gdr_decode|1|0|0.70||--moe-w8a8 --fused-moe-kernel --vectorized-moe --fused-gdr-kernel --batched-gdr-decode"
+"b891eae|b891eae_fused_gdr_decode_kernel|1|0|0.70||--moe-w8a8 --fused-moe-kernel --vectorized-moe --fused-gdr-kernel --fused-gdr-decode-kernel"
+"1124c2d|1124c2d_HEAD_batched_gdr_decode|1|0|0.70||--moe-w8a8 --fused-moe-kernel --vectorized-moe --fused-gdr-kernel --batched-gdr-decode"
+"1124c2d|1124c2d_HEAD_fused_gdr_decode_kernel|1|0|0.70||--moe-w8a8 --fused-moe-kernel --vectorized-moe --fused-gdr-kernel --fused-gdr-decode-kernel"
 )
 # Note on eec3fe0 at tp=2: its own commit message says the tp=1 INT8 fix was
 # "CPU-validated, GPU-unconfirmed" at the time it landed. tp=2 is the
@@ -90,19 +122,42 @@ smoke_test() {
 stop_server() {
     local pid="$1"
     if kill -0 "$pid" 2>/dev/null; then
-        kill -TERM "$pid" 2>/dev/null   # graceful -- lets nsys finalize the .nsys-rep on process exit
-        for _ in $(seq 1 20); do
+        # SIGINT, not SIGTERM: nsys's own documented graceful-stop path is
+        # Ctrl-C (SIGINT) -- that's what makes it stop the target AND
+        # finalize the .nsys-rep. SIGTERM's behavior against the nsys
+        # wrapper process itself isn't documented the same way, and this is
+        # exactly the spot where guessing wrong is expensive: losing the
+        # trace after the full multi-minute bench has already run, not just
+        # a quick retry. 120s budget before escalating -- finalizing a trace
+        # with thousands of captured kernels can take real, non-trivial time.
+        kill -INT "$pid" 2>/dev/null
+        local waited=0
+        while [ "$waited" -lt 120 ]; do
             kill -0 "$pid" 2>/dev/null || break
-            sleep 1
+            sleep 2
+            waited=$((waited + 2))
         done
-        kill -9 "$pid" 2>/dev/null || true
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "  [WARN] nsys/server still alive ${waited}s after SIGINT -- escalating to SIGTERM then SIGKILL (trace may be incomplete/corrupt if it comes to this)"
+            kill -TERM "$pid" 2>/dev/null
+            sleep 10
+            kill -9 "$pid" 2>/dev/null || true
+        fi
     fi
     pkill -9 -f "src/server.py" 2>/dev/null || true
-    sleep 2   # port 2333 (NCCL init) release -- documented gotcha, EADDRINUSE otherwise
+    sleep 3   # port 2333 (NCCL init) release -- documented gotcha, EADDRINUSE otherwise
+
+    # Verify the port is ACTUALLY free before returning -- if something is
+    # still bound to it, the NEXT run's wait_for_health would burn its full
+    # timeout guessing why a brand-new server never comes up, instead of
+    # surfacing the real cause immediately.
+    if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
+        echo "  [WARN] port ${PORT} still answering after stop_server -- something didn't die. Check 'ps aux | grep server.py' before the next run."
+    fi
 }
 
 run_one() {
-    local sha="$1" label="$2" tp="$3" gpu_ids="$4" gmu="$5" flags="$6"
+    local sha="$1" label="$2" tp="$3" gpu_ids="$4" gmu="$5" extra_env="$6" flags="$7"
     local wt_dir="$WORKTREE_ROOT/$label"
     local out_dir="$OUT_ROOT/$label"
     mkdir -p "$out_dir"
@@ -113,8 +168,45 @@ run_one() {
     echo "=================================================================="
 
     if [ ! -d "$wt_dir" ]; then
-        git worktree add "$wt_dir" "$sha" || { echo "[$label] FAILED: git worktree add"; return 1; }
+        if ! git worktree add "$wt_dir" "$sha"; then
+            # Self-heal once: a prior run earlier in THIS SAME script
+            # execution (not just a previous invocation -- the startup
+            # prune only catches staleness from before the script started)
+            # can leave a stale registration if `git worktree remove`
+            # failed silently for the same label. Retry once after pruning
+            # before giving up, rather than losing the whole run to
+            # something a single extra command fixes.
+            echo "[$label] git worktree add failed, retrying once after 'git worktree prune'..."
+            git worktree prune -v
+            git worktree add "$wt_dir" "$sha" || { echo "[$label] FAILED: git worktree add (after prune retry)"; return 1; }
+        fi
+    else
+        # Reusing a directory left over from an earlier interrupted run (e.g.
+        # `git worktree remove` failed silently because a killed GPU process
+        # still held an open file handle). Verify it's actually checked out
+        # at the commit we think it is before trusting it -- silently running
+        # the wrong commit's code would be a much worse failure mode than a
+        # loud one here, since nothing else in this script would catch it.
+        local want_sha have_sha
+        want_sha=$(git rev-parse "$sha") || { echo "[$label] FAILED: cannot resolve $sha"; return 1; }
+        have_sha=$(git -C "$wt_dir" rev-parse HEAD 2>/dev/null) || have_sha=""
+        if [ "$want_sha" != "$have_sha" ]; then
+            echo "[$label] FAILED: existing worktree at $wt_dir is checked out at ${have_sha:-<unknown>}, expected $want_sha -- remove it manually (git worktree remove --force '$wt_dir') and re-run."
+            return 1
+        fi
+        echo "[$label] reusing existing worktree (verified at $want_sha)"
     fi
+    # rm -rf FIRST, unconditionally, before symlinking the checkpoint in.
+    # Confirmed by testing this exact sequence locally: db148fb (unlike the
+    # other 4 picks) still git-tracks 13 small files under qwen35_checkpoint/
+    # (tokenizer.json, config.json, etc. -- only *.safetensors was gitignored
+    # that early; the whole directory wasn't gitignored until eec3fe0). `git
+    # worktree add` materializes those into a REAL, non-empty directory at
+    # that path, and `ln -sfn` onto an existing real (non-symlink) directory
+    # does NOT replace it -- it silently no-ops or nests the link inside it,
+    # depending on the ln implementation -- either way the server would then
+    # load a checkpoint dir with only tokenizer/config files and no weights.
+    rm -rf "$wt_dir/qwen35_checkpoint"
     ln -sfn "$CKPT_DIR" "$wt_dir/qwen35_checkpoint"
 
     local srv_log="$out_dir/server.log"
@@ -124,14 +216,25 @@ run_one() {
         cd "$wt_dir" || exit 1
         # No --kill none here (unlike the interactive sessions in the session
         # handoffs, which used it to let a server outlive a --duration-boxed
-        # capture for further un-traced bench trials): this script sends
-        # SIGTERM to nsys itself once the bench finishes, and WANTS nsys's
-        # default behavior of propagating that to the server so it exits and
-        # nsys can finalize the .nsys-rep cleanly.
-        CUDA_VISIBLE_DEVICES="$gpu_ids" PYTHONUNBUFFERED=1 \
+        # capture for further un-traced bench trials): this script signals
+        # nsys itself once the bench finishes (see stop_server), and WANTS
+        # nsys's default behavior of propagating that to the server so it
+        # exits and nsys can finalize the .nsys-rep cleanly.
+        # `env` is NOT decorative here -- confirmed by testing directly: bash
+        # only recognizes a leading `NAME=value` TOKEN as an env-assignment
+        # prefix; a variable EXPANSION in that position (`$extra_env ...`,
+        # even when non-empty) does not qualify, and once one word in a
+        # simple command isn't an assignment, nothing after it is treated as
+        # one either -- `$extra_env CUDA_VISIBLE_DEVICES=... nsys ...` would
+        # make "CUDA_VISIBLE_DEVICES=..." itself the (nonexistent) command
+        # name whenever $extra_env is empty, i.e. for 5 of these 7 runs.
+        # `env` sidesteps this: it's a real command that takes NAME=value
+        # pairs as plain arguments, so $extra_env can safely be empty or not.
+        env $extra_env CUDA_VISIBLE_DEVICES="$gpu_ids" PYTHONUNBUFFERED=1 \
         nsys profile -o "$rep_base" --force-overwrite=true --cuda-graph-trace=node \
             python src/server.py \
                 --model qwen35_checkpoint \
+                --port "$PORT" \
                 --tensor-parallel-size "$tp" \
                 --cuda-graphs \
                 --concurrency-mode batched \
@@ -166,6 +269,7 @@ run_one() {
     (
         cd "$wt_dir" || exit 1
         python bench_http_concurrency.py \
+            --base-url "http://localhost:${PORT}" \
             --tokenizer-dir qwen35_checkpoint \
             --levels "$BENCH_LEVELS" \
             --prompt-tokens 128 --max-tokens 1024 \
@@ -201,11 +305,11 @@ run_one() {
 # ── main loop ────────────────────────────────────────────────────────────
 FAILED=()
 for entry in "${RUNS[@]}"; do
-    IFS='|' read -r sha label tp gpu_ids gmu flags <<< "$entry"
+    IFS='|' read -r sha label tp gpu_ids gmu extra_env flags <<< "$entry"
     if [ -n "$RUNS_FILTER" ] && [[ "$label" != *"$RUNS_FILTER"* ]]; then
         continue
     fi
-    if ! run_one "$sha" "$label" "$tp" "$gpu_ids" "$gmu" "$flags"; then
+    if ! run_one "$sha" "$label" "$tp" "$gpu_ids" "$gmu" "$extra_env" "$flags"; then
         FAILED+=("$label")
     fi
 done
@@ -218,7 +322,7 @@ SUMMARY="$OUT_ROOT/summary.md"
     echo "| label | commit | tok/s @ c${BENCH_LEVELS} | trace |"
     echo "|---|---|---|---|"
     for entry in "${RUNS[@]}"; do
-        IFS='|' read -r sha label tp gpu_ids gmu flags <<< "$entry"
+        IFS='|' read -r sha label tp gpu_ids gmu extra_env flags <<< "$entry"
         blog="$OUT_ROOT/$label/bench.log"
         toks="n/a"
         if [ -f "$blog" ]; then
